@@ -1,16 +1,17 @@
 {
-  "name": "@tintinweb/pi-subagents",
-  "version": "0.19.0",
-  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi — parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
+  "name": "opensec-pi-subagents",
+  "version": "0.19.2",
+  "description": "Fork of @tintinweb/pi-subagents with parent model/thinking inheritance and cached agent discovery.",
   "author": "tintinweb",
+  "contributors": ["kushalkhemka"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-subagents.git"
+    "url": "git+https://github.com/opensec-git/opensec-pi-subagents.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "homepage": "https://github.com/opensec-git/opensec-pi-subagents#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-subagents/issues"
+    "url": "https://github.com/opensec-git/opensec-pi-subagents/issues"
   },
   "publishConfig": {
     "access": "public"

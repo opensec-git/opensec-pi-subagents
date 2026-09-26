@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-09-26
+
+### Changed
+- **Cache unchanged subagent discovery and configuration.** Directory listings, parsed agent files, and parsed subagent settings are reused after metadata validation on each load. Changes invalidate the cache without a timer; sessions, extension initialization, tools, skills, model, and thinking inheritance remain unchanged.
+
 ## [0.19.0] - 2026-08-25
 
 > **⚠️ Breaking — this release requires pi 0.84.0 or newer** (`peerDependencies` moves from `>=0.81.0`). `SubagentWorkflow` needs two host APIs that do not exist below it, and both fail the typecheck rather than degrading quietly — see the `Changed` entry below for which, and why neither was worth reimplementing to hold the old floor. npm flags an older pi at install time.

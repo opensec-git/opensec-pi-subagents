@@ -833,8 +833,10 @@ export async function runAgent(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
 
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  // Omitting this SDK option uses saved settings, not the live parent's effort.
+  // A reopened session keeps its saved effort unless explicitly overridden.
+  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking
+    ?? (options.resumeSessionFile ? undefined : ctx.thinkingLevel);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)

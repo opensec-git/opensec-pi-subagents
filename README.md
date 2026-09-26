@@ -1,4 +1,6 @@
-# @tintinweb/pi-subagents
+# opensec-pi-subagents
+
+Fork of [@tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) 0.19.0, with the default `Explore` agent changed to inherit the parent's model and current thinking level. This fork also passes the parent's current thinking level to new agents that do not set their own. Original project and documentation links below belong to the upstream author; this package is maintained separately.
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
 
@@ -40,7 +42,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Install
 
 ```bash
-pi install npm:@tintinweb/pi-subagents
+pi install npm:opensec-pi-subagents
 ```
 
 Or load directly for development:
@@ -242,10 +244,12 @@ Group completions render each agent as a separate block. The LLM receives struct
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
-| `Explore` | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace` (standalone) | Fast codebase exploration (read-only) |
+| `Explore` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Fast codebase exploration (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
+
+New agents inherit the parent's current model and thinking level when neither the agent definition nor the call overrides them. This includes `Explore`: it does not select Claude Haiku automatically. Thinking inheritance uses the live session's effort, not the saved Pi default; Pi still clamps effort to the selected model's supported levels. Reopening a saved subagent preserves its saved effort unless explicitly overridden. Existing agent-file pins remain authoritative.
 
 Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
 
@@ -264,6 +268,8 @@ Agents are discovered from three locations (higher priority wins):
 Project-level agents override global ones with the same name, so you can customize a global agent for a specific project. If both project locations define the same name, **`.pi/agents/` wins** — `.pi` stays the project authority; `.agents/agents/` is an additional read location for projects that keep their agent assets in the `.agents` workspace. The global location follows the upstream `PI_CODING_AGENT_DIR` env var — set it to relocate all pi-coding-agent state (agents, skills, settings) to a custom directory. An agent's name is its frontmatter `name:`, falling back to the filename, so two files can now claim the same one — the later load wins, and the warning below names the file that took over.
 
 An unreadable or unparseable agent file is skipped, not fatal — a warning names the file and the error. If it was overriding a same-named agent, a second line names the file that loads instead. Set `strictAgentFiles: true` in `subagents.json` (or `/agents → Settings → Strict agent files`) to fail startup on a broken file instead; mid-session reloads still only warn.
+
+Discovery reuses unchanged directory listings and parsed agent files within each Pi process. File and directory metadata are checked on every load, so edits, additions, removals, and atomic replacements are picked up on the next discovery without a timer or restart. Parsed `subagents.json` settings use the same bounded cache; their existing application points are unchanged. Each load still builds fresh agent configurations, and each spawn keeps its own session and extension initialization. Model/thinking inheritance, tools, skills, and prompts are unchanged.
 
 ### Example: `.pi/agents/auditor.md`
 
@@ -942,6 +948,7 @@ src/
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)
   custom-agents.ts    # Load user-defined agents from .pi/agents/, .agents/agents/, and global agents
+  discovery-cache.ts  # Bounded metadata-validated caches for discovery and parsed configuration
   agent-types.ts      # Unified agent registry (defaults + user), tool name resolution
   agent-file-toggle.ts # Locate/edit an agent's .md: enabled: toggle, eject to frontmatter
   agent-color.ts      # Claude Code/Agency Agents name color parsing and badge rendering

@@ -17,6 +17,7 @@ CLAUDE.md
 # Build artifacts
 *.log
 npm-debug.log*
+*.tgz
 .DS_Store
 
 # Tests (if any)

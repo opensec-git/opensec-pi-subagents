@@ -6,6 +6,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
+import { createDiscoveryCache } from "./discovery-cache.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
 
 /**
@@ -22,6 +23,14 @@ import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./t
  * and a file must be able to override one.
  */
 const RESERVED_IN_TYPE = ":";
+
+const readAgentDirectory = createDiscoveryCache(
+  (path) => readdirSync(path).filter(f => f.endsWith(".md")),
+  64,
+);
+const readParsedAgent = createDiscoveryCache(
+  (path) => parseAgentFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8")),
+);
 
 /**
  * Scan for custom agent .md files from multiple locations.
@@ -62,7 +71,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
 
   let files: string[];
   try {
-    files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    files = readAgentDirectory(dir);
   } catch {
     return;
   }
@@ -172,7 +181,7 @@ export function parseAgentFrontmatter<T extends Record<string, unknown>>(content
 
 function readAgentFile(path: string, strict: boolean): { frontmatter: Record<string, unknown>; body: string } | undefined {
   try {
-    return parseAgentFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8"));
+    return readParsedAgent(path);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     if (strict) throw new Error(`${path}: ${reason}`);
