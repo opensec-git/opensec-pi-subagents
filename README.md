@@ -1,6 +1,27 @@
-# opensec-pi-subagents
+<p align="center">
+  <img src="https://pi-bolt.opensec.in/plugins/opensec-pi-subagents.svg" width="96" height="96" alt="OpenSec Subagents logo">
+</p>
 
-Fork of [@tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) 0.19.0, with the default `Explore` agent changed to inherit the parent's model and current thinking level. This fork also passes the parent's current thinking level to new agents that do not set their own. Original project and documentation links below belong to the upstream author; this package is maintained separately.
+<h1 align="center">OpenSec Subagents for Pi</h1>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/opensec-pi-subagents"><img alt="npm" src="https://img.shields.io/npm/v/opensec-pi-subagents?style=flat-square&color=2A78D6"></a>
+  <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4C96EA?style=flat-square">
+</p>
+
+OpenSec's fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents). New agents inherit the parent
+session's model and current thinking level, and agent discovery and configuration are cached.
+
+> **Install from npm.** [`opensec-pi-subagents`](https://www.npmjs.com/package/opensec-pi-subagents) on npm is OpenSec's
+> prebuilt Bun build for [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt). It carries later fixes than the TypeScript
+> source here, which is at 0.19.2; its README and changelog list them.
+>
+> ```bash
+> pi-bolt install npm:opensec-pi-subagents
+> ```
+>
+> For Pi on Node, use [`@tintinweb/pi-subagents`](https://www.npmjs.com/package/@tintinweb/pi-subagents). The
+> documentation below is upstream's and applies to both, except where the npm README says otherwise.
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
 
@@ -41,11 +62,13 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 ## Install
 
+From npm, for Pi-Bolt (the Bun build, see above):
+
 ```bash
-pi install npm:opensec-pi-subagents
+pi-bolt install npm:opensec-pi-subagents
 ```
 
-Or load directly for development:
+Or load this source directly, for development:
 
 ```bash
 pi -e ./src/index.ts
@@ -1008,4 +1031,7 @@ src/
 
 ## License
 
-MIT — [tintinweb](https://github.com/tintinweb)
+Copyright 2026 OpenSec. Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Based on [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) by [tintinweb](https://github.com/tintinweb)
+and its contributors (MIT); their notice is in [NOTICE](NOTICE).

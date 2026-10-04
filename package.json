@@ -1,10 +1,12 @@
 {
   "name": "opensec-pi-subagents",
   "version": "0.19.2",
-  "description": "Fork of @tintinweb/pi-subagents with parent model/thinking inheritance and cached agent discovery.",
-  "author": "tintinweb",
-  "contributors": ["kushalkhemka"],
-  "license": "MIT",
+  "description": "OpenSec Subagents for Pi: a fork of @tintinweb/pi-subagents with parent model and thinking-level inheritance and cached agent discovery.",
+  "author": "OpenSec",
+  "contributors": [
+    "tintinweb (author of @tintinweb/pi-subagents)"
+  ],
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/opensec-git/opensec-pi-subagents.git"
