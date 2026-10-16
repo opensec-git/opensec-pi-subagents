@@ -75,7 +75,7 @@ import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { readWorkflowScriptFile } from "./workflow/script-file.js";
-import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, pruneSettledWorkflowTasks, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, MERGED_BRANCH_MAX_AGE_DAYS, pruneMergedAgentBranches, recoverLeftoverWorktrees, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -501,6 +501,44 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
+  /**
+   * Set once this activation's session is shutting down (`/new`, `/resume`,
+   * `/reload`, quit). Pi invalidates `pi` and every ctx then, and a call on a
+   * stale one throws — from a detached completion that is an unhandled
+   * rejection, which ends pi. Every detached path checks it first.
+   */
+  let disposed = false;
+  /** Bumped at every shutdown: work started under an older value belongs to a torn-down session. */
+  let sessionGeneration = 0;
+  /** Off-screen mention clones in flight, aborted at shutdown so they stop spending. */
+  const mentionClones = new Set<AbortController>();
+
+  /**
+   * Hand pending subagent spend to the parent session as a `usage` entry, which
+   * pi counts in `getSessionStats()` (footer, statusline, `/cost`) without
+   * putting it in the LLM context. For spend no subagent tool result will carry
+   * back: background and workflow agents that finish after the last such call,
+   * and the `@mention` clone's own turn. Pi < 1.0 has no `appendUsage`, and the
+   * spend then waits for the next tool result as before.
+   */
+  function flushPendingUsage(ctx: ExtensionContext | undefined = currentCtx): void {
+    if (!reportUsage || disposed || !ctx) return;
+    try {
+      type UsageWriter = { appendUsage?: (kind: string, provider: string, model: string, usage: unknown, note?: string) => unknown };
+      const sessionManager = ctx.sessionManager as unknown as UsageWriter;
+      if (typeof sessionManager.appendUsage !== "function") return;
+      const usage = pendingUsage.drain();
+      if (usage) sessionManager.appendUsage("subagents", "pi-subagents", "subagents", usage, "subagent spend");
+    } catch { /* a session going away cannot record anything */ }
+  }
+
+  /** Flush now if the parent is between turns; otherwise `agent_end` or the next tool result will. */
+  function flushPendingUsageIfIdle(): void {
+    try {
+      if (currentCtx?.isIdle()) flushPendingUsage();
+    } catch { /* stale ctx */ }
+  }
+
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
@@ -641,6 +679,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   const manager = new AgentManager((record) => {
+    // After shutdown `pi` is stale, and the shutdown handler records the
+    // agents it interrupted itself.
+    if (disposed) return;
+    // Spend that landed after the parent's last subagent tool result.
+    flushPendingUsageIfIdle();
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -684,7 +727,7 @@ export default function (pi: ExtensionAPI) {
     // 'delivered' → group callback already fired
     widget.update();
   }, undefined, (record) => {
-    if (!isTopLevelAgent(record)) return;
+    if (disposed || !isTopLevelAgent(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -700,7 +743,7 @@ export default function (pi: ExtensionAPI) {
       description: record.description,
     });
   }, (record, info) => {
-    if (!isTopLevelAgent(record)) return;
+    if (disposed || !isTopLevelAgent(record)) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -786,6 +829,8 @@ export default function (pi: ExtensionAPI) {
     // Bypasses handle allocation, so a forged value would duplicate a live
     // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
     delete safeOptions.reclaim;
+    // Internal to a reopen, like `reclaim`: it seeds an agent's lifetime figures.
+    delete safeOptions.carry;
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
@@ -859,6 +904,7 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    disposed = false;
     currentCtx = ctx;
     syncProjectTrust(ctx);
     void tidyAgentWorktrees(ctx);
@@ -892,7 +938,9 @@ export default function (pi: ExtensionAPI) {
             // to consume, and its notification is still the caller's only
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
+            // Includes a stopped agent still winding down: its partial result
+            // has not landed yet.
+            if (manager.isRunActive(record.id)) return false;
             record.resultConsumed = true;
             cancelNudge(record.id);
             return true;
@@ -1100,8 +1148,27 @@ export default function (pi: ExtensionAPI) {
       // Not awaited: the clone runs a full model turn, and prompt() is blocked
       // until this hook returns. The user gets their prompt back immediately
       // and the agent appears in the widget when it starts.
-      void runMentionClone({ ctx, type, message: mention.message, agentTool: registeredAgentTool })
+      //
+      // The clone can outlive this session (`/new`, `/resume`, `/reload` while
+      // it thinks), and then `ctx` and `pi` are stale and throw: everything
+      // after it checks the generation, and the chain ends in a catch, since an
+      // unhandled rejection ends pi. Shutdown aborts the clone itself.
+      const generation = sessionGeneration;
+      const live = () => generation === sessionGeneration && !disposed;
+      const cloneStop = new AbortController();
+      mentionClones.add(cloneStop);
+      void runMentionClone({
+        ctx,
+        type,
+        message: mention.message,
+        agentTool: registeredAgentTool,
+        signal: cloneStop.signal,
+        // The clone's turn is real spend on the main model.
+        onUsage: (usage) => { if (reportUsage && live()) pendingUsage.add(usage); },
+      })
         .then(async (result) => {
+          if (!live()) return;
+          flushPendingUsageIfIdle();
           if (result.spawned) return;
           // A clone that could not run must not swallow the mention: start the
           // agent the direct way rather than leaving the user with a toast and
@@ -1114,14 +1181,18 @@ export default function (pi: ExtensionAPI) {
             // Same reason as the direct path below: the agent may still be
             // starting, and a failure there must reach this catch.
             await manager.awaitStartup(id);
-            ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
+            if (live()) ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
           } catch (err) {
-            ctx.ui.notify(
-              `Could not start ${label}: ${err instanceof Error ? err.message : String(err)}`,
-              "error",
-            );
+            if (live()) {
+              ctx.ui.notify(
+                `Could not start ${label}: ${err instanceof Error ? err.message : String(err)}`,
+                "error",
+              );
+            }
           }
-        });
+        })
+        .catch(() => { /* the session went away mid-flight */ })
+        .finally(() => { mentionClones.delete(cloneStop); });
       return { action: "handled" };
     }
 
@@ -1155,6 +1226,12 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    // Spend no tool result carried back yet: record it while the session can.
+    flushPendingUsage();
+    disposed = true;
+    sessionGeneration++;
+    for (const stop of mentionClones) stop.abort();
+    mentionClones.clear();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1183,6 +1260,11 @@ export default function (pi: ExtensionAPI) {
     for (const record of interrupted) appendRecordEntry(record);
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    // Neither may fire into a torn-down instance (or hold `pi -p` open).
+    groupJoin.dispose();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
     fleet.dispose();
     // Its 80 ms refresh interval otherwise outlives the session across /reload.
     // The interval is cleared first; the UI calls after it may meet a context
@@ -1483,6 +1565,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event) => {
     if (event.toolName === "bash") boundBashTimeout(event.input, getToolTimeoutSeconds(), false);
     return undefined;
+  });
+
+  // The parent's turn is over: spend that arrived after its last subagent tool
+  // result (background agents, workflows) reaches the session stats now.
+  pi.on("agent_end", (_event, ctx) => {
+    flushPendingUsage(ctx);
   });
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
@@ -2614,6 +2702,7 @@ Terse command-style prompts produce shallow, generic work.
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
+    flushPendingUsageIfIdle();
     const result = workflowResultText(task);
     scheduleNudge(task.id, () => {
       pi.sendMessage<NotificationDetails>({
@@ -2786,6 +2875,7 @@ Terse command-style prompts produce shallow, generic work.
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
       workflowTasks.set(runId, task);
+      pruneSettledWorkflowTasks(workflowTasks);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
       // surfaces — nothing else would register the widget for a run whose
@@ -2795,7 +2885,9 @@ Terse command-style prompts produce shallow, generic work.
 
       // Background, like Claude Code: the id comes back now and the run keeps
       // going without the tool call.
-      void runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task));
+      void runWorkflowTask(ctx, task)
+        .then(() => { if (!disposed) notifyWorkflowFinished(task); })
+        .catch(() => { /* the session went away mid-flight */ });
 
       return {
         content: [{
@@ -2944,6 +3036,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
     workflowTasks.set(task.id, task);
+    pruneSettledWorkflowTasks(workflowTasks);
     widget.update();
     fleet.update();
     report(`Running workflow ${meta.name}…`, "info");
@@ -2951,6 +3044,7 @@ Terse command-style prompts produce shallow, generic work.
     // Detached: session_start is awaited by the host, and a workflow can run for
     // minutes — blocking here would hold the whole session's startup.
     void runWorkflowTask(ctx, task).then(() => {
+      if (disposed) return;
       // No tool call to attach a result card to, so the card becomes a session
       // entry (same layout), and the outcome is handed to the model as context
       // for its next turn rather than forcing one.
@@ -2962,7 +3056,8 @@ Terse command-style prompts produce shallow, generic work.
       }, { deliverAs: "nextTurn" });
       widget.update();
       fleet.update();
-    });
+      flushPendingUsageIfIdle();
+    }).catch(() => { /* the session went away mid-flight */ });
   }
 
   // ---- get_subagent_result tool ----
@@ -3001,7 +3096,11 @@ Terse command-style prompts produce shallow, generic work.
       // them), so wait on the queue's start gate (resolved on every way out of
       // the queue) until they leave it, then await like a running one. Polling
       // is the fallback for a queued record without a gate.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
+      // A stopped agent still winding down (committing its worktree, or a tool
+      // ignoring the stop) is waited for too: its partial result lands when it
+      // settles, and reading "stopped" as "over" would report "No output." and
+      // consume the notification that would have carried it.
+      if (params.wait && manager.isRunActive(record.id)) {
         while (record.status === "queued") {
           await abortable(
             record.startGate ?? new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
@@ -3033,8 +3132,11 @@ Terse command-style prompts produce shallow, generic work.
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
+      const active = manager.isRunActive(record.id);
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
+      } else if (record.status === "stopped" && active) {
+        output += "Agent was stopped and is still winding down. Use wait: true or check back later.";
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -3042,9 +3144,9 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
+      if (!active) {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelNudge(record.id);
       }
 
       // Verbose: include full conversation

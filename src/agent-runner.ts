@@ -433,9 +433,19 @@ export function setToolTimeoutSeconds(n: number): void {
   toolTimeoutSeconds = Math.min(TOOL_TIMEOUT_CEILING, Math.max(0, Math.floor(n)));
 }
 
-/** How long past the limit the watchdog waits, so a timing-out `bash` reports its own timeout first. */
-const WATCHDOG_SLACK_MS = 60_000;
-const WATCHDOG_INTERVAL_MS = 5_000;
+/**
+ * Watchdog timing. `slackMs`: how long past the limit it waits, so a timing-out
+ * `bash` reports its own timeout first. `escalateMs`: how long after its abort a
+ * run may stay stuck before the watchdog stops waiting for it — pi awaits a
+ * running tool unconditionally, so one that ignores its AbortSignal would
+ * otherwise hold the run forever.
+ */
+const watchdogTiming = { slackMs: 60_000, intervalMs: 5_000, escalateMs: 30_000 };
+
+/** Override the watchdog timing (tests only; production uses the defaults above). */
+export function setWatchdogTiming(timing: Partial<typeof watchdogTiming>): void {
+  Object.assign(watchdogTiming, timing);
+}
 /** Times one run is resumed after a stuck tool before it is left stopped. */
 export const MAX_TOOL_RECOVERIES = 3;
 const WATCHDOG_EXEMPT_TOOLS: ReadonlySet<string> = new Set(EXCLUDED_TOOL_NAMES);
@@ -477,13 +487,19 @@ export function boundBashTimeout(args: unknown, limitSeconds: number, cap: boole
  * `bash` calls without a timeout, or with a longer one, get the limit. The
  * watchdog covers every tool: past the limit (plus slack) it aborts the run,
  * which kills a running command's process tree, and `takeHung()` then reports
- * the call so the caller can resume the agent with `hungToolPrompt()`.
+ * the call so the caller can resume the agent with `hungToolPrompt()`. When the
+ * abort does not end the run (the tool ignores its signal), it escalates:
+ * after `escalateMs` it resolves `stuck`, and the caller stops waiting.
  */
 export function installToolTimeouts(session: AgentSession, limitSeconds = toolTimeoutSeconds): {
   takeHung(): HungTool | undefined;
+  /** Resolves when an aborted run is still stuck after the escalation delay. */
+  stuck: Promise<void>;
   dispose(): void;
 } {
-  if (limitSeconds <= 0) return { takeHung: () => undefined, dispose: () => {} };
+  if (limitSeconds <= 0) return { takeHung: () => undefined, stuck: new Promise<void>(() => {}), dispose: () => {} };
+  let resolveStuck!: () => void;
+  const stuck = new Promise<void>(resolve => { resolveStuck = resolve; });
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
@@ -493,6 +509,7 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
 
   const running = new Map<string, { toolName: string; started: number }>();
   let hung: HungTool | undefined;
+  let hungAt = 0;
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     // Nested agents and workflows wait on child runs with their own limits.
     if (event.type === "tool_execution_start" && !WATCHDOG_EXEMPT_TOOLS.has(event.toolName)) {
@@ -502,16 +519,24 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
     if (event.type === "agent_end") running.clear();
   });
   const timer = setInterval(() => {
-    if (hung) return;
     const now = Date.now();
-    for (const call of running.values()) {
-      if (now - call.started < limitSeconds * 1000 + WATCHDOG_SLACK_MS) continue;
-      hung = { toolName: call.toolName, seconds: Math.round((now - call.started) / 1000) };
-      running.clear();
-      void session.abort();
+    if (hung) {
+      // Aborted and still not back: escalate rather than wait forever.
+      if (now - hungAt >= watchdogTiming.escalateMs) {
+        clearInterval(timer);
+        resolveStuck();
+      }
       return;
     }
-  }, WATCHDOG_INTERVAL_MS);
+    for (const call of running.values()) {
+      if (now - call.started < limitSeconds * 1000 + watchdogTiming.slackMs) continue;
+      hung = { toolName: call.toolName, seconds: Math.round((now - call.started) / 1000) };
+      hungAt = now;
+      running.clear();
+      void session.abort().catch(() => {});
+      return;
+    }
+  }, watchdogTiming.intervalMs);
   (timer as { unref?: () => void }).unref?.();
 
   return {
@@ -520,6 +545,7 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
       hung = undefined;
       return out;
     },
+    stuck,
     dispose() {
       clearInterval(timer);
       unsubscribe();
@@ -1399,25 +1425,36 @@ export async function driveSession(session: AgentSession, prompt: string, option
   // on counts as this run's output. A resumed session already holds prior
   // turns, and a failed resume must not surface the previous answer (#144).
   const startLen = session.messages.length;
+  // One prompt, raced against the watchdog's escalation. False when the run is
+  // stuck in a tool that ignored the abort: the prompt is left behind (its
+  // eventual settle is swallowed) and the run ends here as aborted.
+  const send = async (text: string): Promise<boolean> => {
+    const sent = session.prompt(text);
+    const outcome = await Promise.race([sent.then(() => "done" as const), toolTimeouts.stuck.then(() => "stuck" as const)]);
+    if (outcome === "done") return true;
+    sent.catch(() => {});
+    aborted = true;
+    return false;
+  };
   try {
     // Stopped before the session was ready: nothing was asked yet, so ask
     // nothing — prompting now would run the whole task for nobody.
     if (options.signal?.aborted) {
       return { responseText: "", aborted: true, steered: false };
     }
-    await session.prompt(prompt);
-    for (let recoveries = 0; ; recoveries++) {
+    let live = await send(prompt);
+    for (let recoveries = 0; live; recoveries++) {
       const hung = toolTimeouts.takeHung();
       if (!hung) break;
       if (aborted || options.signal?.aborted || recoveries >= MAX_TOOL_RECOVERIES) {
         aborted = true;
         break;
       }
-      await session.prompt(hungToolPrompt(hung));
+      live = await send(hungToolPrompt(hung));
     }
-    if (!aborted && options.signal?.aborted !== true) {
+    if (live && !aborted && options.signal?.aborted !== true) {
       const followUp = options.followUp?.();
-      if (followUp !== undefined) await session.prompt(followUp);
+      if (followUp !== undefined) await send(followUp);
     }
   } finally {
     toolTimeouts.dispose();

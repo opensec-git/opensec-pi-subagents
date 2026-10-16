@@ -43,6 +43,10 @@ function makeFaithfulManager(initialStatus = "completed") {
     getRecord: vi.fn(function (this: any, id: string) {
       return records.get(id);
     }),
+    isRunActive: vi.fn((id: string) => {
+      const status = records.get(id)?.status;
+      return status === "running" || status === "queued";
+    }),
   } as any;
 }
 

@@ -125,12 +125,13 @@ export function streamToOutputFile(
       if (firstUser < 0) return;
       writtenCount = firstUser + 1;
     }
+    // One write per flush, not one per message: a turn with many tool results
+    // is a single synchronous append on pi's event loop. Same lines, same order.
+    let chunk = "";
     while (writtenCount < messages.length) {
       const msg = messages[writtenCount];
-      if ((msg.role as string) === "system") {
-        writtenCount++;
-        continue;
-      }
+      writtenCount++;
+      if ((msg.role as string) === "system") continue;
       const entry = {
         isSidechain: true,
         agentId,
@@ -139,11 +140,12 @@ export function streamToOutputFile(
         timestamp: new Date().toISOString(),
         cwd,
       };
-      try {
-        appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
-      } catch { /* ignore write errors */ }
-      writtenCount++;
+      chunk += JSON.stringify(entry) + "\n";
     }
+    if (!chunk) return;
+    try {
+      appendFileSync(path, chunk, "utf-8");
+    } catch { /* ignore write errors */ }
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {

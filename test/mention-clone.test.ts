@@ -399,3 +399,41 @@ describe("when the clone cannot deliver", () => {
     expect(session.dispose).toHaveBeenCalled();
   });
 });
+
+describe("the clone's own cost and lifetime", () => {
+  it("reports its turn's usage — a real turn on the main model", async () => {
+    const listeners: Array<(e: any) => void> = [];
+    const session = cloneSession(async () => {
+      for (const l of listeners) {
+        l({ type: "message_end", message: { role: "assistant", usage: { input: 7, output: 3, cacheWrite: 1, cacheRead: 2, cost: { total: 0.5 } } } });
+      }
+    });
+    session.subscribe = vi.fn((fn: (e: any) => void) => { listeners.push(fn); return () => {}; });
+    const onUsage = vi.fn();
+    await runMentionClone(opts({ onUsage }));
+    expect(onUsage).toHaveBeenCalledWith({ input: 7, output: 3, cacheWrite: 1, cacheRead: 2, cost: 0.5 });
+  });
+
+  it("is aborted when its session goes away mid-turn", async () => {
+    let release!: () => void;
+    const session = cloneSession(() => new Promise<void>(r => { release = r; }));
+    const stop = new AbortController();
+    session.abort = vi.fn(async () => { release(); });
+    const pending = runMentionClone(opts({ signal: stop.signal }));
+    await new Promise(r => setTimeout(r, 0));
+    stop.abort();
+    const result = await pending;
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.spawned).toBe(false);
+    expect(session.dispose).toHaveBeenCalled();
+  });
+
+  it("does not start at all once its session is gone", async () => {
+    cloneSession();
+    const stop = new AbortController();
+    stop.abort();
+    const result = await runMentionClone(opts({ signal: stop.signal }));
+    expect(result.spawned).toBe(false);
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+});

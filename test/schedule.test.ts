@@ -24,6 +24,7 @@ function makeMockManager() {
     spawn: spawnFn,
     awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(() => ({ promise: Promise.resolve("done") })),
+    isRunActive: vi.fn(() => false),
   } as any;
 }
 
@@ -174,15 +175,34 @@ describe("SubagentScheduler — lifecycle", () => {
   });
 
   // Once a fire happens and `lastRun` is set, getNextRun should pivot to it.
-  it("getNextRun uses lastRun when present for interval jobs", () => {
+  it("getNextRun reports the armed timer for interval jobs, not lastRun + interval", () => {
     const job = scheduler.addJob({
       name: "ran-once", description: "x", schedule: "1h",
       subagent_type: "general-purpose", prompt: "p",
     });
+    // lastRun is when the previous run COMPLETED; the timer was re-armed when
+    // it FIRED. Basing the next run on lastRun skewed it by the run's length.
     const lastRun = new Date(Date.now() - 30 * 60_000).toISOString(); // 30m ago
-    scheduler.updateJob(job.id, { lastRun });
-    const next = scheduler.getNextRun(job.id);
-    expect(next).toBe(new Date(new Date(lastRun).getTime() + 3_600_000).toISOString());
+    const armedAt = Date.now();
+    scheduler.updateJob(job.id, { lastRun }); // re-arms the timer now
+    const next = new Date(scheduler.getNextRun(job.id)!).getTime();
+    expect(next).toBeGreaterThanOrEqual(armedAt + 3_600_000);
+    expect(next).toBeLessThan(armedAt + 3_600_000 + 1_000);
+  });
+
+  it("getNextRun advances by the interval from each fire, whatever the run's length", () => {
+    vi.useFakeTimers();
+    try {
+      const job = scheduler.addJob({
+        name: "skew", description: "x", schedule: "1h",
+        subagent_type: "general-purpose", prompt: "p",
+      });
+      const firstFire = Date.now() + 3_600_000;
+      vi.advanceTimersByTime(3_600_000);
+      expect(scheduler.getNextRun(job.id)).toBe(new Date(firstFire + 3_600_000).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects past one-shot timestamps upfront — no record created", () => {

@@ -202,6 +202,11 @@ interface SpawnOptions {
    */
   reuseId?: string;
   /**
+   * Lifetime figures to continue from — a loaded agent reopened from its file
+   * keeps counting where its record left off. Internal, like `reuseId`.
+   */
+  carry?: Pick<AgentRecord, "lifetimeUsage" | "toolUses" | "compactionCount">;
+  /**
    * Restore this worktree (at its path, from its branch) instead of creating a
    * fresh one — the reopen of an evicted worktree agent. Internal.
    */
@@ -375,6 +380,67 @@ interface ResumeOptions {
 
 /** Best-effort ceiling on one child's shutdown handlers, so teardown can't strand a quit. */
 const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a stopped run gets to end on its own before it is abandoned.
+ *
+ * Every stop ends in `session.abort()`, and pi's agent loop awaits a running
+ * tool unconditionally: a tool that ignores its AbortSignal (an extension or
+ * MCP tool, a hung `session_start`) keeps the run alive forever. Past this
+ * grace the manager stops waiting for it: the slot is freed, the record is
+ * settled as stopped and the completion fires, and anything queued proceeds.
+ */
+const DEFAULT_STOP_GRACE_MS = 20_000;
+
+/**
+ * How long an inline caller (a foreground `Agent` call, a nested or workflow
+ * child) keeps waiting after a stop for the run to settle, before it returns
+ * the stopped record anyway. Long enough for an ordinary stop to commit its
+ * worktree; short enough that Esc never leaves the parent stuck on a run that
+ * will not end.
+ */
+const INLINE_STOP_WAIT_MS = 3_000;
+
+/**
+ * How long a finished agent keeps its live session before it is released.
+ *
+ * A finished child's session still holds everything its extensions armed in
+ * `session_start` (MCP clients, watchers, timers) until the record is evicted
+ * ten minutes later — per agent, so a fan-out multiplies it. Past this delay a
+ * saved session is shut down and disposed; its messages and stats stay
+ * readable for the viewer and the result tools, and a resume reopens the
+ * conversation from the session file instead. A resume within the delay
+ * reuses the live session, which is faster.
+ */
+const DEFAULT_SESSION_RELEASE_MS = 60_000;
+
+/**
+ * A run the manager is still responsible for: from the moment it takes its
+ * slot until it settles, normally or by abandonment. One per record at a time.
+ */
+interface LiveRun {
+  id: string;
+  record: AgentRecord;
+  /** The pool charged when the run started, released exactly once. */
+  pool: Pool | undefined;
+  slotReleased: boolean;
+  /** Settled: slot free, completion fired. Any later settle is a no-op. */
+  settled: boolean;
+  /**
+   * Settled by abandonment: the real run may still be going and must not touch
+   * the record, the worktree or the completion when it finally ends.
+   */
+  abandoned: boolean;
+  /** Resolves once settled, normally or by abandonment. */
+  done: Promise<void>;
+  resolveDone: () => void;
+  /** Resolves only on abandonment — raced against the run for every waiter. */
+  whenAbandoned: Promise<void>;
+  resolveAbandoned: () => void;
+  graceTimer?: ReturnType<typeof setTimeout>;
+  /** Path-specific cleanup an abandoned run still owes (transcript, worktree, owned children). */
+  onAbandon: () => Promise<void>;
+}
 
 /**
  * Close the extension lifecycle `runAgent` opened with `bindExtensions`, then dispose.
@@ -566,6 +632,14 @@ export class AgentManager {
   private runningBackground = 0;
   /** Number of currently running foreground (blocking) agents. */
   private runningForeground = 0;
+  /** Runs that have not settled yet, by agent id — including stopped ones still winding down. */
+  private runs = new Map<string, LiveRun>();
+  private stopGraceMs = DEFAULT_STOP_GRACE_MS;
+  /** Records whose finished session was released (shut down and disposed). */
+  private released = new WeakSet<AgentRecord>();
+  /** Pending releases, by record. */
+  private releaseTimers = new Map<AgentRecord, ReturnType<typeof setTimeout>>();
+  private sessionReleaseMs = DEFAULT_SESSION_RELEASE_MS;
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -606,6 +680,179 @@ export class AgentManager {
 
   getMaxConcurrentForeground(): number {
     return this.maxConcurrentForeground;
+  }
+
+  /** How long a stopped run may take to end before it is abandoned (see DEFAULT_STOP_GRACE_MS). */
+  setStopGraceMs(ms: number) {
+    this.stopGraceMs = Math.max(0, ms);
+  }
+
+  /** How long a finished agent keeps its live session (see DEFAULT_SESSION_RELEASE_MS). */
+  setSessionReleaseMs(ms: number) {
+    this.sessionReleaseMs = Math.max(0, ms);
+  }
+
+  /**
+   * After a run settles, schedule the release of its session. Only a saved
+   * session (it has a file to reopen from) that is idle: an in-memory one is
+   * the only copy of the conversation, and a stuck one is handled by resume.
+   */
+  private scheduleRelease(record: AgentRecord): void {
+    this.cancelRelease(record);
+    if (!record.session || !record.sessionFile) return;
+    const timer = setTimeout(() => {
+      this.releaseTimers.delete(record);
+      this.releaseSession(record);
+    }, this.sessionReleaseMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.releaseTimers.set(record, timer);
+  }
+
+  private cancelRelease(record: AgentRecord): void {
+    const timer = this.releaseTimers.get(record);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.releaseTimers.delete(record);
+  }
+
+  /** Shut down and dispose a finished agent's session, keeping it readable. */
+  private releaseSession(record: AgentRecord): void {
+    const session = record.session;
+    if (!session || this.released.has(record)) return;
+    if (this.agents.get(record.id) !== record || this.isRunActive(record.id) || session.isStreaming === true) return;
+    this.released.add(record);
+    void shutdownChildSession(session);
+  }
+
+  /** Whether resuming must reopen the conversation from its file: the live session is gone or stuck. */
+  private needsReopen(record: AgentRecord): boolean {
+    return this.released.has(record) || record.session?.isStreaming === true;
+  }
+
+  /**
+   * Take a run's slot and start tracking it until it settles. The single place
+   * a pool counter goes up; `releaseRunSlot` is the single place it comes down.
+   */
+  private beginRun(id: string, record: AgentRecord, pool: Pool | undefined): LiveRun {
+    let resolveDone!: () => void;
+    let resolveAbandoned!: () => void;
+    const run: LiveRun = {
+      id,
+      record,
+      pool,
+      slotReleased: false,
+      settled: false,
+      abandoned: false,
+      done: new Promise<void>(resolve => { resolveDone = resolve; }),
+      resolveDone: () => resolveDone(),
+      whenAbandoned: new Promise<void>(resolve => { resolveAbandoned = resolve; }),
+      resolveAbandoned: () => resolveAbandoned(),
+      onAbandon: async () => {},
+    };
+    if (pool === "background") this.runningBackground++;
+    else if (pool === "foreground") this.runningForeground++;
+    this.runs.set(id, run);
+    return run;
+  }
+
+  /** Give back the run's slot. Idempotent: a slot is released exactly once. */
+  private releaseRunSlot(run: LiveRun): void {
+    if (run.slotReleased) return;
+    run.slotReleased = true;
+    if (run.pool === "background") this.runningBackground--;
+    else if (run.pool === "foreground") this.runningForeground--;
+  }
+
+  /** Stop tracking a run that never got going (a startup failure): no completion. */
+  private discardRun(run: LiveRun): void {
+    this.releaseRunSlot(run);
+    run.settled = true;
+    if (run.graceTimer) clearTimeout(run.graceTimer);
+    if (this.runs.get(run.id) === run) this.runs.delete(run.id);
+    run.resolveDone();
+  }
+
+  /**
+   * The shared tail of every settle path, normal or abandoned: release the
+   * slot, notify, and let the queue drain into it. Idempotent, so a run that
+   * was abandoned and then ends after all settles only once.
+   */
+  private endRun(run: LiveRun): void {
+    if (run.settled) return;
+    run.settled = true;
+    if (run.graceTimer) clearTimeout(run.graceTimer);
+    if (this.runs.get(run.id) === run) this.runs.delete(run.id);
+    this.releaseRunSlot(run);
+    this.notifyComplete(run.record);
+    this.drainQueue();
+    run.resolveDone();
+    if (!run.abandoned) this.scheduleRelease(run.record);
+  }
+
+  /** Fire onComplete. Never throws: a completion side effect must not take a run (or pi) down. */
+  private notifyComplete(record: AgentRecord): void {
+    try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+  }
+
+  /** After a stop: give the run the grace period to end, then abandon it. */
+  private armStopGrace(id: string): void {
+    const run = this.runs.get(id);
+    if (!run || run.settled || run.graceTimer) return;
+    run.graceTimer = setTimeout(() => { void this.abandonRun(run); }, this.stopGraceMs);
+    (run.graceTimer as { unref?: () => void }).unref?.();
+  }
+
+  /**
+   * Settle a stopped run that did not end within the grace period. Its record
+   * stays "stopped" — and resumable: a resume reopens the conversation from its
+   * session file, since the in-memory session is still stuck in the tool.
+   */
+  private async abandonRun(run: LiveRun): Promise<void> {
+    if (run.settled || run.abandoned) return;
+    run.abandoned = true;
+    const record = run.record;
+    record.error ??= `The run did not end within ${Math.round(this.stopGraceMs / 1000)}s of the stop request `
+      + "(a tool ignored it), so it was abandoned.";
+    record.completedAt ??= Date.now();
+    // Release waiters first: the cleanup below may run git.
+    run.resolveAbandoned();
+    try { await run.onAbandon(); } catch { /* best effort, like every settle path */ }
+    this.endRun(run);
+  }
+
+  /**
+   * Await a run inline, returning once it settles — or, after a stop, once it
+   * has had INLINE_STOP_WAIT_MS to settle. What keeps Esc from stranding a
+   * foreground call on a child whose tool ignores the abort.
+   */
+  private async waitInline(record: AgentRecord, promise: Promise<unknown>): Promise<void> {
+    const signal = record.abortController?.signal;
+    const settled = promise.then(() => {}, () => {});
+    if (!signal) return settled;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<void>(resolve => {
+      onAbort = () => { timer = setTimeout(resolve, INLINE_STOP_WAIT_MS); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([settled, stopped]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /**
+   * Whether the agent still has a run in flight: running or queued, or stopped
+   * but not yet settled (still committing its worktree, or a tool ignoring the
+   * stop). What callers that must not treat "stopped" as "over" check.
+   */
+  isRunActive(id: string): boolean {
+    const record = this.agents.get(id);
+    if (!record) return false;
+    return isBusy(record) || this.runs.has(id);
   }
 
   /**
@@ -678,11 +925,11 @@ export class AgentManager {
       // that queues flips to "queued" there rather than being guessed at here,
       // since the pool decision needs the finished record.
       status: options.isBackground ? "queued" : "running",
-      toolUses: 0,
+      toolUses: options.carry?.toolUses ?? 0,
       startedAt: Date.now(),
       abortController,
-      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
-      compactionCount: 0,
+      lifetimeUsage: options.carry ? { ...options.carry.lifetimeUsage } : { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+      compactionCount: options.carry?.compactionCount ?? 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
       // declared it (e.g. a cross-extension RPC spawn). The widget's background-
@@ -755,10 +1002,7 @@ export class AgentManager {
     if (signal === undefined) return true;
     if (signal.aborted) {
       const record = this.agents.get(id);
-      if (record) {
-        record.status = "stopped";
-        record.completedAt = Date.now();
-      }
+      if (record) this.stopQueued(record);
       return false;
     }
     signal.addEventListener("abort", () => this.abort(id), { once: true });
@@ -784,14 +1028,14 @@ export class AgentManager {
       (err) => {
         this.startups.delete(id);
         if (queuedPool !== undefined) {
-          // Mirrors settleRun: an inline caller gets this failure as a throw
+          // Mirrors endRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
           if (queuedPool === "foreground") record.resultConsumed = true;
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
           record.completedAt = Date.now();
-          this.onComplete?.(record);
+          this.notifyComplete(record);
         } else {
           this.agents.delete(id);
         }
@@ -843,26 +1087,39 @@ export class AgentManager {
     // still copying its repo. Claiming "running" here also keeps abort() and
     // abortAll() able to reach an agent whose worktree is still being created.
     //
-    // The pool is resolved ONCE, here, and carried to `settleRun` below:
+    // The pool is resolved ONCE, here, and carried on the run to `endRun`:
     // `poolFor` reads `maxConcurrentForeground`, which the user can change from
     // `/agents → Settings` mid-run, so recomputing it at settle time would
     // decrement a pool this run never charged (counter underflow, limit
     // silently lifted) or skip the decrement for one it did (leaked slot —
-    // every later blocking spawn queues forever). The two startup exits below
-    // never reach `settleRun`, so they hand the slot back themselves.
+    // every later blocking spawn queues forever). The release is idempotent
+    // (`releaseRunSlot`), so a run that is abandoned and then ends after all,
+    // or a stop during startup, can never free the slot twice. Foreground runs
+    // set `resultConsumed` before settling, so onComplete skips notifications
+    // the inline result already delivered.
     const pool = this.poolFor(record);
-    const releaseSlot = () => {
-      if (pool === "background") this.runningBackground--;
-      else if (pool === "foreground") this.runningForeground--;
-    };
     record.status = "running";
     record.startedAt = Date.now();
     record.startGate = undefined;
     record.cwd = customCwd;
     record.baseCwd = baseCwd;
     this.pi = pi;
-    if (pool === "background") this.runningBackground++;
-    else if (pool === "foreground") this.runningForeground++;
+    const run = this.beginRun(id, record, pool);
+    // A stop that lands while the worktree is still being made ends the run
+    // there: discard the fresh copy, then settle as stopped, completion and all.
+    const stopDuringStartup = async (wt: { path: string; branch: string; baseSha: string; workPath: string }) => {
+      if (record.status === "running") {
+        record.status = "stopped";
+        record.completedAt = Date.now();
+      }
+      // Free the slot before the git cleanup, so the queue need not wait on it.
+      this.releaseRunSlot(run);
+      this.drainQueue();
+      try {
+        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+      } catch { /* best effort */ }
+      this.endRun(run);
+    };
 
     // Worktree isolation: try to create a temporary git worktree. Strict —
     // fail loud if not possible (no silent fallback to main tree). Done BEFORE
@@ -876,29 +1133,27 @@ export class AgentManager {
     const priorWorktreeResult = options.restoreWorktree?.prior;
     if (options.restoreWorktree) {
       if (!isWorktreeIsolationEnabled()) {
-        releaseSlot();
+        this.discardRun(run);
         throw new Error(`Cannot resume agent ${id}: it ran in a git worktree, and worktree isolation is turned off in this project.`);
       }
       const wt = { ...options.restoreWorktree.worktree };
       const error = await restoreWorktree(pi, baseCwd, wt, priorWorktreeResult);
       if (error) {
-        releaseSlot();
+        this.discardRun(run);
         throw new Error(`Cannot resume agent ${id} in its git worktree: ${error}. Nothing was run.`);
       }
       record.worktree = wt;
       record.worktreeResult = priorWorktreeResult;
       worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
       this.worktreeRepos.add(baseCwd);
-      if (record.status !== "running") {
-        releaseSlot();
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
-        this.drainQueue();
+      if (record.status !== "running" || options.signal?.aborted) {
+        await stopDuringStartup(wt);
         return;
       }
     } else if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
       const wt = await createWorktree(pi, baseCwd, id);
       if (!wt) {
-        releaseSlot();
+        this.discardRun(run);
         throw new Error(
           'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
           'Initialize git and commit at least once, or omit `isolation`.',
@@ -918,16 +1173,15 @@ export class AgentManager {
       // (abort(), abortAll()) — a window that did not exist when creation was
       // synchronous. The record is already terminal, so launching the run would
       // burn tokens on work nobody is waiting for: discard the fresh (and by
-      // definition unchanged) worktree instead.
-      if (record.status !== "running") {
-        releaseSlot();
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
-        this.drainQueue();
+      // definition unchanged) worktree instead. A parent signal that fired
+      // meanwhile is the same stop, arriving by the other route.
+      if (record.status !== "running" || options.signal?.aborted) {
+        await stopDuringStartup(wt);
         return;
       }
     }
 
-    this.onStart?.(record);
+    try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
     let detachParentSignal: (() => void) | undefined;
@@ -990,6 +1244,12 @@ export class AgentManager {
         maxSubagentDepth: record.maxSubagentDepth,
       },
       onSessionCreated: (session) => {
+        // Abandoned before its session even existed (a hung extension
+        // startup): nobody will use this session, so release it now.
+        if (run.abandoned) {
+          void shutdownChildSession(session);
+          return;
+        }
         record.session = session;
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
@@ -1033,6 +1293,9 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns }) => {
+        // Abandoned after a stop it ignored: the record was settled without
+        // this run, and may already belong to a newer one.
+        if (run.abandoned) return responseText;
         record.maxTurns = maxTurns;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
@@ -1081,10 +1344,12 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, true, pool);
+        if (record.isBackground === false) record.resultConsumed = true;
+        this.endRun(run);
         return responseText;
       })
       .catch(async (err) => {
+        if (run.abandoned) return "";
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           record.status = "error";
@@ -1114,11 +1379,34 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, false, pool);
+        if (record.isBackground === false) record.resultConsumed = true;
+        this.endRun(run);
         return "";
       });
 
-    record.promise = promise;
+    // What an abandoned run still owes: what the settle paths above would have
+    // done, minus the result it never produced.
+    run.onAbandon = async () => {
+      detach();
+      if (record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* ignore */ }
+        record.outputCleanup = undefined;
+      }
+      if (record.worktree) {
+        try {
+          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+          record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
+          const note = worktreeNote(record.worktreeResult, baseCwd, customCwd !== undefined);
+          if (note) record.result = (record.result ?? "") + note;
+        } catch { /* ignore cleanup errors */ }
+      }
+      this.abortOwnedChildren(id);
+      if (record.isBackground === false) record.resultConsumed = true;
+    };
+
+    // Every waiter (spawnAndWait, waitForAll, result tools, resume) joins the
+    // run — or its abandonment, whichever comes first.
+    record.promise = Promise.race([promise, run.whenAbandoned.then(() => record.result ?? "")]);
 
     // Notify caller that spawn is complete (record is in the map, promise is set).
     // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
@@ -1126,44 +1414,6 @@ export class AgentManager {
     // starts. Read off the options, so a spawn that started from a queue drain
     // still reaches the caller that queued it.
     options.onSpawned?.(id);
-  }
-
-  /**
-   * The shared tail of both settle paths: release whatever pool slot the run
-   * held, notify, and let the queue drain into the freed slot.
-   *
-   * The decrement lives HERE and nowhere else. `abort()` on a running record
-   * only fires its controller and leaves the run to settle normally, so
-   * decrementing there too would double-free — permanently lifting the limit.
-   *
-   * Foreground agents fire `onComplete` for lifecycle symmetry, with
-   * `resultConsumed` set so the callback skips notifications the inline result
-   * already delivered.
-   *
-   * @param guardCallback swallow a throwing `onComplete` (the success path does;
-   *   the error path historically did not, and keeps not doing so).
-   * @param pool the pool this run was CHARGED TO at start time — passed in, not
-   *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
-   *   the release disagree with the acquire.
-   */
-  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
-    if (!record.isBackground) record.resultConsumed = true;
-    if (pool === "background") this.runningBackground--;
-    else if (pool === "foreground") this.runningForeground--;
-
-    if (guardCallback) {
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-    } else {
-      this.onComplete?.(record);
-    }
-
-    // The isBackground half reproduces the pre-pool condition exactly — a
-    // background settle has always drained, even for a nested child that held
-    // no slot — so that path is unchanged whether or not the foreground pool is
-    // on. The `pool` half only adds the drain a freed FOREGROUND slot needs.
-    // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
-    // about reachability, and matching the old condition needs no such claim.
-    if (record.isBackground || pool !== undefined) this.drainQueue();
   }
 
   /**
@@ -1269,8 +1519,9 @@ export class AgentManager {
 
     // undefined when it was aborted while queued, or stopped mid-copy, and so
     // never ran — the record is already terminal with a completedAt, which is
-    // what the caller renders.
-    if (record.promise) await record.promise;
+    // what the caller renders. After a stop, returns within INLINE_STOP_WAIT_MS
+    // even if the run is still winding down (or never will).
+    if (record.promise) await this.waitInline(record, record.promise);
 
     // A record that ended "error" without ever getting a promise never ran: the
     // same startup failure spawn() rethrows on the immediate path (#179). Keep
@@ -1311,6 +1562,31 @@ export class AgentManager {
     // have claimed the record meanwhile.
     await this.waitForSettle(record);
     if (isBusy(record)) return undefined;
+
+    // Its last run settled, but the session is still inside it: a tool that
+    // ignored the stop (the run was abandoned) or the watchdog. Prompting it
+    // would fail with "Agent is already processing", so reopen the
+    // conversation from its session file instead, as for an evicted agent.
+    // Removing the record disposes the stuck session first, which also stops
+    // it from writing to the file the reopened run continues.
+    // The same when its finished session was released to free its resources.
+    if (this.needsReopen(record)) {
+      const state = resumeStateOf(record);
+      if (!state) {
+        throw new Error(
+          `Cannot resume agent ${id}: its last run is stuck in a tool call that ignored the stop request, `
+          + "and it has no saved session to reopen.",
+        );
+      }
+      this.removeRecord(id, record);
+      // The agent's lifetime figures continue on the reopened record.
+      return this.reopen(state, prompt, signal, options, {
+        lifetimeUsage: { ...record.lifetimeUsage },
+        toolUses: record.toolUses,
+        compactionCount: record.compactionCount,
+      });
+    }
+    this.cancelRelease(record);
 
     // Claimed before the awaited preparation, so a concurrent resume is refused
     // rather than preparing (and running) the same agent twice. A failed
@@ -1374,7 +1650,7 @@ export class AgentManager {
               record.status = "error";
               record.error = err instanceof Error ? err.message : String(err);
               record.completedAt = Date.now();
-              this.onComplete?.(record);
+              this.notifyComplete(record);
             }
           },
           release: () => {},
@@ -1399,11 +1675,12 @@ export class AgentManager {
     const abortController = new AbortController();
     record.abortController = abortController;
     const onParentAbort = () => this.abort(id);
+    const run = this.beginRun(id, record, undefined);
     // Keep the promise on the record as well as awaiting it inline: result
     // tools and waitForAll must join this run, not the already settled spawn.
     const promise = (async () => {
       try {
-        this.onStart?.(record);
+        try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
         if (signal?.aborted) this.abort(id);
         else signal?.addEventListener("abort", onParentAbort, { once: true });
         const { text, failure, aborted, steered } = abortController.signal.aborted ? { text: "" } : await resumeAgent(session, prompt, {
@@ -1425,25 +1702,32 @@ export class AgentManager {
           },
           signal: abortController.signal,
         });
+        if (run.abandoned) return record.result ?? "";
         settleResumeStatus(record, { failure, aborted, steered });
         record.result = text;
         record.completedAt ??= Date.now();
       } catch (err) {
+        if (run.abandoned) return record.result ?? "";
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
-      } finally {
-        signal?.removeEventListener("abort", onParentAbort);
-        this.abortOwnedChildren(id);
-        await this.finishResumedWorktree(record);
-        try { this.onComplete?.(record); } catch { /* completion observers do not replace the inline result */ }
       }
+      signal?.removeEventListener("abort", onParentAbort);
+      this.abortOwnedChildren(id);
+      await this.finishResumedWorktree(record);
+      // Completion observers never replace the inline result: endRun guards them.
+      this.endRun(run);
       return record.result ?? "";
     })();
-    record.promise = promise;
-    await promise;
+    run.onAbandon = async () => {
+      signal?.removeEventListener("abort", onParentAbort);
+      this.abortOwnedChildren(id);
+      await this.finishResumedWorktree(record);
+    };
+    record.promise = Promise.race([promise, run.whenAbandoned.then(() => record.result ?? "")]);
+    await this.waitInline(record, record.promise);
     return record;
   }
 
@@ -1465,6 +1749,7 @@ export class AgentManager {
     prompt: string,
     signal: AbortSignal | undefined,
     options: ResumeOptions | undefined,
+    carry?: Pick<AgentRecord, "lifetimeUsage" | "toolUses" | "compactionCount">,
   ): Promise<AgentRecord> {
     const pi = options?.pi ?? this.pi;
     const ctx = options?.ctx;
@@ -1493,6 +1778,7 @@ export class AgentManager {
     const spawnOptions: SpawnOptions = {
       description: entry.description,
       reuseId: entry.id,
+      carry,
       reclaim: entry.handle !== undefined ? { handle: entry.handle, alias: entry.alias } : undefined,
       resumeSessionFile: entry.sessionFile,
       model,
@@ -1608,8 +1894,8 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
-    if (occupiesPoolSlot(record)) this.runningBackground++;
-    this.onStart?.(record);
+    const run = this.beginRun(id, record, occupiesPoolSlot(record) ? "background" : undefined);
+    try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
     // Fresh abort controller so /agents stop and steering target THIS run rather
     // than the previous one's settled controller.
@@ -1630,7 +1916,9 @@ export class AgentManager {
     // After the record is in its running shape, before the run is kicked off.
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
-    const settle = async () => {
+    // Everything but the completion — shared by the normal settle and an
+    // abandonment, which settles without the run's result.
+    const windDown = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1641,9 +1929,11 @@ export class AgentManager {
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
       await this.finishResumedWorktree(record);
-      if (occupiesPoolSlot(record)) this.runningBackground--;
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-      this.drainQueue();
+    };
+    run.onAbandon = windDown;
+    const settle = async () => {
+      await windDown();
+      this.endRun(run);
     };
 
     const promise = resumeAgent(record.session, prompt, {
@@ -1666,6 +1956,7 @@ export class AgentManager {
       signal: abortController.signal,
     })
       .then(async ({ text, failure, aborted, steered }) => {
+        if (run.abandoned) return text;
         settleResumeStatus(record, { failure, aborted, steered });
         record.result = text;
         record.completedAt ??= Date.now();
@@ -1673,6 +1964,7 @@ export class AgentManager {
         return text;
       })
       .catch(async (err) => {
+        if (run.abandoned) return "";
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
@@ -1682,7 +1974,7 @@ export class AgentManager {
         return "";
       });
 
-    record.promise = promise;
+    record.promise = Promise.race([promise, run.whenAbandoned.then(() => record.result ?? "")]);
   }
 
   /**
@@ -1794,13 +2086,10 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record) return false;
 
-    // Remove from queue if queued. No decrement — the slot was never taken —
-    // and no onComplete, matching what a queued background abort has always
-    // done; a blocking caller learns of the stop from its own tool result.
+    // Remove from queue if queued. No decrement — the slot was never taken.
     if (record.status === "queued") {
       this.dequeue(q => q.id === id);
-      record.status = "stopped";
-      record.completedAt = Date.now();
+      this.stopQueued(record);
       return true;
     }
 
@@ -1808,13 +2097,31 @@ export class AgentManager {
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
+    // "stopped" is what the user sees at once; the run itself settles when it
+    // has wound down — or is abandoned if a tool ignores the abort.
+    this.armStopGrace(id);
     return true;
+  }
+
+  /**
+   * Settle a record that never left the queue as stopped. It still reaches
+   * onComplete, like every other stop: the `subagents:failed` event, the
+   * session's `subagents:record` entry and the UI's activity cleanup all hang
+   * off it. A blocking caller learns of the stop from its own tool result.
+   */
+  private stopQueued(record: AgentRecord): void {
+    record.status = "stopped";
+    record.completedAt = Date.now();
+    if (record.isBackground === false) record.resultConsumed = true;
+    this.notifyComplete(record);
   }
 
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
-    const session = record.session;
+    this.cancelRelease(record);
+    // Already shut down and disposed: once is all a session's extensions get.
+    const session = this.released.has(record) ? undefined : record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
     record.session = undefined;
@@ -1867,7 +2174,8 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      // A stopped record whose run has not settled still owns its session.
+      if (this.isRunActive(id)) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -1881,7 +2189,7 @@ export class AgentManager {
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (this.isRunActive(id)) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -1894,32 +2202,33 @@ export class AgentManager {
     this.tombstones.clear();
   }
 
-  /** Whether any agents are still running or queued. */
+  /**
+   * Whether any agents are still running or queued — including a stopped one
+   * whose run has not settled yet, which still holds its slot.
+   */
   hasRunning(): boolean {
-    return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
-    );
+    return this.runs.size > 0 || [...this.agents.values()].some(isBusy);
   }
 
   /** Abort all running and queued agents immediately. */
   abortAll(): number {
     let count = 0;
     // Clear queued agents first
-    for (const queued of this.queue) {
-      const record = this.agents.get(queued.id);
-      if (record) {
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
-    }
+    const queued = this.queue
+      .map(entry => this.agents.get(entry.id))
+      .filter((record): record is AgentRecord => record?.status === "queued");
     this.dequeue(() => true);
+    for (const record of queued) {
+      this.stopQueued(record);
+      count++;
+    }
     // Abort running agents
-    for (const record of this.agents.values()) {
+    for (const [id, record] of this.agents) {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.armStopGrace(id);
         count++;
       }
     }
@@ -1965,6 +2274,9 @@ export class AgentManager {
         if (startup) pending.push(startup);
         if (record.promise) pending.push(record.promise);
       }
+      // A stopped run still winding down holds its slot, and whatever is queued
+      // behind it starts only once it settles (or is abandoned).
+      for (const run of this.runs.values()) pending.push(run.done);
       if (pending.length === 0) break;
       await Promise.allSettled(pending);
     }
@@ -1980,7 +2292,17 @@ export class AgentManager {
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);
-    const sessions = [...this.agents.values()].map(record => record.session);
+    // Release anyone waiting on a run, and stop the grace timers: the runs
+    // themselves are stopped by their sessions' disposal below.
+    for (const run of this.runs.values()) {
+      if (run.graceTimer) clearTimeout(run.graceTimer);
+      run.settled = true;
+      run.resolveDone();
+    }
+    this.runs.clear();
+    for (const timer of this.releaseTimers.values()) clearTimeout(timer);
+    this.releaseTimers.clear();
+    const sessions = [...this.agents.values()].filter(record => !this.released.has(record)).map(record => record.session);
     this.agents.clear();
     this.startups.clear();
     if (pi) {

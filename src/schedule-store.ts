@@ -10,45 +10,58 @@
  * from disk, applies the change, atomic-writes via temp+rename, releases.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 
 const LOCK_RETRY_MS = 50;
-const LOCK_MAX_RETRIES = 100;
-
-/** Block this thread for `ms` without spinning (synchronous, like the lock). */
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
+/** How long the async path keeps retrying a held lock, without blocking the event loop. */
+const DEFAULT_LOCK_WAIT_MS = 5_000;
+/**
+ * A lock older than this is stale whoever it names. Holders keep it for the
+ * milliseconds a read-modify-write takes, so an old lock means its holder died
+ * — and its pid may since have been reused by an unrelated live process, which
+ * would otherwise make the lock permanent.
+ */
+const LOCK_STALE_MS = 30_000;
 
 function isProcessRunning(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM: the process exists but belongs to someone else — alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
-function acquireLock(lockPath: string): void {
-  for (let i = 0; i < LOCK_MAX_RETRIES; i++) {
+/**
+ * Take the lock if it is free (or stale), without waiting. Never blocks: the
+ * store runs on pi's event loop, and a synchronous wait froze the whole TUI.
+ * Returns false while another live process holds it.
+ */
+function tryAcquireLock(lockPath: string): boolean {
+  // A few passes: one to clear a stale lock, one to take it, one for a race.
+  for (let i = 0; i < 3; i++) {
     try {
       writeFileSync(lockPath, `${process.pid}`, { flag: "wx" });
-      return;
-    } catch (e: any) {
-      if (e.code === "EEXIST") {
-        try {
-          const pid = parseInt(readFileSync(lockPath, "utf-8"), 10);
-          if (pid && !isProcessRunning(pid)) {
-            unlinkSync(lockPath);
-            continue;
-          }
-        } catch { /* ignore — try again */ }
-        // Sleep instead of spinning: the holder is another Pi process, and a
-        // busy loop would burn a core for every retry it waits.
-        sleepSync(LOCK_RETRY_MS);
-        continue;
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      try {
+        const pid = parseInt(readFileSync(lockPath, "utf-8"), 10);
+        const age = Date.now() - statSync(lockPath).mtimeMs;
+        if (!pid || !isProcessRunning(pid) || age > LOCK_STALE_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue; // vanished between the write and the read — try again
       }
-      throw e;
+      return false;
     }
   }
-  throw new Error(`Failed to acquire schedule lock: ${lockPath}`);
+  return false;
 }
 
 function releaseLock(lockPath: string): void {
@@ -63,11 +76,16 @@ export function resolveStorePath(cwd: string, sessionId: string): string {
 export class ScheduleStore {
   private filePath: string;
   private lockPath: string;
+  private lockWaitMs: number;
   private jobs = new Map<string, ScheduledSubagent>();
+  /** Async writes waiting for the lock, and the last of them (for ordering). */
+  private queuedWrites = 0;
+  private writeTail: Promise<unknown> = Promise.resolve();
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options: { lockWaitMs?: number } = {}) {
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
+    this.lockWaitMs = options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
     this.load();
   }
 
@@ -110,10 +128,8 @@ export class ScheduleStore {
     renameSync(tmp, this.filePath);
   }
 
-  /** Acquire lock → reload → mutate → save → release. */
-  private withLock<T>(fn: () => T): T {
-    this.ensureDir();
-    acquireLock(this.lockPath);
+  /** Reload → mutate → save → release, with the lock already held. */
+  private underLock<T>(fn: () => T): T {
     try {
       this.load();
       const result = fn();
@@ -122,6 +138,45 @@ export class ScheduleStore {
     } finally {
       releaseLock(this.lockPath);
     }
+  }
+
+  /**
+   * Acquire lock → reload → mutate → save → release. Fails at once, rather
+   * than blocking pi's event loop, when another process holds the lock: the
+   * callers are interactive (the Agent tool, the menu) and can say so.
+   */
+  private withLock<T>(fn: () => T): T {
+    this.ensureDir();
+    if (!tryAcquireLock(this.lockPath)) {
+      throw new Error(`The schedule store is busy (locked by another pi process): ${this.lockPath}`);
+    }
+    return this.underLock(fn);
+  }
+
+  /**
+   * As `withLock`, but waits for a held lock — asynchronously, never blocking
+   * the event loop. Writes are applied in call order: one that finds the lock
+   * free and nothing queued applies at once (synchronously), anything else
+   * queues behind the writes before it.
+   */
+  private withLockAsync<T>(fn: () => T): Promise<T> {
+    try {
+      this.ensureDir();
+      if (this.queuedWrites === 0 && tryAcquireLock(this.lockPath)) return Promise.resolve(this.underLock(fn));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    this.queuedWrites++;
+    const write = this.writeTail.then(async () => {
+      const deadline = Date.now() + this.lockWaitMs;
+      while (!tryAcquireLock(this.lockPath)) {
+        if (Date.now() >= deadline) throw new Error(`Failed to acquire schedule lock: ${this.lockPath}`);
+        await new Promise<void>(resolve => setTimeout(resolve, LOCK_RETRY_MS));
+      }
+      return this.underLock(fn);
+    }).finally(() => { this.queuedWrites--; });
+    this.writeTail = write.catch(() => {});
+    return write;
   }
 
   /** Read-only — returns a snapshot of the in-memory cache. */
@@ -151,13 +206,21 @@ export class ScheduleStore {
     // No-op fast path — an unknown id changes nothing, so don't lock or touch
     // disk (which would otherwise lazily create the backing directory).
     if (!this.jobs.has(id)) return undefined;
-    return this.withLock(() => {
-      const existing = this.jobs.get(id);
-      if (!existing) return undefined;
-      const updated = { ...existing, ...patch };
-      this.jobs.set(id, updated);
-      return updated;
-    });
+    return this.withLock(() => this.applyPatch(id, patch));
+  }
+
+  /** `update` for timer-driven callers: waits for a held lock without blocking. */
+  async updateAsync(id: string, patch: Partial<ScheduledSubagent>): Promise<ScheduledSubagent | undefined> {
+    if (!this.jobs.has(id)) return undefined;
+    return this.withLockAsync(() => this.applyPatch(id, patch));
+  }
+
+  private applyPatch(id: string, patch: Partial<ScheduledSubagent>): ScheduledSubagent | undefined {
+    const existing = this.jobs.get(id);
+    if (!existing) return undefined;
+    const updated = { ...existing, ...patch };
+    this.jobs.set(id, updated);
+    return updated;
   }
 
   remove(id: string): boolean {

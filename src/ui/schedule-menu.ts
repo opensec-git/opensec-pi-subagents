@@ -100,6 +100,12 @@ export async function showSchedulesMenu(
   const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler));
   if (!ok) return;
 
-  scheduler.removeJob(job.id);
+  try {
+    scheduler.removeJob(job.id);
+  } catch (err) {
+    // The store lock is held by another pi process (or the disk failed).
+    ctx.ui.notify(`Could not cancel "${job.name}": ${err instanceof Error ? err.message : String(err)}`, "warning");
+    return;
+  }
   ctx.ui.notify(`Cancelled "${job.name}".`, "info");
 }

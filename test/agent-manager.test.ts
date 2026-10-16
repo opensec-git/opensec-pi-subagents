@@ -1456,8 +1456,9 @@ describe("AgentManager — abortAll", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
 
-  it("stops both queued and running agents and returns the total count", () => {
+  it("stops both queued and running agents and returns the total count", async () => {
     manager = new AgentManager(undefined, 1);
+    manager.setStopGraceMs(20);
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
 
     const running = manager.spawn(mockPi, mockCtx, "X", "r", {
@@ -1474,6 +1475,10 @@ describe("AgentManager — abortAll", () => {
     expect(manager.abortAll()).toBe(2);
     expect(manager.getRecord(running)?.status).toBe("stopped");
     expect(manager.getRecord(queued)?.status).toBe("stopped");
+    // The running agent's run never ends (it ignores the abort), so it still
+    // holds its slot until the stop grace abandons it.
+    expect(manager.hasRunning()).toBe(true);
+    await new Promise(r => setTimeout(r, 60));
     expect(manager.hasRunning()).toBe(false);
   });
 

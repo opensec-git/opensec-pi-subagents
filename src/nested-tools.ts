@@ -89,13 +89,19 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
+  /** Whether the agent's run is still in flight, including a stopped one still winding down. */
+  isRunActive?(id: string): boolean;
   /** An evicted child, still resumable from its session file. */
   findTombstone?(id: string): { parentAgentId?: string } | undefined;
   resume(
     id: string,
     prompt: string,
     signal?: AbortSignal,
-    options?: { pi?: ExtensionAPI; ctx?: ExtensionContext },
+    options?: {
+      pi?: ExtensionAPI;
+      ctx?: ExtensionContext;
+      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+    },
   ): Promise<AgentRecord | undefined>;
 }
 
@@ -158,6 +164,26 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
 export function createNestedSubagentTools(context: NestedToolContext): ToolDefinition[] {
+  /**
+   * Nested children are hidden from every reporting surface, so their spend
+   * would otherwise be unattributable. Fold it into every ancestor's record: the
+   * top-level one appears in lifecycle events, completion notifications, and
+   * `/agents`, and those all read `lifetimeUsage`. The whole chain is walked,
+   * not just the immediate parent — a spawn callback only fires for that child's
+   * OWN turns, so stopping at one level would hide a great-grandchild from the
+   * only record anyone can see. (The live widget/fleet counters read their own
+   * per-agent activity tracker, which still sees only the top-level agent's own
+   * turns.) Used for spawns and resumes alike.
+   */
+  const bookIntoAncestors = (usage: { input: number; output: number; cacheWrite: number }): void => {
+    for (let id: string | undefined = context.parentAgentId; id !== undefined; ) {
+      const ancestor = context.manager.getRecord(id);
+      if (!ancestor) break;
+      addUsage(ancestor.lifetimeUsage, usage);
+      id = ancestor.parentAgentId;
+    }
+  };
+
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
@@ -209,7 +235,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         let resumed: AgentRecord | undefined;
         try {
-          resumed = await context.manager.resume(params.resume, params.prompt, signal, { pi: context.pi, ctx });
+          resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+            pi: context.pi,
+            ctx,
+            onAssistantUsage: bookIntoAncestors,
+          });
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err), true);
         }
@@ -297,23 +327,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
-        // Nested children are hidden from every reporting surface, so their spend
-        // would otherwise be unattributable. Fold it into every ancestor's record:
-        // the top-level one appears in lifecycle events, completion notifications,
-        // and `/agents`, and those all read `lifetimeUsage`. The whole chain is
-        // walked, not just the immediate parent — a spawn callback only fires for
-        // that child's OWN turns, so stopping at one level would hide a
-        // great-grandchild from the only record anyone can see. (The live
-        // widget/fleet counters read their own per-agent activity tracker, which
-        // still sees only the top-level agent's own turns.)
-        onAssistantUsage: (usage) => {
-          for (let id: string | undefined = context.parentAgentId; id !== undefined; ) {
-            const ancestor = context.manager.getRecord(id);
-            if (!ancestor) break;
-            addUsage(ancestor.lifetimeUsage, usage);
-            id = ancestor.parentAgentId;
-          }
-        },
+        onAssistantUsage: bookIntoAncestors,
         depth: childDepth,
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: context.maxSubagentDepth,
@@ -406,7 +420,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // stays unconsumed. Queued records have no promise until the manager starts
       // them, so wait — abortably — on the queue's start gate (polling without
       // one) until they leave the queue, then await.
-      if (params.wait && (record.status === "queued" || record.status === "running")) {
+      if (params.wait && (record.status === "queued" || record.status === "running" || context.manager.isRunActive?.(record.id))) {
         while (record.status === "queued") {
           await abortable(record.startGate ?? new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }

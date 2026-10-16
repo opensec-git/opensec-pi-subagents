@@ -28,6 +28,28 @@ import {
 } from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
+/**
+ * Settled workflow runs a session keeps in memory (card, fleet row, dialog,
+ * `resumeFromRunId`). Each holds its script and full progress log, so an
+ * unbounded map grows for the whole life of a long session.
+ */
+export const MAX_SETTLED_WORKFLOW_TASKS = 50;
+
+/**
+ * Drop the oldest settled runs beyond `max`, in insertion (start) order. Live
+ * runs — running or paused — are never dropped.
+ */
+export function pruneSettledWorkflowTasks(tasks: Map<string, WorkflowTask>, max = MAX_SETTLED_WORKFLOW_TASKS): void {
+  let settled = 0;
+  for (const task of tasks.values()) if (task.status !== "running" && task.status !== "paused") settled++;
+  for (const [id, task] of tasks) {
+    if (settled <= max) return;
+    if (task.status === "running" || task.status === "paused") continue;
+    tasks.delete(id);
+    settled--;
+  }
+}
+
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
 export function workflowRunId(): string {
   return `wf_${randomUUID().replace(/-/g, "").slice(0, 12)}`;

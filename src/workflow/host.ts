@@ -119,13 +119,32 @@ function resolvedInfo(record: AgentRecord | undefined) {
   };
 }
 
-function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
-  const tokens = getLifetimeTotal(record.lifetimeUsage);
+/** What a record had spent before a run, so a resumed run reports only its own. */
+interface SpendBaseline {
+  tokens: number;
+  outputTokens: number;
+  toolUses: number;
+}
+
+function spendOf(record: AgentRecord | undefined): SpendBaseline {
+  return {
+    tokens: record ? getLifetimeTotal(record.lifetimeUsage) : 0,
+    outputTokens: record?.lifetimeUsage?.output ?? 0,
+    toolUses: record?.toolUses ?? 0,
+  };
+}
+
+function toSpawnResult(record: AgentRecord, baseline?: SpendBaseline): WorkflowSpawnResult {
+  // The record's counters are lifetime figures — they accumulate across every
+  // run of the agent — so a resume subtracts what was spent before it; the
+  // runtime adds each call's figures to the run's totals and the budget.
+  const tokens = getLifetimeTotal(record.lifetimeUsage) - (baseline?.tokens ?? 0);
   // Reported separately from `tokens`, which is the lifetime total. The script's
   // `budget` counts *output* tokens, as Claude Code's does — billing the input
   // and cache reads a fan-out re-sends would over-report it by an order of
   // magnitude and make the documented guards useless.
-  const outputTokens = record.lifetimeUsage?.output ?? 0;
+  const outputTokens = (record.lifetimeUsage?.output ?? 0) - (baseline?.outputTokens ?? 0);
+  const toolCalls = record.toolUses - (baseline?.toolUses ?? 0);
   const cwd = childCwd(record);
   // Where an isolated child's work went. On its own fields: `text` may be JSON
   // the script parses, and the note on `record.result` never reaches a
@@ -136,7 +155,7 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   const common = {
     ...(tokens > 0 ? { tokens } : {}),
     ...(outputTokens > 0 ? { outputTokens } : {}),
-    ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
+    ...(toolCalls > 0 ? { toolCalls } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
     ...(branch !== undefined ? { branch } : {}),
     ...(worktreePath !== undefined ? { worktreePath } : {}),
@@ -186,6 +205,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
+  /**
+   * Runtime agent id → a stop for a child whose id the manager has not issued
+   * yet (it is still creating its worktree). Folded into the spawn's signal, so
+   * a skip or retry in that window stops the child instead of being lost.
+   */
+  const startupStops = new Map<string, AbortController>();
   /**
    * scopeModels warnings already toasted, so a fan-out that pins one
    * out-of-scope agent file raises one notification rather than one per child.
@@ -279,7 +304,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // The session's signal stops the child on a kill or shutdown; the run's
       // stops it when the run ends any other way, including while it is still
       // creating its worktree, before `abortAgent` can know its id.
-      const signal = eitherSignal(deps.signal, request.signal);
+      const startupStop = new AbortController();
+      startupStops.set(request.agentId, startupStop);
+      const signal = eitherSignal(eitherSignal(deps.signal, request.signal), startupStop.signal);
 
       /**
        * Hand the child's EFFECTIVE configuration back to the run.
@@ -385,14 +412,21 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         // never ran. That is this agent's failure, not the run's: the script
         // sees `null` and its siblings carry on.
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        if (startupStops.get(request.agentId) === startupStop) startupStops.delete(request.agentId);
       }
     },
 
     abortAgent(agentId) {
       const id = records.get(agentId);
-      // Nothing to abort before the manager has issued an id — the child is
-      // still in startup, and the run's own signal reaches it there.
-      if (id !== undefined) manager.abort(id);
+      if (id !== undefined) {
+        manager.abort(id);
+        return;
+      }
+      // No id yet — the child is still in startup (creating its worktree). Its
+      // spawn's signal reaches it there, and the manager settles it as stopped,
+      // which the script sees as skipped (and a retry re-runs).
+      startupStops.get(agentId)?.abort();
     },
 
     async resumeAgent(agentId, prompt, onResolved) {
@@ -401,6 +435,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
       let record: AgentRecord | undefined;
+      // Taken before the run: the record's counters are lifetime figures, and
+      // they carry over when a loaded child is reopened from its file. An
+      // evicted child starts a fresh record, so there is nothing to subtract.
+      const before = manager.getRecord(id);
+      const baseline = spendOf(before);
       try {
         // A child evicted after it finished is reopened from its session file.
         record = await manager.resume(id, prompt, deps.signal, { pi, ctx });
@@ -424,7 +463,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       onResolved?.({ recordId: id });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record);
+      return toSpawnResult(record, before !== undefined && record.id === before.id ? baseline : undefined);
     },
 
     /**
