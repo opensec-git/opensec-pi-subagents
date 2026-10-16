@@ -15,7 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -25,7 +25,7 @@ import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, restoreWorktree } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -326,6 +326,8 @@ interface ResumeOptions {
   onCompaction?: (info: CompactionInfo) => void;
   /** Called at the end of each agentic turn with the run's turn count. */
   onTurnEnd?: (turnCount: number) => void;
+  /** The extension API for git calls (restoring a worktree). Default: the latest spawn's. */
+  pi?: ExtensionAPI;
   /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
@@ -429,6 +431,8 @@ export class AgentManager {
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
+  /** The extension API of the latest spawn, for git calls a resume makes. */
+  private pi?: ExtensionAPI;
 
   /**
    * Startup phases, keyed by agent id. `spawn()` still returns synchronously,
@@ -756,6 +760,9 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     record.startGate = undefined;
+    record.cwd = customCwd;
+    record.baseCwd = baseCwd;
+    this.pi = pi;
     if (pool === "background") this.runningBackground++;
     else if (pool === "foreground") this.runningForeground++;
 
@@ -1181,6 +1188,28 @@ export class AgentManager {
     await this.waitForSettle(record);
     if (isBusy(record)) return undefined;
 
+    // Claimed before the awaited preparation, so a concurrent resume is refused
+    // rather than preparing (and running) the same agent twice. A failed
+    // preparation hands the record back as it was: the agent did not fail,
+    // the resume never started.
+    const before = { status: record.status, completedAt: record.completedAt };
+    record.status = "queued";
+    const preparation = this.prepareResume(record, options);
+    // Visible to waitForAll and to a concurrent resume's waitForSettle, which
+    // would otherwise see a "queued" record with nothing to wait on.
+    record.promise = preparation.then(() => record.result ?? "", () => record.result ?? "");
+    try {
+      await preparation;
+    } catch (err) {
+      if (record.status === "queued") {
+        record.status = before.status;
+        record.completedAt = before.completedAt;
+      }
+      throw err;
+    }
+    // Stopped while it was being prepared.
+    if (record.status !== "queued") return record;
+
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
     // "running" — or "queued" when at the concurrency limit. Previously
@@ -1188,17 +1217,14 @@ export class AgentManager {
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
+      // A run still in flight was refused above. Detaching means the caller
       // gets control back while the record stays "running", so nothing stops the
       // model from resuming the same agent again. Starting a second run would
       // overwrite record.abortController — orphaning the live run beyond the
       // reach of `/agents` stop and abortAll() — double-count the pool slot, and
       // then reject from session.prompt() with "Agent is already processing",
       // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (isBusy(record)) return undefined;
-
+      // failure for a run that is still going.
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
@@ -1236,7 +1262,6 @@ export class AgentManager {
 
     // Foreground resume returns its result inline, but still participates in
     // lifecycle observers (widget, fleet list) like every other run.
-    if (isBusy(record)) return undefined;
     record.isBackground = false;
     record.resultConsumed = true;
     record.status = "running";
@@ -1287,6 +1312,7 @@ export class AgentManager {
       } finally {
         signal?.removeEventListener("abort", onParentAbort);
         this.abortOwnedChildren(id);
+        await this.finishResumedWorktree(record);
         try { this.onComplete?.(record); } catch { /* completion observers do not replace the inline result */ }
       }
       return record.result ?? "";
@@ -1294,6 +1320,56 @@ export class AgentManager {
     record.promise = promise;
     await promise;
     return record;
+  }
+
+  /**
+   * Everything a resume needs before its prompt is sent. Throws, with the
+   * reason, when the agent cannot be resumed; nothing has run by then.
+   *
+   * A worktree agent's worktree was committed to its branch and removed when
+   * its run settled, but its session's tools still point there — and Pi's
+   * write tool creates missing directories, so a resume would write into an
+   * orphaned temp directory outside the repo. Put the worktree back first.
+   */
+  private async prepareResume(record: AgentRecord, options: ResumeOptions | undefined): Promise<void> {
+    const worktree = record.worktree;
+    if (worktree?.path && !existsSync(worktree.path)) {
+      if (!isWorktreeIsolationEnabled()) {
+        throw new Error(
+          `Cannot resume agent ${record.id}: it ran in a git worktree, and worktree isolation is turned off in this project.`,
+        );
+      }
+      const pi = options?.pi ?? this.pi;
+      const repo = record.baseCwd;
+      const error = pi && repo
+        ? await restoreWorktree(pi, repo, worktree, record.worktreeResult)
+        : "the repository it ran in is unknown";
+      if (error) {
+        throw new Error(`Cannot resume agent ${record.id} in its git worktree: ${error}. Nothing was run.`);
+      }
+      if (repo) this.worktreeRepos.add(repo);
+    }
+  }
+
+  /**
+   * After a resumed run of a worktree agent: commit what it changed, remove the
+   * worktree again, and tell the caller where the work is — exactly as a first
+   * run's settle path does. A run that changed nothing keeps the earlier
+   * result, so the note still names the branch the first run's work is on.
+   */
+  private async finishResumedWorktree(record: AgentRecord): Promise<void> {
+    const pi = this.pi;
+    const repo = record.baseCwd;
+    if (!record.worktree?.path || !pi || !repo || !existsSync(record.worktree.path)) return;
+    const prior = record.worktreeResult;
+    try {
+      const wtResult = await cleanupWorktree(pi, repo, record.worktree, record.description);
+      record.worktreeResult = wtResult.hasChanges || !prior ? wtResult : prior;
+      const note = worktreeNote(record.worktreeResult, repo, record.cwd !== undefined);
+      if (!note) return;
+      if (record.status === "error") record.error = (record.error ?? "") + note;
+      else record.result = (record.result ?? "") + note;
+    } catch { /* ignore cleanup errors, like the spawn path */ }
   }
 
   /** Resolve once the record's previous run, including its startup, has fully settled. */
@@ -1342,7 +1418,7 @@ export class AgentManager {
     // After the record is in its running shape, before the run is kicked off.
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
-    const settle = () => {
+    const settle = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1352,6 +1428,7 @@ export class AgentManager {
       }
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
+      await this.finishResumedWorktree(record);
       if (occupiesPoolSlot(record)) this.runningBackground--;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
@@ -1376,20 +1453,20 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure, aborted, steered }) => {
+      .then(async ({ text, failure, aborted, steered }) => {
         settleResumeStatus(record, { failure, aborted, steered });
         record.result = text;
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return text;
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return "";
       });
 

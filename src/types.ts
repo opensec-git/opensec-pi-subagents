@@ -202,6 +202,13 @@ export interface AgentRecord {
   resultConsumed?: boolean;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
+  /** Caller-supplied working directory (`SpawnOptions.cwd`), if any. */
+  cwd?: string;
+  /**
+   * The directory the agent was started from: `cwd`, else the parent session's.
+   * For a worktree agent, the repo its worktree and branch belong to.
+   */
+  baseCwd?: string;
   /** Worktree info if the agent is running in an isolated worktree. */
   worktree?: { path: string; branch: string; baseSha: string; workPath: string };
   /** Worktree cleanup result after agent completion. */

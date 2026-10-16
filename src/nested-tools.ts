@@ -187,10 +187,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        let resumed: AgentRecord | undefined;
+        try {
+          resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
-          : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+          : textResult(`Nested agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`, true);
       }
 
       if (context.depth >= context.maxSubagentDepth) {

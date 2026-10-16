@@ -6,6 +6,10 @@
  * the `Agent` tool. Everything between — the manager, the runner, pi's session,
  * the tools the child calls — is real. No network, no provider keys.
  */
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -60,6 +64,25 @@ function recordOf(r: PrintModeRun): { status?: string; result?: string } | undef
   );
   const id = agentIdIn(textOf(results[0] ?? {}));
   return id ? (r.manager?.getRecord(id) as { status?: string; result?: string } | undefined) : undefined;
+}
+
+/** Parent: spawn in the foreground, then resume using the id in its result. */
+function foregroundScript(spawnArgs: Record<string, unknown>, resumePrompt: string) {
+  return (ctx: Context): FauxReply => {
+    const results = agentResults(ctx);
+    if (results.length === 0) {
+      return agentCall({ description: "probe", prompt: "probe", run_in_background: false, ...spawnArgs });
+    }
+    if (results.length === 1) {
+      return agentCall({
+        resume: agentIdIn(textOf(results[0])),
+        prompt: resumePrompt,
+        description: "resume",
+        run_in_background: false,
+      });
+    }
+    return "Done.";
+  };
 }
 
 let run: PrintModeRun | undefined;
@@ -158,3 +181,109 @@ describe("resume of a foreground agent", () => {
     ]);
   });
 });
+
+describe("resume of a worktree-isolated agent", () => {
+  const repos: string[] = [];
+  afterEach(() => {
+    for (const r of repos.splice(0)) rmSync(r, { recursive: true, force: true });
+  });
+
+  function makeRepo() {
+    const repo = mkdtempSync(join(tmpdir(), "wt-resume-"));
+    repos.push(repo);
+    const git = (...a: string[]) => execFileSync("git", a, { cwd: repo, stdio: "pipe" }).toString().trim();
+    git("init", "-q");
+    git("config", "user.email", "t@t");
+    git("config", "user.name", "t");
+    writeFileSync(join(repo, "README.md"), "x");
+    git("add", "README.md");
+    git("commit", "-q", "-m", "init");
+    return { repo, git };
+  }
+
+  /**
+   * First run: `pwd`, optionally write first.txt. Then the parent resumes it
+   * (before which `beforeResume` may tamper with the repo); the resumed run
+   * runs `pwd` and writes resumed.txt.
+   */
+  async function runWorktreeResume(repo: string, opts: { firstWrites: boolean; beforeResume?: () => void }) {
+    let phase: "first" | "resume" = "first";
+    let firstPwd = "";
+    const resumeToolResults: string[] = [];
+    let resumeStep = 0;
+    run = await runPrintMode({
+      prompt: "go",
+      cwd: repo,
+      live: false,
+      maxModelCalls: 40,
+      respond: (ctx) => {
+        if (isParent(ctx)) {
+          // Foreground spawn, resumed by the id in its result: no completion
+          // nudge to race the print-mode host's hold loop.
+          const r = foregroundScript({ prompt: "isolated task", isolation: "worktree" }, "do more work")(ctx);
+          if (typeof r !== "string" && agentResults(ctx).length === 1) {
+            phase = "resume";
+            opts.beforeResume?.();
+          }
+          return r;
+        }
+        const results = ctx.messages.filter((m) => m.role === "toolResult");
+        if (phase === "first") {
+          if (results.length === 0) return fauxToolCall("bash", { command: "pwd" });
+          if (results.length === 1) {
+            firstPwd = textOf(results[0]).trim();
+            if (opts.firstWrites) return fauxToolCall("write", { path: "first.txt", content: "first run\n" });
+          }
+          return "WT-1 done";
+        }
+        resumeStep++;
+        if (resumeStep > 1) resumeToolResults.push(textOf(results.at(-1) ?? {}));
+        if (resumeStep === 1) return fauxToolCall("bash", { command: "pwd" });
+        if (resumeStep === 2) return fauxToolCall("write", { path: "resumed.txt", content: "written on resume\n" });
+        return "WT-2 done";
+      },
+    });
+    return { firstPwd, resumeToolResults, resumeStep, last: textOf(agentResults({ messages: run.parentSession.messages } as Context).at(-1) ?? {}) };
+  }
+
+  for (const firstWrites of [true, false]) {
+    it(`puts the worktree back and commits the resumed work to the agent's branch (first run ${firstWrites ? "changed files" : "changed nothing"})`, async () => {
+      const { repo, git } = makeRepo();
+      const { firstPwd, resumeToolResults, last } = await runWorktreeResume(repo, { firstWrites });
+
+      expect(firstPwd).toMatch(/pi-agent-/);
+      // The resumed run worked in its worktree, at the same path.
+      expect(resumeToolResults[0]?.trim()).toBe(firstPwd);
+      expect(resumeToolResults[0]).not.toMatch(/does not exist/);
+      // Nothing outside the repo: the worktree is removed again, and the file
+      // is neither in the main checkout nor left in a temp directory.
+      expect(existsSync(firstPwd)).toBe(false);
+      expect(existsSync(join(repo, "resumed.txt"))).toBe(false);
+      // The resumed work is on the agent's branch, with the first run's work.
+      const branch = /Changes saved to branch `([^`]+)`/.exec(last)?.[1];
+      expect(branch).toMatch(/^pi-agent-/);
+      const files = git("ls-tree", "--name-only", branch as string).split("\n");
+      expect(files).toContain("resumed.txt");
+      if (firstWrites) expect(files).toContain("first.txt");
+      expect(git("worktree", "list").split("\n")).toHaveLength(1);
+    });
+  }
+
+  it("refuses to resume when the agent's branch is gone, and runs nothing", async () => {
+    const { repo, git } = makeRepo();
+    const { firstPwd, resumeStep, last } = await runWorktreeResume(repo, {
+      firstWrites: true,
+      beforeResume: () => {
+        for (const b of git("branch", "--list", "pi-agent-*", "--format=%(refname:short)").split("\n").filter(Boolean)) {
+          git("branch", "-D", b);
+        }
+      },
+    });
+
+    expect(last).toMatch(/Cannot resume agent .* branch `pi-agent-[^`]+` no longer exists/);
+    expect(resumeStep).toBe(0);
+    expect(existsSync(firstPwd)).toBe(false);
+    expect(readdirSync(repo)).not.toContain("resumed.txt");
+  });
+});
+

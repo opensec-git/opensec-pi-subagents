@@ -978,9 +978,15 @@ export default function (pi: ExtensionAPI) {
         // downstream consumer keys off and a resume must not re-open it.
         const config = getAgentConfig(record.type);
         // No turn limit here: the resumed run keeps the one its first run had.
-        const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
-          outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
-        });
+        let resumedRecord: AgentRecord | undefined;
+        try {
+          resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
+            outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+          });
+        } catch (err) {
+          ctx.ui.notify(`Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+          return { action: "handled" };
+        }
         ctx.ui.notify(
           resumedRecord ? `Resuming ${target}` : `Could not resume ${target} — it is still running.`,
           resumedRecord ? "info" : "warning",
@@ -1370,6 +1376,7 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      pi,
       maxTurns: opts.maxTurns,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
@@ -2069,13 +2076,18 @@ Terse command-style prompts produce shallow, generic work.
             );
           }
 
-          const record = await startBackgroundResume(ctx, existing, params.prompt, {
-            outputTranscript,
-            maxTurns: resumeMaxTurns,
-            toolCallId,
-          });
+          let record: AgentRecord | undefined;
+          try {
+            record = await startBackgroundResume(ctx, existing, params.prompt, {
+              outputTranscript,
+              maxTurns: resumeMaxTurns,
+              toolCallId,
+            });
+          } catch (err) {
+            return textResult(err instanceof Error ? err.message : String(err));
+          }
           if (!record) {
-            return textResult(`Failed to resume agent "${params.resume}".`);
+            return textResult(`Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`);
           }
 
           const isQueued = record.status === "queued";
@@ -2091,9 +2103,17 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal, { maxTurns: resumeMaxTurns });
+        let record: AgentRecord | undefined;
+        try {
+          record = await manager.resume(params.resume, params.prompt, signal, { maxTurns: resumeMaxTurns, pi });
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err));
+        }
         if (!record) {
-          return textResult(`Failed to resume agent "${params.resume}".`);
+          return textResult(
+            `Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.\n` +
+            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
         }
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).

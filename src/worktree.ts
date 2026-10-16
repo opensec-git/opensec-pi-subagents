@@ -10,7 +10,7 @@
  * agents at once would otherwise serialize them all on the TUI's event loop.
  */
 
-import { existsSync, mkdtempSync, realpathSync, rmdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -183,18 +183,22 @@ export async function cleanupWorktree(
       // The agent committed on its own; those commits live only here.
     }
 
-    // Create a branch pointing to the worktree's HEAD.
-    // If the branch already exists, append a suffix to avoid overwriting previous work.
-    let branchName = worktree.branch;
-    try {
-      await git(pi, worktree.path, ["branch", branchName], 5000);
-    } catch {
-      // Branch already exists — use a unique suffix
-      branchName = `${worktree.branch}-${Date.now()}`;
-      await git(pi, worktree.path, ["branch", branchName], 5000);
+    // A worktree restored for a resume has the agent's branch checked out, so
+    // the commit above is already on it: nothing to create.
+    if (await currentBranch(pi, worktree.path) !== worktree.branch) {
+      // Create a branch pointing to the worktree's HEAD.
+      // If the branch already exists, append a suffix to avoid overwriting previous work.
+      let branchName = worktree.branch;
+      try {
+        await git(pi, worktree.path, ["branch", branchName], 5000);
+      } catch {
+        // Branch already exists — use a unique suffix
+        branchName = `${worktree.branch}-${Date.now()}`;
+        await git(pi, worktree.path, ["branch", branchName], 5000);
+      }
+      // Update branch name in worktree info for the caller
+      worktree.branch = branchName;
     }
-    // Update branch name in worktree info for the caller
-    worktree.branch = branchName;
   } catch {
     return kept;
   }
@@ -207,6 +211,104 @@ export async function cleanupWorktree(
     branch: worktree.branch,
     path: worktree.path,
   };
+}
+
+/** The branch checked out in `cwd`, or undefined when HEAD is detached. */
+async function currentBranch(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+  try {
+    return await git(pi, cwd, ["symbolic-ref", "-q", "--short", "HEAD"], 5000) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Put back the worktree a finished isolated agent ran in, at the SAME path, so
+ * it can be resumed. The path matters: a resumed session's tools are bound to
+ * it and its history names it, and Pi's write tool creates missing parent
+ * directories — run against a removed worktree, writes would land in an
+ * orphaned temp directory outside the repo and never reach a branch.
+ *
+ * - The agent's changes were committed to a branch: check that branch out
+ *   (detached at its tip when it is checked out elsewhere).
+ * - It made no changes: a detached worktree at its base commit.
+ * - The worktree is still there (kept because cleanup could not commit): use it.
+ *
+ * `worktree.baseSha` is moved to the restored HEAD, so the cleanup after the
+ * resumed run sees only that run's changes. Returns an error message, or
+ * undefined on success; on failure nothing is left behind.
+ */
+export async function restoreWorktree(
+  pi: ExtensionAPI,
+  repo: string,
+  worktree: WorktreeInfo,
+  prior: WorktreeCleanupResult | undefined,
+): Promise<string | undefined> {
+  if (existsSync(worktree.path)) {
+    try {
+      await git(pi, worktree.path, ["rev-parse", "--is-inside-work-tree"], 5000);
+      return undefined;
+    } catch {
+      return `its worktree path \`${worktree.path}\` exists but is not a git work tree`;
+    }
+  }
+
+  // A removed worktree can leave a stale registration that blocks `add`.
+  try { await git(pi, repo, ["worktree", "prune"], 5000); } catch { /* best effort */ }
+
+  const branch = prior?.hasChanges ? prior.branch : undefined;
+  if (prior?.hasChanges && !branch) {
+    // Kept on disk because its changes could not be committed, and now gone.
+    return `its worktree \`${worktree.path}\` was kept with uncommitted changes and no longer exists`;
+  }
+  try {
+    if (branch) await git(pi, repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], 5000);
+    else await git(pi, repo, ["cat-file", "-e", `${worktree.baseSha}^{commit}`], 5000);
+  } catch {
+    return branch
+      ? `its branch \`${branch}\` no longer exists`
+      : `its base commit ${worktree.baseSha.slice(0, 12)} no longer exists in \`${repo}\``;
+  }
+
+  // The private parent createWorktree made with mkdtemp. Recreated with the
+  // same mode; an existing one is used only if it is still ours and private.
+  const parent = dirname(worktree.path);
+  let createdParent = false;
+  if (existsSync(parent)) {
+    const st = statSync(parent);
+    const ownedByUs = process.getuid === undefined || st.uid === process.getuid();
+    if (!st.isDirectory() || !ownedByUs || (st.mode & 0o077) !== 0) {
+      return `\`${parent}\` exists and is not a private directory of this user`;
+    }
+  } else {
+    try {
+      mkdirSync(parent, { mode: 0o700 });
+      createdParent = true;
+    } catch (err) {
+      return `cannot recreate \`${parent}\`: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  try {
+    if (branch) {
+      try {
+        await git(pi, repo, ["worktree", "add", worktree.path, branch], 30000);
+      } catch {
+        // Checked out in another worktree: work detached at its tip; cleanup
+        // then saves new commits to a suffixed branch instead of moving it.
+        await git(pi, repo, ["worktree", "add", "--detach", worktree.path, branch], 30000);
+      }
+      worktree.branch = branch;
+    } else {
+      await git(pi, repo, ["worktree", "add", "--detach", worktree.path, worktree.baseSha], 30000);
+    }
+    worktree.baseSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
+  } catch (err) {
+    if (existsSync(worktree.path)) await removeWorktree(pi, repo, worktree.path);
+    else if (createdParent) removeParentDir(worktree.path);
+    return `\`git worktree add\` failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  return undefined;
 }
 
 /** Remove the private parent createWorktree made, once the worktree is gone. */

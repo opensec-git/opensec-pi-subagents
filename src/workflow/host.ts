@@ -378,11 +378,19 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      const record = await manager.resume(id, prompt, deps.signal);
+      let record: AgentRecord | undefined;
+      try {
+        record = await manager.resume(id, prompt, deps.signal, { pi });
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
       if (record === undefined) {
+        const live = manager.getRecord(id);
         return {
           ok: false,
-          error: `Agent ${id} has no session left to resume — records are dropped ten minutes after they finish.`,
+          error: live?.status === "running" || live?.status === "queued"
+            ? `Agent ${id} is still running — it can only be resumed once its current run finishes.`
+            : `Agent ${id} has no session left to resume.`,
         };
       }
       // The resumed row is built from scratch, so it has to be told the same
