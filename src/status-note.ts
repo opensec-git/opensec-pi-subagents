@@ -22,7 +22,7 @@ import type { AgentRecord } from "./types.js";
 export function getStatusNote(status: string): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
+      return " (STOPPED BY THE USER before completion — the user ended this run; output is partial and the task was NOT finished)";
     case "aborted":
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
@@ -95,4 +95,22 @@ export function agentIdLine(id: string): string {
 export function partialOutputSuffix(record: AgentRecord): string {
   const partial = record.result?.trim();
   return partial ? `\n\nPartial output before the failure:\n${partial}` : "";
+}
+
+/**
+ * Whether a terminal status means the run did not deliver its answer: a
+ * failure, a hard stop at the turn limit, or a stop by the user. Results in
+ * these states go back to the model with `isError`, so it does not read a
+ * fragment as a finished task. `steered` is not one: it wrapped up on request.
+ */
+export function isFailedStatus(status: string): boolean {
+  return status === "error" || status === "aborted" || status === "stopped";
+}
+
+/**
+ * Where every turn of a failed run can be read: its saved session file. Empty
+ * for a session kept only in memory, which leaves nothing on disk.
+ */
+export function sessionFileLine(record: Pick<AgentRecord, "sessionFile">): string {
+  return record.sessionFile ? `\n\nSession file (every turn of this agent): ${record.sessionFile}` : "";
 }

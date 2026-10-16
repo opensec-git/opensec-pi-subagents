@@ -21,6 +21,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
+import { extractText } from "./context.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { sessionFileProblem } from "./session-file.js";
@@ -550,6 +551,41 @@ function worktreeNote(
   }
   for (const note of wtResult.notes ?? []) lines.push(`- ${note}`);
   return lines.length > 0 ? `\n\n---\n${lines.join("\n")}` : "";
+}
+
+/** How many messages a session holds — where a run's own turns begin. 0 for a stub. */
+function messageCount(session: AgentSession | undefined): number {
+  try {
+    return session?.messages?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The last assistant text a session holds from message `start` on: what a run
+ * that threw or was abandoned had produced. Bounded like the runner's own
+ * fallback, so a failed resume never surfaces the previous run's answer
+ * (#144). "" for none, or for a session that cannot be read.
+ */
+function salvageText(session: AgentSession | undefined, start: number): string {
+  try {
+    const messages = session?.messages ?? [];
+    for (let i = messages.length - 1; i >= start; i--) {
+      const msg = messages[i];
+      if (msg.role !== "assistant") continue;
+      const text = extractText(msg.content).trim();
+      if (text) return text;
+    }
+  } catch { /* a disposed or partial session has nothing to give */ }
+  return "";
+}
+
+/** Keep what a failed run produced on its record, unless the run already reported text. */
+function salvagePartial(record: AgentRecord, start: number): void {
+  if (record.result?.trim()) return;
+  const text = salvageText(record.session, start);
+  if (text) record.result = text;
 }
 
 /**
@@ -1358,6 +1394,10 @@ export class AgentManager {
 
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
+    // Where this run's turns begin in its session: past the history of a
+    // reopened conversation. Set once the session exists.
+    let runStart = 0;
+
     // Wire parent abort signal to stop the subagent when the parent is interrupted.
     // A queued spawn can start minutes after the caller handed us its signal,
     // by which time it may already be aborted — and `addEventListener` would
@@ -1419,6 +1459,7 @@ export class AgentManager {
           return;
         }
         record.session = session;
+        runStart = messageCount(session);
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -1526,6 +1567,8 @@ export class AgentManager {
         }
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
+        // A run that threw reported no text; keep what its turns produced.
+        salvagePartial(record, runStart);
 
         detach();
 
@@ -1558,6 +1601,7 @@ export class AgentManager {
     // done, minus the result it never produced.
     run.onAbandon = async () => {
       detach();
+      salvagePartial(record, runStart);
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }
         record.outputCleanup = undefined;
@@ -1884,6 +1928,7 @@ export class AgentManager {
     record.error = undefined;
 
     const session = record.session;
+    const runStart = messageCount(session);
     const abortController = new AbortController();
     record.abortController = abortController;
     const onParentAbort = () => this.abort(id);
@@ -1925,6 +1970,7 @@ export class AgentManager {
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
+        salvagePartial(record, runStart);
       }
       signal?.removeEventListener("abort", onParentAbort);
       this.abortOwnedChildren(id);
@@ -1934,6 +1980,7 @@ export class AgentManager {
       return record.result ?? "";
     })();
     run.onAbandon = async () => {
+      salvagePartial(record, runStart);
       signal?.removeEventListener("abort", onParentAbort);
       this.abortOwnedChildren(id);
       await this.finishResumedWorktree(record);
@@ -2107,6 +2154,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    const runStart = messageCount(record.session);
     const run = this.beginRun(id, record, occupiesPoolSlot(record) ? "background" : undefined);
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
@@ -2134,6 +2182,9 @@ export class AgentManager {
     const windDown = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
+      // What a run that threw or was abandoned had produced; a settled run's
+      // own text is already on the record.
+      if (record.status === "error" || record.status === "stopped") salvagePartial(record, runStart);
       // Final flush of streaming output file
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }

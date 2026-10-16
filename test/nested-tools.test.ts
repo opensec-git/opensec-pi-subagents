@@ -545,6 +545,34 @@ describe("child-safe nested Agent tools", () => {
     expect(result.content[0].text).toContain("got this far");
   });
 
+  it.each(["aborted", "stopped"] as const)(
+    "reports a %s child as an error result naming its session file, inline and fetched",
+    async (status) => {
+      const record = {
+        id: "child-1", status, result: "partial work", sessionFile: "/tmp/child.jsonl", parentAgentId: "parent-1",
+      };
+      spawnAndWait.mockImplementation(async () => ({ id: "child-1", record }));
+      const [agent, getResult] = tools();
+      const inline = await execute(agent, { subagent_type: "scout", description: "cut", prompt: "Do work" });
+      expect(inline.isError).toBe(true);
+      expect(inline.content[0].text).toContain("partial work");
+      expect(inline.content[0].text).toContain("Session file (every turn of this agent): /tmp/child.jsonl");
+
+      records.set("child-1", record);
+      const fetched = await execute(getResult, { agent_id: "child-1" });
+      expect(fetched.isError).toBe(true);
+      expect(fetched.content[0].text).toContain("/tmp/child.jsonl");
+    },
+  );
+
+  it("does not flag a steered child, which wrapped up on request", async () => {
+    records.set("child-1", { id: "child-1", status: "steered", result: "done", sessionFile: "/tmp/c.jsonl", parentAgentId: "parent-1" });
+    const [, getResult] = tools();
+    const result = await execute(getResult, { agent_id: "child-1" });
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).not.toContain("Session file");
+  });
+
   it("attributes a nested child's token spend to the owning parent", async () => {
     const parent = { id: "parent-1", status: "running", lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 } };
     records.set("parent-1", parent);

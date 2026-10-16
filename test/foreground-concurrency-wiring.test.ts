@@ -125,7 +125,8 @@ describe("maxConcurrentForeground, through the Agent tool", () => {
 
     const result = await second; // resolves — never rejects
     expect(textOf(result)).toContain("STOPPED BY THE USER");
-    expect(result.isError).toBeFalsy();
+    // Returned, not thrown: a stopped run is an error result the batch survives.
+    expect(result.isError).toBe(true);
 
     // Freeing the slot must not start the agent the user just stopped.
     resolvers.get("alpha")!();

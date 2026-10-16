@@ -25,7 +25,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
-import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, sessionFileLine } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -147,7 +147,7 @@ type ResultPosition = "inline" | "fetched";
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const idLine = position === "inline" ? agentIdLine(record.id) : "";
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${idLine}`;
+    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${sessionFileLine(record)}${idLine}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -159,7 +159,8 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
-  return (note ? `Nested agent${note}.\n\n${text}` : text) + idLine;
+  const sessionLine = isFailedStatus(record.status) ? sessionFileLine(record) : "";
+  return (note ? `Nested agent${note}.\n\n${text}` : text) + sessionLine + idLine;
 }
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
@@ -250,7 +251,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           return textResult(err instanceof Error ? err.message : String(err), true);
         }
         return resumed
-          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
+          ? textResult(formatRecord(resumed, "inline"), isFailedStatus(resumed.status))
           : textResult(`Nested agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`, true);
       }
 
@@ -401,7 +402,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           { ...options, signal },
           attachTranscript,
         );
-        return textResult(formatRecord(record, "inline"), record.status === "error");
+        return textResult(formatRecord(record, "inline"), isFailedStatus(record.status));
       } catch (err) {
         return textResult(err instanceof Error ? err.message : String(err), true);
       }
@@ -432,7 +433,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      return textResult(formatRecord(record, "fetched"), isFailedStatus(record.status));
     },
   });
 
