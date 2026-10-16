@@ -10,7 +10,7 @@ import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { type EventedSessionLike, getCachedSessionContextPercent, getLifetimeCost, getLifetimeTotal, type LifetimeUsage } from "../usage.js";
 
 // ---- Constants ----
 
@@ -55,7 +55,7 @@ export interface AgentActivity {
   activeTools: Map<string, string>;
   toolUses: number;
   responseText: string;
-  session?: SessionLike;
+  session?: EventedSessionLike;
   /** Current turn count. */
   turnCount: number;
   /** Effective max turns for this agent (undefined = unlimited). */
@@ -475,7 +475,7 @@ export class AgentWidget {
       // folds a hidden child's spend into. Reading the tracker while an agent
       // runs and the record once it stops made the figure jump at completion.
       const tokens = getLifetimeTotal(a.lifetimeUsage);
-      const contextPercent = getSessionContextPercent(bg?.session);
+      const contextPercent = getCachedSessionContextPercent(bg?.session);
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
       const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 

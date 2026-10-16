@@ -165,3 +165,58 @@ export function getSessionContextPercent(session: SessionLike | undefined): numb
   try { return session.getSessionStats().contextUsage?.percent ?? null; }
   catch { return null; }
 }
+
+/** A session that can also report its events, as pi's `AgentSession` does. */
+export type EventedSessionLike = SessionLike & {
+  subscribe?(listener: (event: { type: string }) => void): () => void;
+};
+
+/**
+ * Events that fire per streamed token or tool-output chunk. Neither changes
+ * what `getContextUsage()` reads: the streaming message only joins the session
+ * entries at `message_end`.
+ */
+const STREAMING_EVENTS = new Set(["message_update", "tool_execution_update"]);
+/** Upper bound on staleness: for sessions with no events, and as a backstop for evented ones. */
+const CONTEXT_PERCENT_POLL_MS = 1_000;
+const CONTEXT_PERCENT_BACKSTOP_MS = 5_000;
+
+type PercentCacheEntry = { percent: number | null; at: number; dirty: boolean; evented: boolean };
+const percentCache = new WeakMap<object, PercentCacheEntry>();
+
+/**
+ * {@link getSessionContextPercent} for per-frame callers (the widget and the
+ * conversation viewer).
+ *
+ * pi's `getSessionStats()` copies and walks every session entry and rebuilds
+ * the context projection, so calling it once per running agent per frame made
+ * a frame's cost grow with agents x transcript length. The value only changes
+ * when the session records something, so it is recomputed after any
+ * non-streaming session event, at most every 5 s otherwise, and at most once a
+ * second for a session that cannot be subscribed to.
+ */
+export function getCachedSessionContextPercent(session: EventedSessionLike | undefined): number | null {
+  if (!session) return null;
+  let entry = percentCache.get(session);
+  if (!entry) {
+    const created: PercentCacheEntry = { percent: null, at: 0, dirty: true, evented: false };
+    if (typeof session.subscribe === "function") {
+      try {
+        session.subscribe(event => {
+          if (!STREAMING_EVENTS.has(event?.type)) created.dirty = true;
+        });
+        created.evented = true;
+      } catch { /* fall back to polling */ }
+    }
+    percentCache.set(session, created);
+    entry = created;
+  }
+  const now = Date.now();
+  const maxAge = entry.evented ? CONTEXT_PERCENT_BACKSTOP_MS : CONTEXT_PERCENT_POLL_MS;
+  if (entry.dirty || now - entry.at >= maxAge) {
+    entry.percent = getSessionContextPercent(session);
+    entry.at = now;
+    entry.dirty = false;
+  }
+  return entry.percent;
+}

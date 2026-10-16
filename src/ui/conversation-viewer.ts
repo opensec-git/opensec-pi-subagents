@@ -10,7 +10,7 @@ import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownThe
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import { getCachedSessionContextPercent, getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -315,7 +315,7 @@ export class ConversationViewer implements Component {
     // nested child's spend.
     const tokens = getLifetimeTotal(this.record.lifetimeUsage);
     if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
+      const percent = getCachedSessionContextPercent(this.activity?.session);
       headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
     }
     const cost = this.showCost ? formatCost(getLifetimeCost(this.record.lifetimeUsage)) : "";
