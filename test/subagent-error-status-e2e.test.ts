@@ -9,6 +9,7 @@
  * request. Each run pins `live: false` so the pre-publish smoke's global
  * `PI_E2E_LIVE=1` can't swap a real model in and turn this suite red.
  */
+import { existsSync } from "node:fs";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +26,14 @@ function agentToolResult(session: AgentSession): string {
     (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
   );
   return ((msg?.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? "").join("");
+}
+
+/** Whether the parent's Agent tool result was delivered as an error result. */
+function agentToolResultIsError(session: AgentSession): boolean {
+  const msg = [...session.messages].reverse().find(
+    (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
+  );
+  return (msg as { isError?: boolean } | undefined)?.isError === true;
 }
 
 vi.setConfig({ testTimeout: 30_000 });
@@ -104,5 +113,22 @@ describe("issue #144 — empty-error final turns must not be 'completed'", () =>
     const toolResult = agentToolResult(run.parentSession);
     expect(toolResult).toContain(FATAL);
     expect(toolResult).not.toContain("Partial output before the failure:");
+  });
+
+  it("is delivered as an error result naming the session file that holds every turn", async () => {
+    run = await runPrintMode({
+      prompt: "Delegate.",
+      respond: routeBySession({
+        parentInitial: agentCall({ run_in_background: false, description: "doomed", prompt: "Do work." }),
+        parentFinal: "parent done",
+        subagent: () => fauxAssistantMessage([], { stopReason: "error", errorMessage: FATAL }),
+      }),
+      live: false,
+    });
+
+    expect(agentToolResultIsError(run.parentSession)).toBe(true);
+    const path = agentToolResult(run.parentSession).match(/Session file \(every turn of this agent\): (\S+)/)?.[1];
+    expect(path).toBeDefined();
+    expect(existsSync(path!)).toBe(true);
   });
 });

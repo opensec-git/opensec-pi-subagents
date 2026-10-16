@@ -427,6 +427,52 @@ describe("createWorkflowHost — scopeModels", () => {
     registerAgents(new Map());
   });
 
+  /** The same model from two providers, and a parent on a third, so none is preferred. */
+  const SHARED = [ALLOWED, { ...ALLOWED, provider: "openrouter" }];
+  const sharedCtx = () => scopedCtx({
+    model: { id: "deepseek-chat", name: "DeepSeek", provider: "deepseek" },
+    modelRegistry: {
+      find: (provider: string, id: string) => SHARED.find(m => m.provider === provider && m.id === id) ?? null,
+      getAll: () => SHARED,
+      getAvailable: () => SHARED,
+    },
+  });
+
+  it("runs an agent whose file names an ambiguous model on the parent's, warning once per run", async () => {
+    registerAgents(new Map([["pinned", {
+      name: "pinned", displayName: "Pinned", description: "pins an ambiguous model", extensions: false, skills: false,
+      model: "allowed", systemPrompt: "pinned", promptMode: "replace",
+    } as any]]));
+    const stub = stubManager();
+    const ctxShared = sharedCtx();
+    const parent = ctxShared.model;
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctxShared, manager: stub.manager });
+
+    const first = await host.spawnAgent(request({ agentType: "pinned" }));
+    await host.spawnAgent(request({ agentType: "pinned" }));
+
+    expect(first.ok).toBe(true);
+    const options = stub.spawnAndWait.mock.calls[0][4];
+    expect(options.model).toBe(parent);
+    expect(options.modelNote).toBe(
+      'Note: model "allowed" from the agent file is ambiguous (candidates: anthropic/allowed-model, '
+        + "openrouter/allowed-model); ran on deepseek/deepseek-chat instead.",
+    );
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(options.modelNote, "warning");
+  });
+
+  it("refuses an ambiguous model the script named, with the candidates", async () => {
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: sharedCtx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ model: "allowed" }));
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Model "allowed" is ambiguous');
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("refuses a model the script named that is out of scope, and fails only that agent", async () => {
     setScopeModelsEnabled(true);
     const stub = stubManager();

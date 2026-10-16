@@ -211,6 +211,49 @@ describe("child-safe nested Agent tools", () => {
     expect(inScope.isError).toBe(false);
   });
 
+  /** The same model from two providers, neither of them the parent's. */
+  const SHARED = [
+    { id: "shared-model", name: "Shared", provider: "anthropic" },
+    { id: "shared-model", name: "Shared", provider: "openrouter" },
+  ];
+  const PARENT = { id: "deepseek-chat", name: "DeepSeek", provider: "deepseek" };
+  const sharedCtx = () => ({
+    ...ctx(),
+    model: PARENT,
+    modelRegistry: {
+      find: (provider: string, id: string) => SHARED.find(m => m.provider === provider && m.id === id),
+      getAvailable: () => SHARED,
+      getAll: () => SHARED,
+    },
+  });
+
+  it("runs an agent whose file names a model two other providers serve on the parent's, and says so", async () => {
+    writeAgent("pinned", "model: shared\n");
+    const [agent] = tools();
+    const result = await agent.execute(
+      "call-1", { subagent_type: "pinned", description: "pinned", prompt: "Do it" }, undefined, undefined, sharedCtx(),
+    );
+    expect(result.isError).toBe(false);
+    expect(spawnAndWait.mock.calls[0][4]).toMatchObject({ model: PARENT });
+    expect(result.content[0].text.startsWith(
+      'Note: model "shared" from the agent file is ambiguous (candidates: anthropic/shared-model, openrouter/shared-model); '
+        + "ran on deepseek/deepseek-chat instead.\n\n",
+    )).toBe(true);
+    expect(spawnAndWait.mock.calls[0][4].modelNote).toContain('model "shared" from the agent file is ambiguous');
+  });
+
+  it("refuses a caller-supplied model that matches several providers, naming them", async () => {
+    setModelOverrideAllowed(true);
+    const [agent] = tools();
+    const result = await agent.execute(
+      "call-1", { subagent_type: "scout", description: "d", prompt: "p", model: "shared" }, undefined, undefined, sharedCtx(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Model "shared" is ambiguous');
+    expect(result.content[0].text).toContain("anthropic/shared-model, openrouter/shared-model");
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("offers no model or thinking parameter and ignores both while overrides are off (the default)", async () => {
     const [agent] = tools();
     expect(Object.keys(agent.parameters.properties)).not.toContain("model");
@@ -543,6 +586,34 @@ describe("child-safe nested Agent tools", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("provider exploded");
     expect(result.content[0].text).toContain("got this far");
+  });
+
+  it.each(["aborted", "stopped"] as const)(
+    "reports a %s child as an error result naming its session file, inline and fetched",
+    async (status) => {
+      const record = {
+        id: "child-1", status, result: "partial work", sessionFile: "/tmp/child.jsonl", parentAgentId: "parent-1",
+      };
+      spawnAndWait.mockImplementation(async () => ({ id: "child-1", record }));
+      const [agent, getResult] = tools();
+      const inline = await execute(agent, { subagent_type: "scout", description: "cut", prompt: "Do work" });
+      expect(inline.isError).toBe(true);
+      expect(inline.content[0].text).toContain("partial work");
+      expect(inline.content[0].text).toContain("Session file (every turn of this agent): /tmp/child.jsonl");
+
+      records.set("child-1", record);
+      const fetched = await execute(getResult, { agent_id: "child-1" });
+      expect(fetched.isError).toBe(true);
+      expect(fetched.content[0].text).toContain("/tmp/child.jsonl");
+    },
+  );
+
+  it("does not flag a steered child, which wrapped up on request", async () => {
+    records.set("child-1", { id: "child-1", status: "steered", result: "done", sessionFile: "/tmp/c.jsonl", parentAgentId: "parent-1" });
+    const [, getResult] = tools();
+    const result = await execute(getResult, { agent_id: "child-1" });
+    expect(result.isError).toBe(false);
+    expect(result.content[0].text).not.toContain("Session file");
   });
 
   it("attributes a nested child's token spend to the owning parent", async () => {

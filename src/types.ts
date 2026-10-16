@@ -143,6 +143,11 @@ export interface AgentResumeState {
   /** The agent's pi session file. A record without one is never kept. */
   sessionFile: string;
   completedAt: number;
+  /**
+   * How its last run ended, for get_subagent_result once the record is gone.
+   * Absent in entries written before it was kept.
+   */
+  status?: AgentRecord["status"];
   /** Top-level agents only. */
   handle?: string;
   alias?: string;
@@ -289,8 +294,18 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
-  /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
+  /**
+   * Resolved spawn params, captured for UI display. Fixed at spawn time, except
+   * the model and thinking level: those are rewritten from the session at the
+   * start of every run, so they name what the latest run actually ran with.
+   */
   invocation?: AgentInvocation;
+  /**
+   * Set when the model the agent file names did not resolve (missing, or
+   * ambiguous) and the run used another: says what was asked for, why it was
+   * not used, and what ran instead. Shown wherever the result is.
+   */
+  modelNote?: string;
   /**
    * The turn limit the first run enforced (undefined = unlimited). A resumed
    * run gets the same limit, counted afresh, unless its caller passes one.

@@ -23,7 +23,7 @@ import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
 import { isModelOverrideAllowed } from "./invocation-config.js";
 import { type LongTimer, setLongTimeout } from "./long-timer.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -309,17 +309,20 @@ export class SubagentScheduler {
     const marked = store.updateAsync(id, { lastStatus: "running" });
 
     // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
+    // job was created (auth added/removed). If it no longer resolves (missing,
+    // or now ambiguous), the job still fires on the spawn default, and its
+    // result says so.
     let resolvedModel: any | undefined;
+    let modelNote: string | undefined;
     // A job's model and thinking level came from the call that scheduled it,
     // so they count only while `allowModelOverride` is on; otherwise each fire
     // runs on the parent's current model and level, like any other spawn.
     const overridesAllowed = isModelOverrideAllowed();
     const thinking = overridesAllowed ? job.thinking : undefined;
     if (job.model && overridesAllowed) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
+      const resolution = resolveModelDetailed(job.model, ctx.modelRegistry, ctx.model?.provider);
+      if (resolution.ok) resolvedModel = resolution.model;
+      else modelNote = unresolvedModelNote(job.model, unresolvedReason(resolution), "the agent's default model", "the scheduled job");
     }
 
     let agentId: string;
@@ -337,6 +340,7 @@ export class SubagentScheduler {
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
+        ...(modelNote !== undefined ? { modelNote } : {}),
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: thinking,

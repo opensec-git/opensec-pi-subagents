@@ -21,6 +21,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { getAgentConfig } from "./agent-types.js";
+import { extractText } from "./context.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { sessionFileProblem } from "./session-file.js";
@@ -117,17 +118,20 @@ const DEFAULT_MAX_CONCURRENT = 10;
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 
 /**
- * How many evicted agents stay addressable by name. Only a bound on memory —
- * a session that spawns hundreds of agents shouldn't retain every one — and
- * far above the handful anyone keeps in their head.
+ * How many evicted agents stay addressable — by name, by resume, and by
+ * get_subagent_result, which reads a released agent's result from its saved
+ * session. Only a bound on memory: an entry is a few hundred bytes of ids and
+ * paths (about 450 B, 700 B with a worktree), never the conversation, so 2000
+ * cost about 1 MB. High because a session that spawns hundreds of agents
+ * should still be able to read the result of any of them.
  */
-const MAX_TOMBSTONES = 100;
+const MAX_TOMBSTONES = 2000;
 
 /**
  * The same bound for owned children — nested agents and workflow children —
  * counted apart, so a large workflow cannot push the session's own agents out.
  */
-const MAX_OWNED_TOMBSTONES = 200;
+const MAX_OWNED_TOMBSTONES = 4000;
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -338,6 +342,8 @@ interface SpawnOptions {
   onBeforeWorktreeCleanup?: (worktreePath: string) => Promise<void>;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
+  /** The caller's note that the agent file's model did not resolve (see `AgentRecord.modelNote`). */
+  modelNote?: string;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /**
@@ -552,6 +558,69 @@ function worktreeNote(
   return lines.length > 0 ? `\n\n---\n${lines.join("\n")}` : "";
 }
 
+/** How many messages a session holds — where a run's own turns begin. 0 for a stub. */
+function messageCount(session: AgentSession | undefined): number {
+  try {
+    return session?.messages?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The last assistant text a session holds from message `start` on: what a run
+ * that threw or was abandoned had produced. Bounded like the runner's own
+ * fallback, so a failed resume never surfaces the previous run's answer
+ * (#144). "" for none, or for a session that cannot be read.
+ */
+function salvageText(session: AgentSession | undefined, start: number): string {
+  try {
+    const messages = session?.messages ?? [];
+    for (let i = messages.length - 1; i >= start; i--) {
+      const msg = messages[i];
+      if (msg.role !== "assistant") continue;
+      const text = extractText(msg.content).trim();
+      if (text) return text;
+    }
+  } catch { /* a disposed or partial session has nothing to give */ }
+  return "";
+}
+
+/** Keep what a failed run produced on its record, unless the run already reported text. */
+function salvagePartial(record: AgentRecord, start: number): void {
+  if (record.result?.trim()) return;
+  const text = salvageText(record.session, start);
+  if (text) record.result = text;
+}
+
+/**
+ * Record the model and thinking level a run actually runs with, from its
+ * session. Both are only knowable once pi has resolved its defaults and clamped
+ * the level to what the model supports. Writing them back makes the record
+ * authoritative, so every surface (the widget, the notification, the result
+ * tools) reads one place instead of each re-deriving "session, else the
+ * request" for itself. Called at the start of every run, so a resumed run
+ * records its own.
+ */
+function recordRunModel(record: AgentRecord, session: AgentSession): void {
+  if (!session.model) return;
+  record.invocation ??= {};
+  // Read the kept request first: a caller's level survives being clamped
+  // AND, one line later, being replaced by the effective one.
+  const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
+  Object.assign(record.invocation, describeModel(session.model));
+  // Guarded: a session that reports no level keeps the request rather than
+  // losing it. Overwriting unconditionally would turn an older or stubbed
+  // session into a blank `thinking:` tag, which is worse than the
+  // stale-but-true value it replaced.
+  if (session.thinkingLevel) {
+    record.invocation.thinking = session.thinkingLevel;
+    if (requested && requested !== session.thinkingLevel) {
+      record.invocation.requestedThinking = requested;
+    }
+  }
+}
+
 /**
  * Whether a run is in flight or waiting for a slot. A function rather than an
  * inline test so TypeScript does not narrow `status` across an `await` that
@@ -595,6 +664,7 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
     description: record.description,
     sessionFile: record.sessionFile,
     completedAt: record.completedAt ?? Date.now(),
+    status: record.status,
     handle: record.handle,
     alias: record.alias,
     parentAgentId: record.parentAgentId,
@@ -1068,6 +1138,7 @@ export class AgentManager {
       // `options` has stopped being the interesting object.
       blocking: options.blocking,
       invocation: options.invocation,
+      modelNote: options.modelNote,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
@@ -1358,6 +1429,10 @@ export class AgentManager {
 
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
+    // Where this run's turns begin in its session: past the history of a
+    // reopened conversation. Set once the session exists.
+    let runStart = 0;
+
     // Wire parent abort signal to stop the subagent when the parent is interrupted.
     // A queued spawn can start minutes after the caller handed us its signal,
     // by which time it may already be aborted — and `addEventListener` would
@@ -1419,6 +1494,7 @@ export class AgentManager {
           return;
         }
         record.session = session;
+        runStart = messageCount(session);
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -1428,28 +1504,7 @@ export class AgentManager {
         // stubbed session must degrade to "not resumable" rather than throw
         // and take the whole spawn down with it.
         record.sessionFile = session.sessionManager?.getSessionFile?.();
-        // Same reason, different field: the model and thinking level are only
-        // knowable once pi has resolved its defaults and clamped the level to
-        // what the model supports. Writing them back here makes the record
-        // authoritative, so every surface reads one place instead of each
-        // re-deriving "session, else the request" for itself.
-        if (session.model) {
-          record.invocation ??= {};
-          // Read the kept request first: a caller's level survives being clamped
-          // AND, one line later, being replaced by the effective one.
-          const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
-          Object.assign(record.invocation, describeModel(session.model));
-          // Guarded for the reason above: a session that reports no level keeps
-          // the request rather than losing it. Overwriting unconditionally would
-          // turn an older or stubbed session into a blank `thinking:` tag, which
-          // is worse than the stale-but-true value it replaced.
-          if (session.thinkingLevel) {
-            record.invocation.thinking = session.thinkingLevel;
-            if (requested && requested !== session.thinkingLevel) {
-              record.invocation.requestedThinking = requested;
-            }
-          }
-        }
+        recordRunModel(record, session);
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -1462,11 +1517,12 @@ export class AgentManager {
         try { options.onSessionCreated?.(session); } catch { /* ignore caller wiring errors */ }
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns }) => {
+      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns, modelNote }) => {
         // Abandoned after a stop it ignored: the record was settled without
         // this run, and may already belong to a newer one.
         if (run.abandoned) return responseText;
         record.maxTurns = maxTurns;
+        record.modelNote ??= modelNote;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -1526,6 +1582,8 @@ export class AgentManager {
         }
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt ??= Date.now();
+        // A run that threw reported no text; keep what its turns produced.
+        salvagePartial(record, runStart);
 
         detach();
 
@@ -1558,6 +1616,7 @@ export class AgentManager {
     // done, minus the result it never produced.
     run.onAbandon = async () => {
       detach();
+      salvagePartial(record, runStart);
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }
         record.outputCleanup = undefined;
@@ -1884,6 +1943,8 @@ export class AgentManager {
     record.error = undefined;
 
     const session = record.session;
+    recordRunModel(record, session);
+    const runStart = messageCount(session);
     const abortController = new AbortController();
     record.abortController = abortController;
     const onParentAbort = () => this.abort(id);
@@ -1925,6 +1986,7 @@ export class AgentManager {
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
+        salvagePartial(record, runStart);
       }
       signal?.removeEventListener("abort", onParentAbort);
       this.abortOwnedChildren(id);
@@ -1934,6 +1996,7 @@ export class AgentManager {
       return record.result ?? "";
     })();
     run.onAbandon = async () => {
+      salvagePartial(record, runStart);
       signal?.removeEventListener("abort", onParentAbort);
       this.abortOwnedChildren(id);
       await this.finishResumedWorktree(record);
@@ -2107,6 +2170,8 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    const runStart = messageCount(record.session);
+    recordRunModel(record, record.session);
     const run = this.beginRun(id, record, occupiesPoolSlot(record) ? "background" : undefined);
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
@@ -2134,6 +2199,9 @@ export class AgentManager {
     const windDown = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
+      // What a run that threw or was abandoned had produced; a settled run's
+      // own text is already on the record.
+      if (record.status === "error" || record.status === "stopped") salvagePartial(record, runStart);
       // Final flush of streaming output file
       if (record.outputCleanup) {
         try { record.outputCleanup(); } catch { /* ignore */ }
@@ -2367,17 +2435,24 @@ export class AgentManager {
 
   private keepTombstone(state: AgentResumeState): void {
     this.tombstones.set(state.id, state);
-    // Bound the memory a long session can accumulate, per kind (top-level or
-    // owned). Oldest first, since the agent someone still wants to reach is the
-    // one they used most recently.
-    const topLevel = isTopLevelAgent(state);
-    const sameKind = [...this.tombstones.values()].filter(entry => isTopLevelAgent(entry) === topLevel);
-    let excess = sameKind.length - (topLevel ? MAX_TOMBSTONES : MAX_OWNED_TOMBSTONES);
-    if (excess <= 0) return;
-    sameKind.sort((a, b) => a.completedAt - b.completedAt);
-    for (const entry of sameKind) {
-      if (excess-- <= 0) break;
-      this.tombstones.delete(entry.id);
+    this.trimTombstones();
+  }
+
+  /**
+   * Bound the memory a long session can accumulate, per kind (top-level or
+   * owned). Oldest first, since the agent someone still wants to reach is the
+   * one they used most recently. One counting pass; the sort runs only for a
+   * kind that is over its cap.
+   */
+  private trimTombstones(): void {
+    let topLevel = 0;
+    for (const entry of this.tombstones.values()) if (isTopLevelAgent(entry)) topLevel++;
+    const owned = this.tombstones.size - topLevel;
+    for (const [kindIsTopLevel, excessCount] of [[true, topLevel - MAX_TOMBSTONES], [false, owned - MAX_OWNED_TOMBSTONES]] as const) {
+      if (excessCount <= 0) continue;
+      const sameKind = [...this.tombstones.values()].filter(entry => isTopLevelAgent(entry) === kindIsTopLevel);
+      sameKind.sort((a, b) => a.completedAt - b.completedAt);
+      for (const entry of sameKind.slice(0, excessCount)) this.tombstones.delete(entry.id);
     }
   }
 
@@ -2385,7 +2460,9 @@ export class AgentManager {
    * Make agents of an earlier activation (before a restart, `/resume`,
    * `/fork` or `/reload`) resumable again, from what was persisted in the
    * parent session. Later entries for the same id win. A live record keeps
-   * precedence: it is the newer state of the same agent.
+   * precedence: it is the newer state of the same agent. Trimmed once at the
+   * end rather than per entry, so a session with thousands of entries restores
+   * in one pass.
    */
   restoreTombstones(states: readonly AgentResumeState[]): void {
     for (const state of states) {
@@ -2393,8 +2470,9 @@ export class AgentManager {
       // In entry order, so a later entry for the same id (a later run) wins.
       const current = this.tombstones.get(state.id);
       if (current && current.completedAt > state.completedAt) continue;
-      this.keepTombstone(state);
+      this.tombstones.set(state.id, state);
     }
+    this.trimTombstones();
   }
 
   private cleanup() {

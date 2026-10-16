@@ -1243,10 +1243,10 @@ describe("resuming an evicted agent by name", () => {
     expect(manager.getRecord(resumedId).description).toBe("find flaky tests");
   });
 
-  it("does not let the tools steer or read an agent that is gone", async () => {
-    // A mention can resurrect it, but there is no live record to interrupt and
-    // no result to return — so the tools must say so rather than resolve to a
-    // tombstone and act on stale data.
+  it("does not let the tools steer an agent that is gone, and reads its result from its saved session", async () => {
+    // A mention can resurrect it, but there is no live record to interrupt, so
+    // steering must say so rather than resolve to a tombstone. Its result is
+    // still readable: get_subagent_result reads it from the saved session.
     const { tools } = boot();
     finishedRun(fakeSession());
     await evict(await spawnBackground(tools));
@@ -1260,7 +1260,10 @@ describe("resuming an evicted agent by name", () => {
     );
 
     expect(textOf(steered)).toContain("Agent not found");
-    expect(textOf(read)).toContain("Agent not found");
+    expect(textOf(read)).not.toContain("Agent not found");
+    expect(textOf(read)).toContain("saved session file");
+    // The file holds only its header: no turn to report.
+    expect(textOf(read)).toContain("No output.");
   });
 
   it("reports a session that is gone, rather than starting something else", async () => {

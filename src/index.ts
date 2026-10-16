@@ -31,17 +31,19 @@ import { GroupJoinManager } from "./group-join.js";
 import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { readSavedResult } from "./session-file.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, runModelText, sessionFileLine } from "./status-note.js";
+import { AGENT_ARG_SHAPE, argumentRepair, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentResumeState, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -85,9 +87,22 @@ import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
 
-/** Tool execute return value for a text response. */
-function textResult(msg: string, details?: AgentDetails) {
-  return { content: [{ type: "text" as const, text: msg }], details: details as any };
+/**
+ * Tool execute return value for a text response. `isError` reports a failure
+ * without throwing: the model reads the text as an error result, while
+ * `details` still reaches the renderer.
+ */
+function textResult(msg: string, details?: AgentDetails, isError = false) {
+  return {
+    content: [{ type: "text" as const, text: msg }],
+    details: details as any,
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+/** A refusal or lookup failure: an error result with no agent details. */
+function errorResult(msg: string) {
+  return textResult(msg, undefined, true);
 }
 
 export function renderRunningAgentStatus(
@@ -100,6 +115,24 @@ export function renderRunningAgentStatus(
   container.addChild(new Text(theme.fg("accent", frame) + (statsText ? " " + statsText : ""), 0, 0));
   container.addChild(new Text(theme.fg("dim", `  ⎿  ${activity}`), 0, 0));
   return container;
+}
+
+/**
+ * What a background spawn or resume tells the model about the result. The
+ * notification is the signal: get_subagent_result is for the full text after
+ * it, and calling it before only invites a polling loop.
+ */
+const BACKGROUND_FOLLOW_UP =
+  "You will be notified when this agent completes — continue with other work meanwhile, and do not poll it.\n" +
+  "After the notification, get_subagent_result returns its full result. steer_subagent sends it a message mid-run.";
+
+/** What get_subagent_result says of an agent whose run is not over yet. */
+function stillRunningText(state: "running" | "queued" | "stopping"): string {
+  const lead = state === "stopping"
+    ? "Agent was stopped and is still winding down."
+    : `Agent is still ${state}.`;
+  return `${lead} A completion notification will arrive on its own when it finishes — continue with other work ` +
+    "meanwhile, and do not call get_subagent_result for this agent again until that notification arrives.";
 }
 
 /** How long a foreground `Agent` call runs before its row offers the background key. */
@@ -177,8 +210,39 @@ function getStatusLabel(status: string, error?: string): string {
   }
 }
 
-/** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
+/** Lines of a result a completion notification carries; get_subagent_result has the rest. */
+const NOTIFICATION_PREVIEW_LINES = 10;
+
+/**
+ * The head of a result for a notification: its first `maxLines` lines, cut at
+ * `maxLen` characters as well so one huge line cannot flood the parent's
+ * context. When anything is left out, a note says how much and where the rest
+ * is.
+ */
+export function previewResult(result: string, maxLen: number, maxLines: number): string {
+  const lines = result.split("\n");
+  let head = lines.slice(0, maxLines).join("\n");
+  if (head.length > maxLen) head = head.slice(0, maxLen);
+  if (head.length === result.length) return result;
+  // A line cut part-way counts as not shown: its end is missing.
+  const headLines = head.split("\n").length;
+  const fullLines = result[head.length] === "\n" ? headLines : headLines - 1;
+  const totalBytes = Buffer.byteLength(result, "utf8");
+  const missingBytes = totalBytes - Buffer.byteLength(head, "utf8");
+  return `${head}\n...(truncated: ${lines.length - fullLines} of ${lines.length} lines and ${missingBytes} of ${totalBytes} bytes ` +
+    "not shown; use get_subagent_result for the full output)";
+}
+
+/**
+ * Format a structured task notification matching Claude Code's <task-notification> XML.
+ * The result is previewed by lines (`maxLines`) within `resultMaxLen` characters.
+ */
+function formatTaskNotification(
+  record: AgentRecord,
+  resultMaxLen: number,
+  showCost = false,
+  maxLines = NOTIFICATION_PREVIEW_LINES,
+): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
@@ -190,20 +254,26 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
 
-  const resultPreview = record.result
-    ? record.result.length > resultMaxLen
-      ? record.result.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
-      : record.result
-    : "No output.";
+  const resultPreview = record.result ? previewResult(record.result, resultMaxLen, maxLines) : "No output.";
+  // The whole result's size, so the parent can judge whether fetching the rest is worth it.
+  const resultBytes = record.result ? `<result_bytes>${Buffer.byteLength(record.result, "utf8")}</result_bytes>` : null;
 
   return [
     `<task-notification>`,
     `<task-id>${record.id}</task-id>`,
     record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
+    // A failed run's every turn is in its saved session.
+    record.sessionFile && isFailedStatus(record.status) ? `<session-file>${escapeXml(record.sessionFile)}</session-file>` : null,
     `<status>${escapeXml(status)}</status>`,
+    // What the run actually ran on, which a fuzzy model name or a fallback can change.
+    record.invocation?.modelId ? `<model>${escapeXml(record.invocation.modelId)}</model>` : null,
+    record.invocation?.modelId && record.invocation.thinking ? `<thinking>${escapeXml(record.invocation.thinking)}</thinking>` : null,
+    // The agent file's model did not resolve and the run used another.
+    record.modelNote ? `<model-note>${escapeXml(record.modelNote)}</model-note>` : null,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
+    resultBytes,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
@@ -1504,9 +1574,11 @@ export default function (pi: ExtensionAPI) {
     // Through the completion outbox, like every other completion: delivered at
     // this session's next boundary (a turn when idle), coalesced with anything
     // else that finished, and cancelled per agent by get_subagent_result.
-    // An entry is all there is of an evicted agent, and get_subagent_result
-    // cannot fetch more, so its whole result goes in.
-    const maxLen = (r: AgentRecord) => (manager.getRecord(r.id) === r ? 500 : 20_000);
+    // An entry is all there is of an evicted agent's record, so its whole
+    // result goes in (up to 20 000 characters), not a preview: its saved
+    // session holds the agent's text, but not what the record added to it,
+    // such as the note naming its worktree branch.
+    const live = (r: AgentRecord) => manager.getRecord(r.id) === r;
     for (const r of records) {
       agentActivity.delete(r.id);
       widget.markFinished(r.id);
@@ -1514,7 +1586,10 @@ export default function (pi: ExtensionAPI) {
     }
     const parts = records.flatMap(r => {
       try {
-        return [{ id: r.id, text: formatTaskNotification(r, maxLen(r), showCost), details: buildNotificationDetails(r, 300) }];
+        const text = live(r)
+          ? formatTaskNotification(r, 500, showCost)
+          : formatTaskNotification(r, 20_000, showCost, Number.POSITIVE_INFINITY);
+        return [{ id: r.id, text, details: buildNotificationDetails(r, 300) }];
       } catch { return []; /* as in sendIndividualNudge */ }
     });
     if (parts.length > 0) {
@@ -2200,13 +2275,13 @@ export default function (pi: ExtensionAPI) {
   // them goes too — a model told it may pick a model will keep trying.
   const modelOverrideAllowed = isModelOverrideAllowed();
   const modelGuideline = modelOverrideAllowed
-    ? `- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").\n- Use thinking to control extended thinking level.\n`
+    ? `- Use model to specify a different model (as "provider/modelId", or a short name such as "haiku"; the parent's provider is preferred, and a name matching models of several other providers is refused).\n- Use thinking to control extended thinking level.\n`
     : "";
   const modelParamShape = {
     model: Type.Optional(
       Type.String({
         description:
-          'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+          'Optional model override. Accepts "provider/modelId", or a short name (e.g. "haiku"); the parent\'s provider is preferred, and a name matching models of several other providers is refused. Omit to use the agent type\'s default.',
       }),
     ),
     thinking: Type.Optional(
@@ -2386,6 +2461,8 @@ Terse command-style prompts produce shallow, generic work.
       ...isolationParam(isWorktreeIsolationEnabled()),
       ...scheduleParam,
     }),
+    // Weak models' malformed arguments, repaired before validation (tool-args.ts).
+    prepareArguments: argumentRepair(AGENT_ARG_SHAPE),
 
     // ---- Custom rendering: Claude Code style ----
 
@@ -2416,7 +2493,9 @@ Terse command-style prompts produce shallow, generic work.
       // Pi reports pre-execution failures (extension block, abort, argument
       // validation) as `{ content: [reason], details: {} }` with isError set —
       // no status to render, so show the reason instead of inventing one (#199).
-      if (renderContext.isError || !details?.status) {
+      // A failed run is an error result too, but one of ours: it carries the
+      // agent's id and keeps its status line.
+      if (!details?.status || (renderContext.isError && details.agentId === undefined)) {
         return new Text(text, 0, 0);
       }
 
@@ -2530,7 +2609,7 @@ Terse command-style prompts produce shallow, generic work.
       // but the parameter is required by the schema — so gating it here would
       // make a live agent unresumable the moment its type is deleted, disabled,
       // or gains a case-clashing sibling. Only a real spawn is gated.
-      if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
+      if (!dispatch.ok && !params.resume) return errorResult(dispatch.message);
       const subagentType = dispatch.ok ? dispatch.type : rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
@@ -2541,8 +2620,9 @@ Terse command-style prompts produce shallow, generic work.
       // foreground path. Resume deliberately doesn't: it replays the stored
       // session and ignores `subagent_type` entirely, so a note about type
       // substitution would be describing something that didn't happen.
+      // A blank type is what a call without one is repaired to (tool-args.ts).
       const fallbackNote = dispatch.ok && dispatch.fellBackFrom !== undefined
-        ? `Note: Unknown agent type "${dispatch.fellBackFrom}" — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
+        ? `Note: ${dispatch.fellBackFrom ? `Unknown agent type "${dispatch.fellBackFrom}"` : "No agent type given"} — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
         : "";
 
       const displayName = getDisplayName(subagentType);
@@ -2556,16 +2636,23 @@ Terse command-style prompts produce shallow, generic work.
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
+      // A model the caller named and that does not resolve (missing, or
+      // ambiguous) is the caller's error. One the agent file names falls back
+      // to the parent's, and the result says so: never a silent substitution.
       let model = ctx.model;
+      let modelNote: string | undefined;
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+        const resolution = resolveModelDetailed(resolvedConfig.modelInput, ctx.modelRegistry, ctx.model?.provider);
+        if (resolution.ok) {
+          model = resolution.model;
+        } else if (resolvedConfig.modelFromParams) {
+          return errorResult(resolution.message);
         } else {
-          model = resolved;
+          modelNote = unresolvedModelNote(resolvedConfig.modelInput, unresolvedReason(resolution), model ?? "the parent's model");
         }
       }
+      // What every result of this spawn leads with.
+      const spawnNotes = fallbackNote + (modelNote ? `${modelNote}\n\n` : "");
 
       // Scope validation: the effective resolved model is checked against the
       // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
@@ -2578,7 +2665,7 @@ Terse command-style prompts produce shallow, generic work.
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
       });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
+      if (scopeVerdict.kind === "error") return errorResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
@@ -2611,7 +2698,7 @@ Terse command-style prompts produce shallow, generic work.
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
       const askedModel = ((asked: string | undefined) => {
         if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
+        const resolvedAsked = resolveModel(asked, ctx.modelRegistry, ctx.model?.provider);
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
@@ -2675,19 +2762,19 @@ Terse command-style prompts produce shallow, generic work.
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
+          return errorResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
         }
         if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
+          return errorResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
         }
         if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
+          return errorResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
         }
         if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
+          return errorResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
         }
         if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
+          return errorResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
         try {
           const job = scheduler.addJob({
@@ -2713,7 +2800,7 @@ Terse command-style prompts produce shallow, generic work.
             `Manage via /agents → Scheduled jobs.`,
           );
         } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
+          return errorResult(err instanceof Error ? err.message : String(err));
         }
       }
 
@@ -2729,23 +2816,23 @@ Terse command-style prompts produce shallow, generic work.
         const evicted = resolved?.kind === "tombstone" ? resolved.entry : undefined;
         const target = live && isTopLevelAgent(live) ? live : evicted;
         if (!target) {
-          return textResult(
+          return errorResult(
             `Agent not found: "${params.resume}". Agents stay resumable while their session file exists ` +
             `(subagent sessions are saved unless rememberAgents is off); this one is unknown or was never saved.`,
           );
         }
         const id = target.id;
         if (live && !live.session) {
-          return textResult(`Agent "${params.resume}" has no session to resume — it never got far enough to start one.`);
+          return errorResult(`Agent "${params.resume}" has no session to resume — it never got far enough to start one.`);
         }
         // A detached resume hands control back while the record stays
         // "running", so nothing stops the model from resuming the same agent
         // again mid-run. manager.resume() refuses that; say why here, where the
         // model can act on it, instead of letting it read as a generic failure.
         if (live && (live.status === "running" || live.status === "queued")) {
-          return textResult(
+          return errorResult(
             `Agent "${params.resume}" is still ${live.status} — it can only be resumed once its current run finishes.\n` +
-            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+            `Use steer_subagent to send it a message mid-run. A completion notification arrives on its own when the run finishes.`,
           );
         }
         const resumeTranscript = resumeWritesTranscript(target.type);
@@ -2761,10 +2848,10 @@ Terse command-style prompts produce shallow, generic work.
               toolCallId,
             });
           } catch (err) {
-            return textResult(err instanceof Error ? err.message : String(err));
+            return errorResult(err instanceof Error ? err.message : String(err));
           }
           if (!record) {
-            return textResult(`Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`);
+            return errorResult(`Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`);
           }
 
           const isQueued = record.status === "queued";
@@ -2774,8 +2861,7 @@ Terse command-style prompts produce shallow, generic work.
             `Type: ${record.type}\n` +
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-            `\nYou will be notified when this agent completes.\n` +
-            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            `\n${BACKGROUND_FOLLOW_UP}`,
             { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
           );
         }
@@ -2805,16 +2891,16 @@ Terse command-style prompts produce shallow, generic work.
             onStarted: wiring.onStarted,
           });
         } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
+          return errorResult(err instanceof Error ? err.message : String(err));
         } finally {
           agentActivity.delete(id);
           widget.markFinished(id);
           fleet.onAgentFinished(id);
         }
         if (!record) {
-          return textResult(
+          return errorResult(
             `Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.\n` +
-            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+            `Use steer_subagent to send it a message mid-run. A completion notification arrives on its own when the run finishes.`,
           );
         }
         // A foreground resume flushes its transcript itself: only a background
@@ -2827,8 +2913,9 @@ Terse command-style prompts produce shallow, generic work.
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
           return textResult(
-            `Agent failed: ${record.error}${partialOutputSuffix(record)}${agentIdLine(record.id)}`,
+            `Agent failed: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}${agentIdLine(record.id)}`,
             buildDetails(detailBaseFor(record), record),
+            true,
           );
         }
         return textResult(
@@ -2836,8 +2923,10 @@ Terse command-style prompts produce shallow, generic work.
           // run's headline does rather than presenting partial output as done.
           (getForegroundOutcomeNote(record.status) ? `Agent resumed${getForegroundOutcomeNote(record.status)}.\n\n` : "") +
           (record.result?.trim() || "No output.") +
+          (isFailedStatus(record.status) ? sessionFileLine(record) : "") +
           agentIdLine(record.id),
           buildDetails(detailBaseFor(record), record),
+          isFailedStatus(record.status),
         );
       }
 
@@ -2847,14 +2936,13 @@ Terse command-style prompts produce shallow, generic work.
       const backgroundResult = (id: string, record: AgentRecord | undefined) => {
         const isQueued = record?.status === "queued";
         return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
+          `${spawnNotes}Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `\n${BACKGROUND_FOLLOW_UP}\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
@@ -2894,6 +2982,7 @@ Terse command-style prompts produce shallow, generic work.
           isBackground: true,
           isolation,
           invocation: agentInvocation,
+          modelNote,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
         });
@@ -3050,6 +3139,7 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isolation,
           invocation: agentInvocation,
+          modelNote,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           // Deliberately does NOT set fgId: that drives agentActivity, the
@@ -3108,7 +3198,11 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}${agentIdLine(record.id)}`, details);
+        return textResult(
+          `${spawnNotes}Agent failed: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}${agentIdLine(record.id)}`,
+          details,
+          true,
+        );
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -3118,11 +3212,22 @@ Terse command-style prompts produce shallow, generic work.
         const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
         if (costText) statsParts.push(costText);
       }
+      const modelText = runModelText(record);
+      if (modelText) statsParts.push(modelText);
+      // The headline names how the run ended: a stopped or aborted run did not
+      // complete, and "completed" in front of it reads as a finished task.
+      const headline = record.status === "stopped"
+        ? "Agent was stopped by the user after"
+        : record.status === "aborted"
+          ? "Agent was aborted after"
+          : "Agent completed in";
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${spawnNotes}${headline} ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
         (record.result?.trim() || "No output.") +
+        (isFailedStatus(record.status) ? sessionFileLine(record) : "") +
         agentIdLine(record.id),
         details,
+        isFailedStatus(record.status),
       );
     },
   });
@@ -3608,19 +3713,62 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- get_subagent_result tool ----
 
+  /** A finished top-level agent of this session whose record was released, by id or handle. */
+  function evictedTopLevelAgent(ref: string): AgentResumeState | undefined {
+    const byId = manager.findTombstone(ref);
+    if (byId) return isTopLevelAgent(byId) ? byId : undefined;
+    const resolved = manager.resolveMention(ref);
+    return resolved?.kind === "tombstone" ? resolved.entry : undefined;
+  }
+
+  /**
+   * get_subagent_result for an agent whose record the 10-minute cleanup has
+   * released: status and model from its kept resume state, the result from
+   * its saved session file. Read on demand, so nothing is held in memory
+   * longer for it.
+   */
+  function savedAgentResult(entry: AgentResumeState) {
+    const saved = readSavedResult(entry.sessionFile);
+    if (typeof saved === "string") {
+      return errorResult(`Agent ${entry.id} finished and was released from memory, and its result cannot be read: ${saved}.`);
+    }
+    const status = entry.status ?? "unknown";
+    const model = entry.model ?? saved.model;
+    const thinking = entry.thinking ?? saved.thinking;
+    let output =
+      `Agent: ${entry.id}\n` +
+      `Type: ${getDisplayName(entry.type)} | Status: ${status}${getStatusNote(status)}\n` +
+      (model ? `Model: ${thinking ? `${model}, thinking: ${thinking}` : model}\n` : "") +
+      `Description: ${entry.description}\n` +
+      `(Read from the agent's saved session file, ${entry.sessionFile}: its in-memory record was released after it finished.)\n\n`;
+    if (status === "error") {
+      output += `Error: ${saved.error ?? "not recorded in the saved session"}`;
+      if (saved.text) output += `\n\nPartial output before the failure:\n${saved.text}`;
+    } else {
+      output += saved.text || "No output.";
+    }
+    // Its notification, if one is still pending, is answered by this read.
+    outbox.cancel(entry.id);
+    return textResult(output, undefined, isFailedStatus(status));
+  }
+
   registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
-    promptSnippet: "Check status and retrieve results from a background agent",
+      "Retrieve a background agent's full result after its completion notification, which carries only a preview. " +
+      "You are notified automatically when a background agent finishes, so do not call this to check on one that is " +
+      "still running — continue with other work instead. Use the agent ID returned by Agent.",
+    promptSnippet: "Retrieve a finished background agent's full result",
     parameters: Type.Object({
       agent_id: Type.String({
         description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "If true, wait for the agent to complete before returning. Default: false.",
+          description:
+            "If true, block until the agent finishes. Only when there is nothing else to do until it does; " +
+            "otherwise keep working and let the completion notification arrive. Default: false.",
         }),
       ),
       verbose: Type.Optional(
@@ -3629,10 +3777,17 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
+    prepareArguments: argumentRepair(RESULT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
+      if (!record) {
+        // Released from memory after it finished: its resume state is kept,
+        // and its saved session still holds the final result.
+        const evicted = evictedTopLevelAgent(params.agent_id);
+        if (evicted) return savedAgentResult(evicted);
+      }
       if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        return errorResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool
@@ -3673,20 +3828,23 @@ Terse command-style prompts produce shallow, generic work.
       if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
       statsParts.push(`Duration: ${duration}`);
 
+      const modelText = runModelText(record);
       let output =
         `Agent: ${record.id}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
+        (modelText ? `Model: ${modelText}\n` : "") +
+        (record.modelNote ? `${record.modelNote}\n` : "") +
         `Description: ${record.description}\n\n`;
 
       const active = manager.isRunActive(record.id);
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+      if (record.status === "running" || record.status === "queued") {
+        output += stillRunningText(record.status);
       } else if (record.status === "stopped" && active) {
-        output += "Agent was stopped and is still winding down. Use wait: true or check back later.";
+        output += stillRunningText("stopping");
       } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record)}`;
+        output += `Error: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}`;
       } else {
-        output += record.result?.trim() || "No output.";
+        output += (record.result?.trim() || "No output.") + (isFailedStatus(record.status) ? sessionFileLine(record) : "");
       }
 
       // Mark result as consumed — suppresses the completion notification
@@ -3703,7 +3861,9 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      return textResult(output);
+      // A failed, aborted or stopped run is reported as an error result, so the
+      // model does not read its fragment as the finished task.
+      return textResult(output, undefined, isFailedStatus(record.status));
     },
   }));
 
@@ -3724,13 +3884,14 @@ Terse command-style prompts produce shallow, generic work.
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
       }),
     }),
+    prepareArguments: argumentRepair(STEER_ARG_SHAPE),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        return errorResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
       if (record.status !== "running") {
-        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+        return errorResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
       if (!record.session) {
         // Session not ready yet — queue the steer for delivery once initialized
@@ -3759,7 +3920,7 @@ Terse command-style prompts produce shallow, generic work.
           `Current state: ${stateParts.join(" · ")}`,
         );
       } catch (err) {
-        return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
+        return errorResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
   }));
@@ -3770,15 +3931,16 @@ Terse command-style prompts produce shallow, generic work.
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
+  function getModelLabel(type: string, registry?: ModelRegistry, parentProvider?: string): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
+    const resolution = resolveModelDetailed(cfg.model, registry, parentProvider);
+    // Configured but unresolvable: the run falls back to the parent model (and
+    // its result says so), so flag it here too rather than hiding the config.
+    if (!resolution.ok) return `${label} (${resolution.reason === "ambiguous" ? "ambiguous" : "unavailable"}, fallback: inherit)`;
+    const resolved = resolution.model;
     // Surface what it actually resolved to when that differs from the config —
     // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.
@@ -3880,7 +4042,7 @@ Terse command-style prompts produce shallow, generic work.
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,

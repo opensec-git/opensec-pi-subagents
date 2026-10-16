@@ -17,7 +17,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -25,7 +25,8 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
-import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, sessionFileLine } from "./status-note.js";
+import { argumentRepair, NESTED_AGENT_ARG_SHAPE, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -59,6 +60,8 @@ interface NestedSpawnOptions {
   isBackground?: boolean;
   isolation?: IsolationMode;
   invocation?: AgentInvocation;
+  /** The agent file's model did not resolve; see `AgentRecord.modelNote`. */
+  modelNote?: string;
   signal?: AbortSignal;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
@@ -147,7 +150,7 @@ type ResultPosition = "inline" | "fetched";
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const idLine = position === "inline" ? agentIdLine(record.id) : "";
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${idLine}`;
+    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${sessionFileLine(record)}${idLine}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -159,7 +162,8 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
-  return (note ? `Nested agent${note}.\n\n${text}` : text) + idLine;
+  const sessionLine = isFailedStatus(record.status) ? sessionFileLine(record) : "";
+  return (note ? `Nested agent${note}.\n\n${text}` : text) + sessionLine + idLine;
 }
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
@@ -227,6 +231,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       inherit_context: Type.Optional(Type.Boolean()),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
+    prepareArguments: argumentRepair(NESTED_AGENT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
@@ -250,7 +255,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           return textResult(err instanceof Error ? err.message : String(err), true);
         }
         return resumed
-          ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
+          ? textResult(formatRecord(resumed, "inline"), isFailedStatus(resumed.status))
           : textResult(`Nested agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`, true);
       }
 
@@ -290,15 +295,22 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: false,
       });
+      // Same rule as the top-level tool: a model the caller named must
+      // resolve; one the agent file names falls back to this agent's model,
+      // and the result says so.
       let model = ctx.model;
+      let modelNote: string | undefined;
       if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
+        const resolution = resolveModelDetailed(invocation.modelInput, ctx.modelRegistry, ctx.model?.provider);
+        if (resolution.ok) {
+          model = resolution.model;
+        } else if (invocation.modelFromParams) {
+          return textResult(resolution.message, true);
         } else {
-          model = resolvedModel;
+          modelNote = unresolvedModelNote(invocation.modelInput, unresolvedReason(resolution), model ?? "the parent agent's model");
         }
       }
+      const notePrefix = modelNote ? `${modelNote}\n\n` : "";
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn
       // must not escape the allowlist. A "warn" verdict proceeds silently:
@@ -333,6 +345,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
+        modelNote,
         onAssistantUsage: bookIntoAncestors,
         depth: childDepth,
         parentAgentId: context.parentAgentId,
@@ -390,7 +403,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Worktree isolation starts the agent asynchronously; surface its
           // failure as a tool error, like the synchronous throw used to.
           await context.manager.awaitStartup(id);
-          return textResult(`Nested agent started in background. Agent ID: ${id}`);
+          return textResult(`${notePrefix}Nested agent started in background. Agent ID: ${id}`);
         }
 
         const { record } = await context.manager.spawnAndWait(
@@ -401,7 +414,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           { ...options, signal },
           attachTranscript,
         );
-        return textResult(formatRecord(record, "inline"), record.status === "error");
+        return textResult(notePrefix + formatRecord(record, "inline"), isFailedStatus(record.status));
       } catch (err) {
         return textResult(err instanceof Error ? err.message : String(err), true);
       }
@@ -416,6 +429,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       agent_id: Type.String(),
       wait: Type.Optional(Type.Boolean()),
     }),
+    prepareArguments: argumentRepair(RESULT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal) => {
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId)) {
@@ -432,7 +446,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      return textResult(formatRecord(record, "fetched"), isFailedStatus(record.status));
     },
   });
 
@@ -444,6 +458,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       agent_id: Type.String(),
       message: Type.String(),
     }),
+    prepareArguments: argumentRepair(STEER_ARG_SHAPE),
     execute: async (_toolCallId, params) => {
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {

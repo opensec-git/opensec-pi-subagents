@@ -235,20 +235,51 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(resolved).toMatchObject({ record: { id } });
   });
 
-  it("drops the oldest once the cap is reached, keeping the most recent", async () => {
+  /** Resume states as a parent session's entries carry them; `i` orders their ages. */
+  function states(count: number, kind: "top" | "owned") {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `${kind}-${i}`,
+      type: "Explore",
+      description: `${kind} ${i}`,
+      sessionFile: `/sessions/${kind}-${i}.jsonl`,
+      completedAt: 1_000 + i,
+      ...(kind === "top" ? { handle: `explore-${kind}-${i}` } : { parentAgentId: "parent" }),
+    }));
+  }
+
+  it("keeps 2000 top-level and 4000 owned tombstones, dropping the oldest of each kind", () => {
     manager = new AgentManager();
-    for (let i = 0; i < 101; i++) {
-      const { record } = await evictable("Explore", `run-${i}`, `/sessions/${i}.jsonl`);
-      // Distinct ages so "oldest" is well defined; run-0 is the oldest. Set on
-      // the record we just made — under fake timers every startedAt is equal,
-      // so listAgents() has no meaningful order to index into.
-      record.completedAt = Date.now() - (TEN_MINUTES + 101_000 - i * 1000);
-    }
+    manager.restoreTombstones([...states(2001, "top"), ...states(4001, "owned")]);
+
+    expect(manager.listTombstones()).toHaveLength(2000);
+    expect(manager.findTombstone("top-0")).toBeUndefined();
+    expect(manager.findTombstone("top-1")).toBeDefined();
+    expect(manager.findTombstone("owned-0")).toBeUndefined();
+    expect(manager.findTombstone("owned-1")).toBeDefined();
+    expect(manager.findTombstone("owned-4000")).toBeDefined();
+  });
+
+  it("restores thousands of entries in one cheap pass", () => {
+    manager = new AgentManager();
+    const entries = [...states(2000, "top"), ...states(4000, "owned")];
+    const started = performance.now();
+    manager.restoreTombstones(entries);
+    // One trim at the end, not one per entry: generous bound, far below what
+    // a per-entry rescan of 6000 entries costs.
+    expect(performance.now() - started).toBeLessThan(250);
+    expect(manager.listTombstones()).toHaveLength(2000);
+  });
+
+  it("drops the oldest once the cap is reached by an eviction, keeping the most recent", async () => {
+    manager = new AgentManager();
+    manager.restoreTombstones(states(2000, "top"));
+    const { record } = await evictable("Explore", "newest", "/sessions/newest.jsonl");
+    record.completedAt = Date.now() - (TEN_MINUTES + 30_000);
     await vi.advanceTimersByTimeAsync(TICK);
 
-    expect(manager.listTombstones()).toHaveLength(100);
-    expect(manager.resolveMention("explore")).toBeUndefined(); // run-0's handle
-    expect(manager.resolveMention("explore-101")?.kind).toBe("tombstone");
+    expect(manager.listTombstones()).toHaveLength(2000);
+    expect(manager.findTombstone("top-0")).toBeUndefined();
+    expect(manager.findTombstone(record.id)).toMatchObject({ status: "completed" });
   });
 
   it("hands a reclaimed name straight back, numbering nothing", async () => {
