@@ -40,7 +40,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, sessionFileLine } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, runModelText, sessionFileLine } from "./status-note.js";
 import { AGENT_ARG_SHAPE, argumentRepair, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -265,6 +265,9 @@ function formatTaskNotification(
     // A failed run's every turn is in its saved session.
     record.sessionFile && isFailedStatus(record.status) ? `<session-file>${escapeXml(record.sessionFile)}</session-file>` : null,
     `<status>${escapeXml(status)}</status>`,
+    // What the run actually ran on, which a fuzzy model name or a fallback can change.
+    record.invocation?.modelId ? `<model>${escapeXml(record.invocation.modelId)}</model>` : null,
+    record.invocation?.modelId && record.invocation.thinking ? `<thinking>${escapeXml(record.invocation.thinking)}</thinking>` : null,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
     resultBytes,
@@ -3197,6 +3200,8 @@ Terse command-style prompts produce shallow, generic work.
         const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
         if (costText) statsParts.push(costText);
       }
+      const modelText = runModelText(record);
+      if (modelText) statsParts.push(modelText);
       // The headline names how the run ended: a stopped or aborted run did not
       // complete, and "completed" in front of it reads as a finished task.
       const headline = record.status === "stopped"
@@ -3766,9 +3771,11 @@ Terse command-style prompts produce shallow, generic work.
       if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
       statsParts.push(`Duration: ${duration}`);
 
+      const modelText = runModelText(record);
       let output =
         `Agent: ${record.id}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
+        (modelText ? `Model: ${modelText}\n` : "") +
         `Description: ${record.description}\n\n`;
 
       const active = manager.isRunActive(record.id);

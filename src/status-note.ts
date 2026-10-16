@@ -114,3 +114,14 @@ export function isFailedStatus(status: string): boolean {
 export function sessionFileLine(record: Pick<AgentRecord, "sessionFile">): string {
   return record.sessionFile ? `\n\nSession file (every turn of this agent): ${record.sessionFile}` : "";
 }
+
+/**
+ * The model and thinking level the agent's latest run ran with, as
+ * "provider/id, thinking: high", or undefined before a model is known.
+ */
+export function runModelText(record: Pick<AgentRecord, "invocation">): string | undefined {
+  const modelId = record.invocation?.modelId;
+  if (!modelId) return undefined;
+  const thinking = record.invocation?.thinking;
+  return thinking ? `${modelId}, thinking: ${thinking}` : modelId;
+}

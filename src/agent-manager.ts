@@ -589,6 +589,34 @@ function salvagePartial(record: AgentRecord, start: number): void {
 }
 
 /**
+ * Record the model and thinking level a run actually runs with, from its
+ * session. Both are only knowable once pi has resolved its defaults and clamped
+ * the level to what the model supports. Writing them back makes the record
+ * authoritative, so every surface (the widget, the notification, the result
+ * tools) reads one place instead of each re-deriving "session, else the
+ * request" for itself. Called at the start of every run, so a resumed run
+ * records its own.
+ */
+function recordRunModel(record: AgentRecord, session: AgentSession): void {
+  if (!session.model) return;
+  record.invocation ??= {};
+  // Read the kept request first: a caller's level survives being clamped
+  // AND, one line later, being replaced by the effective one.
+  const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
+  Object.assign(record.invocation, describeModel(session.model));
+  // Guarded: a session that reports no level keeps the request rather than
+  // losing it. Overwriting unconditionally would turn an older or stubbed
+  // session into a blank `thinking:` tag, which is worse than the
+  // stale-but-true value it replaced.
+  if (session.thinkingLevel) {
+    record.invocation.thinking = session.thinkingLevel;
+    if (requested && requested !== session.thinkingLevel) {
+      record.invocation.requestedThinking = requested;
+    }
+  }
+}
+
+/**
  * Whether a run is in flight or waiting for a slot. A function rather than an
  * inline test so TypeScript does not narrow `status` across an `await` that
  * can change it.
@@ -1469,28 +1497,7 @@ export class AgentManager {
         // stubbed session must degrade to "not resumable" rather than throw
         // and take the whole spawn down with it.
         record.sessionFile = session.sessionManager?.getSessionFile?.();
-        // Same reason, different field: the model and thinking level are only
-        // knowable once pi has resolved its defaults and clamped the level to
-        // what the model supports. Writing them back here makes the record
-        // authoritative, so every surface reads one place instead of each
-        // re-deriving "session, else the request" for itself.
-        if (session.model) {
-          record.invocation ??= {};
-          // Read the kept request first: a caller's level survives being clamped
-          // AND, one line later, being replaced by the effective one.
-          const requested = record.invocation.requestedThinking ?? record.invocation.thinking;
-          Object.assign(record.invocation, describeModel(session.model));
-          // Guarded for the reason above: a session that reports no level keeps
-          // the request rather than losing it. Overwriting unconditionally would
-          // turn an older or stubbed session into a blank `thinking:` tag, which
-          // is worse than the stale-but-true value it replaced.
-          if (session.thinkingLevel) {
-            record.invocation.thinking = session.thinkingLevel;
-            if (requested && requested !== session.thinkingLevel) {
-              record.invocation.requestedThinking = requested;
-            }
-          }
-        }
+        recordRunModel(record, session);
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -1928,6 +1935,7 @@ export class AgentManager {
     record.error = undefined;
 
     const session = record.session;
+    recordRunModel(record, session);
     const runStart = messageCount(session);
     const abortController = new AbortController();
     record.abortController = abortController;
@@ -2155,6 +2163,7 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     const runStart = messageCount(record.session);
+    recordRunModel(record, record.session);
     const run = this.beginRun(id, record, occupiesPoolSlot(record) ? "background" : undefined);
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 

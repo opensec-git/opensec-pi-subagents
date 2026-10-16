@@ -289,7 +289,11 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
-  /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
+  /**
+   * Resolved spawn params, captured for UI display. Fixed at spawn time, except
+   * the model and thinking level: those are rewritten from the session at the
+   * start of every run, so they name what the latest run actually ran with.
+   */
   invocation?: AgentInvocation;
   /**
    * The turn limit the first run enforced (undefined = unlimited). A resumed
