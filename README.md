@@ -108,6 +108,28 @@ appears under one of them after 2 s. In the conversation viewer (FleetView, `/ag
   run moves from the foreground to the background concurrency pool, over the limit if the pool is full.
 - Nested agents, workflow agents, queued spawns and resumed runs cannot be handed off.
 
+### Conversation viewer
+
+Opening an agent (FleetView, `/agents`, the workflow inspector's `c`) shows its conversation drawn by Pi's own chat
+components, exactly as Pi draws the main session: user and assistant messages with thinking blocks, each tool call
+with its arguments and its tool's own result rendering (edit diffs, read previews, bash command, output, exit status
+and duration, running/done/error state), `!` bash runs, compaction and branch summaries, skill blocks and extension
+messages. Tool renderers come from the subagent's own session, so an extension tool draws as it does in Pi. A message
+that is still streaming and a tool that is still running update live.
+
+- `ctrl+o` expands and collapses tool output, as in Pi (it follows a rebinding of Pi's `app.tools.expand`).
+- Pi's `hideThinkingBlock`, `outputPad` and `markdown.codeBlockIndent` settings apply, read when the viewer opens.
+- Agent output is sanitized before Pi's components see it: escape and control sequences in messages, tool arguments
+  and results are removed (Pi's own styling is kept).
+- Not the same as the main session: images in tool results show as Pi's text placeholder (an inline image cannot be
+  clipped to a scrolled overlay), Mermaid blocks are not drawn as diagrams (Pi's Mermaid renderer is not available to
+  extensions), and clicking a tool block or thinking block does not toggle it (use `ctrl+o`).
+- The `viewerMarkdown` setting and the viewer's `m` key were removed in 0.20.4; a `viewerMarkdown` key left in
+  `subagents.json` is ignored.
+- Cost: each message's component is built once and its rendered lines are kept; a frame re-renders only the streamed
+  message and tools that changed, and scrolling never re-renders. Without a JIT (Pi-Bolt) a frame takes about 5 µs and
+  a scroll step about 15 µs at any transcript length.
+
 ### Fullscreen conversation observer
 
 In Pi's fullscreen mode (`/settings → TUI mode → fullscreen`, Pi's default), an agent opened from FleetView, `/agents`
@@ -118,14 +140,15 @@ or pauses an agent, and `Esc` returns to the previous view (while composing, the
 - A one-column scrollbar in Pi's style that follows Pi's `/settings → Fullscreen scrollbar`: `auto` appears while
   scrolling or hovering and hides after a second, `always` stays, `hidden` removes it and its mouse target. Drag the
   thumb, or click the track to page. The column is kept free in `auto` mode too, so the bar never re-wraps the text.
-- Clickable footer controls (steer, send to background, stop with two clicks, Markdown mode, close).
+- Clickable footer controls (steer, send to background, stop with two clicks, expand tool output, close).
 - While scrolled away, the divider above the footer shows `[ ↓ N new messages · Ctrl+End ]` (conversation messages,
   not streaming updates); click it or press `Ctrl+End` to jump back and follow, without losing a steering draft.
 - Mouse events are consumed, so they never scroll, select or click the main view underneath. Text selection, copying
   and switching agents without leaving the observer are not implemented.
 - Cost: built on the viewer's incremental transcript, so scrolling, wheel and drags reuse cached lines, a frame checks
-  only the transcript's last message and draws only the visible rows, and nothing ticks while it is idle. Without a JIT
-  (Pi-Bolt), a frame or a scroll step costs well under a millisecond whatever the transcript's length.
+  only what changed and draws only the visible rows, and nothing ticks while it is idle (a running bash tool's elapsed
+  time redraws its block once a second, as in Pi). Without a JIT (Pi-Bolt), a frame or a scroll step costs well under a
+  millisecond whatever the transcript's length.
 
 ### Resuming agents
 
