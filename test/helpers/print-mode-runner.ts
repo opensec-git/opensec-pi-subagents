@@ -53,6 +53,9 @@ import {
   fauxAssistantMessage,
   fauxText,
   fauxToolCall,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  type Message,
   type Model,
   type ToolCall,
 } from "@earendil-works/pi-ai";
@@ -224,6 +227,23 @@ export function routeBySession(routes: {
   };
 }
 
+/**
+ * Pi 1.0 hands providers a transcript whose system prompt and tool set live in
+ * `system` messages (`toolsAdded`/`toolsRemoved`), not in `Context.systemPrompt`
+ * / `Context.tools`. Responders are written against the classic shape, so fold
+ * the transcript back into it: current prompt and tools, non-system messages.
+ * A context that already carries `tools` (pre-1.0 Pi) passes through.
+ */
+export function legacyContext(context: Context): Context {
+  if (context.tools || !context.messages.some((m) => m.role === "system")) return context;
+  const messages = context.messages as Message[];
+  return {
+    systemPrompt: getCurrentSystemPrompt(messages),
+    tools: getCurrentTools(messages),
+    messages: messages.filter((m) => m.role !== "system"),
+  };
+}
+
 /** Normalize any FauxReply into a faux AssistantMessage (tool calls ⇒ stopReason "toolUse"). */
 function toAssistantMessage(reply: FauxReply): AssistantMessage {
   if (reply && typeof reply === "object" && "role" in reply) {
@@ -329,7 +349,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
       }
       const max = options.maxModelCalls ?? 16;
       const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(context, state));
+        toAssistantMessage(await respond(legacyContext(context), state));
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }
