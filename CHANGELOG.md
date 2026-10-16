@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resume.** A finished, stopped or failed agent stays resumable by the model as long as its session file exists, not 10 minutes: the Agent tool, `@handle`, nested and workflow `agent({resume})` reopen it from the file under the same id, with its own model, thinking level, working directory, worktree and `isolated` setting. Agents are rebuilt after a restart, `/resume`, `/fork` or `/reload`. A worktree agent resumes in its worktree, recreated from its branch. `max_turns`, grace turns and the tool watchdog apply to resumed runs. Foreground results give the model the agent id. A resume waits for a stopped run to finish.
+- **Stopping.** An agent whose tool ignores the abort signal is still stopped: its slot is freed and queued agents start, a foreground call returns, and the watchdog gives up on it instead of waiting forever. Agents stopped while queued or while their worktree is made complete like any other stop.
+- **Crashes.** An `@mention` racing `/new`, `/resume` or `/reload`, an error in a completion handler, and scheduler fires can no longer end Pi's process; the schedule lock no longer blocks Pi.
+- **Project trust.** Subagents follow Pi's decision about a project folder: in an untrusted folder they load none of its extensions or settings, and the extension ignores its agents, skills, workflows and `subagents.json`. A project agent that replaces a built-in is shown.
+- **Explore and Plan** are read-only by their tools (`read`, `grep`, `find`, `ls`), not only by their prompt.
+- **Worktrees.** Cleanup no longer deletes ignored output, nested repositories or stashes while reporting "no changes"; worktrees left by a crash are committed to a `-recovered` branch; workflows report every child's branch. Gate commands and git calls end their whole process tree on a timeout.
+- **Usage.** Workflow resumes are not counted twice; background, workflow and nested spend reaches the parent.
+
+### Performance
+
+- The widget and fleet list share one refresh timer, which stops while nothing runs; the transcript viewer builds incrementally (500 messages: 85 ms to 0.6 ms a frame without a JIT); the widget formats only the rows it shows; foreground progress is sent once a frame, not per token; per-tool-call scope checks and git environment checks are cached; finished agents' sessions are released 60 s after they settle; transcript writes are batched.
+- Tests clean up their temporary folders.
+
 ## [0.19.11] - 2026-10-07
 
 ### Fixed
