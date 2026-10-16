@@ -11,6 +11,7 @@ import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
 import { type EventedSessionLike, getCachedSessionContextPercent, getLifetimeCost, getLifetimeTotal, type LifetimeUsage } from "../usage.js";
+import { RefreshTicker } from "./refresh-ticker.js";
 
 // ---- Constants ----
 
@@ -254,7 +255,6 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
 export class AgentWidget {
   private uiCtx: UICtx | undefined;
   private widgetFrame = 0;
-  private widgetInterval: ReturnType<typeof setInterval> | undefined;
   /** Tracks how many turns each finished agent has survived. Key: agent ID, Value: turns since finished. */
   private finishedTurnAge = new Map<string, number>();
   /** How many extra turns errors/aborted agents linger (completed agents clear after 1 turn). */
@@ -300,6 +300,12 @@ export class AgentWidget {
      * conversation viewer unconditionally.
      */
     private showModel: () => boolean = () => false,
+    /**
+     * The clock the 80 ms refresh runs on. The extension shares one with the
+     * fleet list and the inline foreground spinners, so their redraws land on
+     * the same frame. Defaults to a private one.
+     */
+    private ticker: RefreshTicker = new RefreshTicker(),
   ) {}
 
   /**
@@ -349,9 +355,7 @@ export class AgentWidget {
 
   /** Ensure the widget update timer is running. */
   ensureTimer() {
-    if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
-    }
+    if (!this.ticker.has(this)) this.ticker.set(this, 80, () => this.update());
   }
 
   /** When a finished agent's row expires by time. */
@@ -617,7 +621,7 @@ export class AgentWidget {
     if (hasActive) {
       this.ensureTimer();
     } else {
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
+      this.ticker.delete(this);
       if (hasFinished) {
         this.expiryTimer = setTimeout(() => { this.expiryTimer = undefined; this.update(); }, Math.max(0, nextExpiry - Date.now()));
         this.expiryTimer.unref?.();
@@ -680,10 +684,7 @@ export class AgentWidget {
   }
 
   dispose() {
-    if (this.widgetInterval) {
-      clearInterval(this.widgetInterval);
-      this.widgetInterval = undefined;
-    }
+    this.ticker.delete(this);
     this.clearExpiryTimer();
     if (this.uiCtx) {
       this.uiCtx.setWidget("agents", undefined);

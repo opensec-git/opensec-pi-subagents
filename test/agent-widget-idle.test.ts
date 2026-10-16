@@ -52,7 +52,7 @@ function harness(records: ReturnType<typeof record>[]) {
     get registered() { return registered; },
     get requestRenders() { return requestRenders; },
     resetCount: () => { requestRenders = 0; },
-    timerAlive: () => !!(widget as any).widgetInterval,
+    timerAlive: () => (widget as any).ticker.has(widget),
   };
 }
 
