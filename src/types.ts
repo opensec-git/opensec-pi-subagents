@@ -240,6 +240,11 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+  /**
+   * The turn limit the first run enforced (undefined = unlimited). A resumed
+   * run gets the same limit, counted afresh, unless its caller passes one.
+   */
+  maxTurns?: number;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
   /**

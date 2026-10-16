@@ -312,12 +312,20 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /**
+   * Turn limit for the resumed run. Default: the limit the agent's first run
+   * enforced (`record.maxTurns`), counted afresh — with the same grace turns
+   * and tool watchdog as a first run.
+   */
+  maxTurns?: number;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** Called at the end of each agentic turn with the run's turn count. */
+  onTurnEnd?: (turnCount: number) => void;
   /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
@@ -380,6 +388,24 @@ function worktreeNote(
     return `\n\n---\nChanges could not be saved to a branch; the worktree was kept at \`${wtResult.path}\`.`;
   }
   return "";
+}
+
+/**
+ * Terminal status of a resumed run, with the spawn path's precedence: an
+ * external stop stays "stopped", a hard abort at the turn limit is "aborted",
+ * then a failed final turn is an honest "error" (#144) — the resumed text stays
+ * available — then "steered" or "completed".
+ */
+function settleResumeStatus(
+  record: AgentRecord,
+  run: { failure?: string; aborted?: boolean; steered?: boolean },
+): void {
+  if (record.status === "stopped") return;
+  if (run.aborted) record.status = "aborted";
+  else if (run.failure) {
+    record.status = "error";
+    record.error = run.failure;
+  } else record.status = run.steered ? "steered" : "completed";
 }
 
 export class AgentManager {
@@ -868,7 +894,8 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
+      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns }) => {
+        record.maxTurns = maxTurns;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -1209,7 +1236,9 @@ export class AgentManager {
         this.onStart?.(record);
         if (signal?.aborted) this.abort(id);
         else signal?.addEventListener("abort", onParentAbort, { once: true });
-        const { text, failure } = abortController.signal.aborted ? { text: "" } : await resumeAgent(session, prompt, {
+        const { text, failure, aborted, steered } = abortController.signal.aborted ? { text: "" } : await resumeAgent(session, prompt, {
+          maxTurns: options?.maxTurns ?? record.maxTurns,
+          onTurnEnd: options?.onTurnEnd,
           onToolActivity: (activity) => {
             if (activity.type === "end") record.toolUses++;
             options?.onToolActivity?.(activity);
@@ -1226,10 +1255,7 @@ export class AgentManager {
           },
           signal: abortController.signal,
         });
-        if (record.status !== "stopped") {
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
-        }
+        settleResumeStatus(record, { failure, aborted, steered });
         record.result = text;
         record.completedAt ??= Date.now();
       } catch (err) {
@@ -1306,6 +1332,8 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      maxTurns: options.maxTurns ?? record.maxTurns,
+      onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1322,14 +1350,8 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
-        // Don't overwrite status if externally stopped via abort().
-        if (record.status !== "stopped") {
-          // Same contract as the spawn path (#144): a failed final turn is an
-          // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
-        }
+      .then(({ text, failure, aborted, steered }) => {
+        settleResumeStatus(record, { failure, aborted, steered });
         record.result = text;
         record.completedAt ??= Date.now();
         settle();

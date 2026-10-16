@@ -684,6 +684,8 @@ export interface RunResult {
   structuredJson?: string;
   /** Whether the extra structured-output prompt had to be sent. */
   structuredRetried?: boolean;
+  /** The turn limit this run enforced (undefined = unlimited), for later resumes. */
+  maxTurns?: number;
 }
 
 /**
@@ -1223,11 +1225,94 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
+  // Build the effective prompt: optionally prepend parent context
+  let effectivePrompt = prompt;
+  if (options.inheritContext) {
+    const parentContext = buildParentContext(ctx);
+    if (parentContext) {
+      effectivePrompt = parentContext + prompt;
+    }
+  }
+
+  let structuredRetried = false;
+  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  const run = await driveSession(session, effectivePrompt, {
+    maxTurns,
+    signal: options.signal,
+    onTurnEnd: options.onTurnEnd,
+    onTextDelta: options.onTextDelta,
+    onToolActivity: options.onToolActivity,
+    onAssistantUsage: options.onAssistantUsage,
+    onCompaction: options.onCompaction,
+    // One more prompt when a schema was asked for and nothing usable came back
+    // — the model answered in prose, or only ever called the tool invalidly.
+    // Sent inside driveSession, so the turn tracking, the text collector and
+    // above all the abort forwarding are still live: torn down first, a retry
+    // would be unkillable.
+    followUp: () => {
+      if (structuredCapture === undefined || structuredCapture.json !== undefined) return undefined;
+      structuredRetried = true;
+      return structuredRetryPrompt(structuredCapture);
+    },
+  });
+
+  // A child asked for structured output that never gave any has failed, however
+  // articulate its prose was. Reported through `failure` so it travels the same
+  // path as a provider error rather than arriving as a successful empty answer.
+  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
+    ? structuredCapture.lastError !== undefined
+      ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
+      : "The agent did not report its answer through StructuredOutput."
+    : undefined;
+  return {
+    responseText: run.responseText,
+    session,
+    aborted: run.aborted,
+    steered: run.steered,
+    failure: run.failure ?? structuredFailure,
+    maxTurns,
+    ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
+    ...(structuredRetried ? { structuredRetried } : {}),
+  };
+}
+
+/** Callbacks and limits for one run of prompts on a session (first run or resume). */
+export interface DriveOptions {
+  /** Turn limit for this run. undefined = unlimited. */
+  maxTurns?: number;
+  signal?: AbortSignal;
+  onTurnEnd?: (turnCount: number) => void;
+  onTextDelta?: (delta: string, fullText: string) => void;
+  onToolActivity?: (activity: ToolActivity) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
+  onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /**
+   * An extra prompt to send once the main prompt (and any stuck-tool recovery)
+   * has finished, unless the run was aborted. Returns undefined for none.
+   */
+  followUp?: () => string | undefined;
+}
+
+export interface DriveResult {
+  responseText: string;
+  /** Hard-aborted: max_turns + grace turns exceeded, or stuck tools past the recovery limit. */
+  aborted: boolean;
+  /** Steered to wrap up at the soft turn limit. */
+  steered: boolean;
+  failure?: string;
+}
+
+/**
+ * Send a prompt to a session and enforce the run's limits: the soft turn limit
+ * (steer), the grace turns (hard abort), the per-tool timeout and its watchdog
+ * recovery. Shared by a first run and a resume, so a resumed agent is bounded
+ * exactly like a fresh one. The turn count starts at zero for every run.
+ */
+export async function driveSession(session: AgentSession, prompt: string, options: DriveOptions): Promise<DriveResult> {
   const toolTimeouts = installToolTimeouts(session);
 
-  // Track turns for graceful max_turns enforcement
   let turnCount = 0;
-  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  const maxTurns = options.maxTurns;
   let softLimitReached = false;
   let aborted = false;
 
@@ -1277,26 +1362,17 @@ export async function runAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  // Build the effective prompt: optionally prepend parent context
-  let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
-  }
-
   // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
+  // on counts as this run's output. A resumed session already holds prior
+  // turns, and a failed resume must not surface the previous answer (#144).
   const startLen = session.messages.length;
-  let structuredRetried = false;
   try {
     // Stopped before the session was ready: nothing was asked yet, so ask
     // nothing — prompting now would run the whole task for nobody.
     if (options.signal?.aborted) {
-      return { responseText: "", session, aborted: true, steered: false };
+      return { responseText: "", aborted: true, steered: false };
     }
-    await session.prompt(effectivePrompt);
+    await session.prompt(prompt);
     for (let recoveries = 0; ; recoveries++) {
       const hung = toolTimeouts.takeHung();
       if (!hung) break;
@@ -1306,16 +1382,9 @@ export async function runAgent(
       }
       await session.prompt(hungToolPrompt(hung));
     }
-
-    // One more prompt when a schema was asked for and nothing usable came back
-    // — the model answered in prose, or only ever called the tool invalidly.
-    // Inside this `try`, so the turn tracking, the text collector and above all
-    // the abort forwarding are still live: torn down first, a retry would be
-    // unkillable.
-    if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
-      structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+    if (!aborted && options.signal?.aborted !== true) {
+      const followUp = options.followUp?.();
+      if (followUp !== undefined) await session.prompt(followUp);
     }
   } finally {
     toolTimeouts.dispose();
@@ -1324,86 +1393,25 @@ export async function runAgent(
     cleanupAbort();
   }
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  // A child asked for structured output that never gave any has failed, however
-  // articulate its prose was. Reported through `failure` so it travels the same
-  // path as a provider error rather than arriving as a successful empty answer.
-  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
-    ? structuredCapture.lastError !== undefined
-      ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
-      : "The agent did not report its answer through StructuredOutput."
-    : undefined;
   return {
-    responseText,
-    session,
+    responseText: collector.getText().trim() || getLastAssistantText(session, startLen),
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
-    ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
-    ...(structuredRetried ? { structuredRetried } : {}),
+    failure: finalTurnError(session, startLen),
   };
 }
 
 /**
- * Send a new prompt to an existing session (resume).
+ * Send a new prompt to an existing session (resume). Runs under the same turn
+ * limit, grace turns and tool watchdog as a first run (see `driveSession`).
  */
 export async function resumeAgent(
   session: AgentSession,
   prompt: string,
-  options: {
-    onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: LifetimeUsage) => void;
-    onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
-    signal?: AbortSignal;
-  } = {},
-): Promise<{ text: string; failure?: string }> {
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
-  const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
-
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
-        }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-        }
-      })
-    : () => {};
-
-  const toolTimeouts = installToolTimeouts(session);
-  try {
-    if (options.signal?.aborted) return { text: "" };
-    await session.prompt(prompt);
-    for (let recoveries = 0; recoveries < MAX_TOOL_RECOVERIES && !options.signal?.aborted; recoveries++) {
-      const hung = toolTimeouts.takeHung();
-      if (!hung) break;
-      await session.prompt(hungToolPrompt(hung));
-    }
-  } finally {
-    toolTimeouts.dispose();
-    collector.unsubscribe();
-    unsubEvents();
-    cleanupAbort();
-  }
-
-  return {
-    text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
-  };
+  options: DriveOptions = {},
+): Promise<{ text: string; failure?: string; aborted?: boolean; steered?: boolean }> {
+  const run = await driveSession(session, prompt, options);
+  return { text: run.responseText, failure: run.failure, aborted: run.aborted, steered: run.steered };
 }
 
 /**

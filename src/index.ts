@@ -977,9 +977,9 @@ export default function (pi: ExtensionAPI) {
         // must keep holding, since record.outputFile is the sole gate every
         // downstream consumer keys off and a resume must not re-open it.
         const config = getAgentConfig(record.type);
+        // No turn limit here: the resumed run keeps the one its first run had.
         const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
           outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
-          maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
         });
         ctx.ui.notify(
           resumedRecord ? `Resuming ${target}` : `Could not resume ${target} — it is still running.`,
@@ -1357,7 +1357,9 @@ export default function (pi: ExtensionAPI) {
     // this index, so it is written exactly once.
     const transcriptAnchor = existing.session?.messages.length ?? 0;
 
-    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns);
+    // `opts.maxTurns` is an explicit override; without one the resumed run
+    // enforces the limit the agent's first run had.
+    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns ?? existing.maxTurns);
     // resumeAgent has no onSessionCreated — the session predates this run —
     // so seed it directly, or the widget shows no context % for the agent.
     bgState.session = existing.session;
@@ -1368,8 +1370,10 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      maxTurns: opts.maxTurns,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       // Fires when the run actually starts — immediately, or on queue
       // drain. Wiring it here (rather than after resume() returns) means a
       // resume stopped while still queued never started streaming, so
@@ -2036,6 +2040,9 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
+        // Only an explicit `max_turns` overrides the limit the agent's first
+        // run had; the type's config default must not replace it.
+        const resumeMaxTurns = params.max_turns != null ? normalizeMaxTurns(params.max_turns) : undefined;
         const existing = manager.getRecord(params.resume);
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
@@ -2064,7 +2071,7 @@ Terse command-style prompts produce shallow, generic work.
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
-            maxTurns: effectiveMaxTurns,
+            maxTurns: resumeMaxTurns,
             toolCallId,
           });
           if (!record) {
@@ -2084,7 +2091,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, { maxTurns: resumeMaxTurns });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
