@@ -108,6 +108,14 @@ delegation. It is not a sandbox: the agent still inherits Pi's environment varia
 `bash` can read), the parent's model registry and auth, global and trusted project settings (shell, command prefix,
 retry, compaction), and, for append-mode agents such as `general-purpose`, the parent's whole system prompt.
 
+The agent file wins over the caller for `isolated:` and `isolation:`; a call's value applies only when the file leaves
+the field unset. This holds on every spawn path: the `Agent` tool, `@handle` mentions (direct mode and the fallback
+when a mention clone fails), resumed and reopened agents, cross-extension RPC and the manager registry. So
+`isolation: off` in a file refuses a caller's `isolation: "worktree"`, and an `isolation: worktree` file gets its
+worktree even when the caller asked for none; outside a git repository such an agent fails to start instead of running
+in the main checkout. Two exceptions: in a workflow, only the script's `agent()` option decides `isolation` (as in Claude
+Code; `isolated:` from the file still applies), and an agent reopened from its session file continues where it ran.
+
 `tools:` limits built-in tools only. Tools registered by extensions stay available unless the file sets
 `extensions: false` (or names the extensions to load), or lists `ext:` selectors in `tools:`, which turns extension
 tools into an allowlist. The built-in `Explore` and `Plan` agents get `read`, `grep`, `find` and `ls` and no extension

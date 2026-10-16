@@ -20,6 +20,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getAgentConfig } from "./agent-types.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { sessionFileProblem } from "./session-file.js";
@@ -1127,6 +1128,15 @@ export class AgentManager {
     // The project switch is enforced here as well as at the tool boundary
     // because cross-extension RPC forwards its options unvalidated — a schema
     // that omits the field can't stop a caller that never saw the schema.
+    // The agent file's `isolation:` is resolved here too, not by each caller:
+    // mentions pass none, and RPC forwards only its caller's value. Workflow
+    // children are the exception, as in Claude Code, whose workflow agent()
+    // reads only the script's option and ignores the definition's. So is an
+    // agent reopened from its session file: it continues where it ran, and a
+    // worktree it ran in comes back through `restoreWorktree` below.
+    const isolation = options.workflowId !== undefined || options.resumeSessionFile !== undefined
+      ? options.isolation
+      : getAgentConfig(type)?.isolation ?? options.isolation;
     let worktreeCwd: string | undefined;
     // What an earlier run of a reopened agent left on its branch. A resumed
     // run that changes nothing keeps reporting that, not "no changes".
@@ -1150,7 +1160,7 @@ export class AgentManager {
         await stopDuringStartup(wt);
         return;
       }
-    } else if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
+    } else if (isolation === "worktree" && isWorktreeIsolationEnabled()) {
       const wt = await createWorktree(pi, baseCwd, id);
       if (!wt) {
         this.discardRun(run);
@@ -1168,6 +1178,10 @@ export class AgentManager {
       // subdirectory, silently dropping extensions/skills.
       worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
       this.worktreeRepos.add(baseCwd);
+      // The widget's "worktree" tag reads this; only callers that resolve the
+      // agent file themselves seed it.
+      record.invocation ??= {};
+      record.invocation.isolation = "worktree";
 
       // No longer "running" means a stop landed while the copy was being made
       // (abort(), abortAll()) — a window that did not exist when creation was
