@@ -41,9 +41,10 @@ if (fixed === null) {
   log(`${testCommand} failed — handing the output back to the same child`)
 
   // Resume, not a fresh spawn: the child still has everything it learned on the
-  // first pass, so it is told what broke rather than rediscovering it.
+  // first pass. The gate's output is not in its conversation (the gate only
+  // rewrote the result the script saw), so it runs the command to see it.
   fixed = await agent(
-    `\`${testCommand}\` is still failing. Read the failure above, fix the cause, and stop.`,
+    `\`${testCommand}\` is still failing. Run it to see the failure, fix the cause, and stop.`,
     { label: 'fix', resume: 'fix' },
   )
 
