@@ -25,7 +25,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -116,18 +116,19 @@ function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): rec
  * How the caller received this record, which decides the outcome wording.
  *
  *   - "inline": a foreground spawn or a resume. The full output is in this very
- *     result and no agent id was handed back, so the note must say there is
- *     nothing left to fetch — otherwise the parent invents an id, calls
- *     `get_subagent_result`, and hits "not owned by this parent" (#174, the same
- *     trap the top-level foreground path fell into).
+ *     result, so the note must say there is nothing left to fetch — otherwise
+ *     the parent calls `get_subagent_result` for nothing (#174, the same trap
+ *     the top-level foreground path fell into). The agent id is appended so
+ *     the parent can resume the child.
  *   - "fetched": `get_subagent_result` on a background child. The parent holds a
  *     valid id and can poll again, so the background wording applies.
  */
 type ResultPosition = "inline" | "fetched";
 
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
+  const idLine = position === "inline" ? agentIdLine(record.id) : "";
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
+    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${idLine}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -139,7 +140,7 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
-  return note ? `Nested agent${note}.\n\n${text}` : text;
+  return (note ? `Nested agent${note}.\n\n${text}` : text) + idLine;
 }
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */

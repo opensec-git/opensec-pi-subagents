@@ -154,15 +154,16 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("never hands the model an agent id — the id lives only in renderer details", async () => {
+  it("hands the model the agent id so it can resume the agent", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const { res, id } = await runForegroundSteeredAgent(tools);
 
-    // `content` is the only thing serialized to the API. If the id isn't here,
-    // the model cannot have obtained it — any id it passes is invented.
-    expect(textOf(res)).not.toContain(id);
-    expect(textOf(res)).not.toMatch(/Agent ID:/);
+    // `content` is the only thing serialized to the API. Without the id there,
+    // a foreground agent could never be resumed, and the tool description
+    // tells the model it can be — so it would invent one.
+    expect(textOf(res)).toContain(`Agent ID: ${id}`);
+    expect(textOf(res)).toContain("resume");
 
     // An invented id is correctly rejected — this is the reporter's error,
     // reproduced WITHOUT any record having been cleaned up.

@@ -122,3 +122,39 @@ describe("resume enforces the run limits", () => {
     expect(resumeCalls).toBeLessThanOrEqual(7);
   });
 });
+
+describe("resume of a foreground agent", () => {
+  it("finds the agent id in the foreground result and resumes the same conversation", async () => {
+    const childContexts: string[][] = [];
+    run = await runPrintMode({
+      prompt: "go",
+      live: false,
+      maxModelCalls: 20,
+      respond: (ctx) => {
+        if (isParent(ctx)) {
+          const results = agentResults(ctx);
+          if (results.length === 0) {
+            return agentCall({ description: "fg", prompt: "CODEWORD BANANA. Reply ACK-1.", run_in_background: false });
+          }
+          if (results.length === 1) {
+            // Only what the model can see: the result text.
+            const id = agentIdIn(textOf(results[0]));
+            if (!id) return "NO-ID";
+            return agentCall({ resume: id, prompt: "What was the codeword?", description: "resume", run_in_background: false });
+          }
+          return "Done.";
+        }
+        childContexts.push(ctx.messages.map((m) => `${m.role}:${textOf(m)}`));
+        return childContexts.length === 1 ? "ACK-1" : "BANANA";
+      },
+    });
+
+    expect(run.responseText).not.toContain("NO-ID");
+    expect(childContexts).toHaveLength(2);
+    expect(childContexts[1]).toEqual([
+      "user:CODEWORD BANANA. Reply ACK-1.",
+      "assistant:ACK-1",
+      "user:What was the codeword?",
+    ]);
+  });
+});

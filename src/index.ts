@@ -35,7 +35,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -2098,10 +2098,17 @@ Terse command-style prompts produce shallow, generic work.
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
+          return textResult(
+            `Agent failed: ${record.error}${partialOutputSuffix(record)}${agentIdLine(record.id)}`,
+            buildDetails(detailBaseFor(record), record),
+          );
         }
         return textResult(
-          record.result?.trim() || "No output.",
+          // A resumed run can now hit its turn limit, so say so the way a first
+          // run's headline does rather than presenting partial output as done.
+          (getForegroundOutcomeNote(record.status) ? `Agent resumed${getForegroundOutcomeNote(record.status)}.\n\n` : "") +
+          (record.result?.trim() || "No output.") +
+          agentIdLine(record.id),
           buildDetails(detailBaseFor(record), record),
         );
       }
@@ -2324,7 +2331,7 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}${agentIdLine(record.id)}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2336,7 +2343,8 @@ Terse command-style prompts produce shallow, generic work.
       }
       return textResult(
         `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
+        (record.result?.trim() || "No output.") +
+        agentIdLine(record.id),
         details,
       );
     },

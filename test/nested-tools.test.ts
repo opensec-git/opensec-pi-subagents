@@ -408,12 +408,24 @@ describe("child-safe nested Agent tools", () => {
     });
 
     expect(result.isError).toBe(false);
-    // Foreground: the whole output is inline and no id came back, so the note
-    // must not invite a get_subagent_result call the parent cannot make (#174).
+    // Foreground: the whole output is inline, so the note must not invite a
+    // get_subagent_result call that has nothing more to return (#174).
     expect(result.content[0].text).toContain("everything the agent produced is above");
     expect(result.content[0].text).not.toContain("output is partial");
     // The warning leads, so it can't read as part of the child's own answer.
     expect(result.content[0].text.indexOf("half an answer")).toBeGreaterThan(0);
+  });
+
+  it("hands the parent the child's id with an inline result, so it can resume it", async () => {
+    spawnAndWait.mockImplementation(async () => ({
+      id: "child-1",
+      record: { id: "child-1", status: "completed", result: "the answer", parentAgentId: "parent-1" },
+    }));
+    const [agent] = tools();
+    const result = await execute(agent, { subagent_type: "scout", description: "fg", prompt: "Do work" });
+
+    expect(result.content[0].text).toContain("the answer");
+    expect(result.content[0].text).toContain("Agent ID: child-1");
   });
 
   it("uses the fetchable wording when the parent polls a background child by id", async () => {
