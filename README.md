@@ -72,6 +72,21 @@ Agent({ subagent_type: "Explore", prompt: "Find authentication code", descriptio
 | `/agents` | Inspect and manage agents: live conversations, settings, workflows, and scheduled jobs (`/agents → Scheduled jobs`). |
 | `@<agent> <message>` | With agent mentions enabled, sends a message to that agent, e.g. `@explore check the RPC path`. A finished agent is resumed (see [Resuming agents](#resuming-agents)). |
 
+### Sending a foreground agent to the background
+
+While a foreground `Agent` call runs (`run_in_background: false`), press `ctrl+b` at the prompt to hand it to the
+background, as in Claude Code. The same run keeps going (session, in-flight turn, transcript and worktree); the blocked
+call returns what a `run_in_background` spawn returns, and the result arrives later as the usual background
+notification. `ctrl+b` hands off every running foreground call at once; a dim `(ctrl+b to run in background)` hint
+appears under one of them after 2 s. In the conversation viewer (FleetView, `/agents`), `b` hands off just that agent.
+
+- The key is claimed only while a foreground call runs and the prompt editor has focus; otherwise `ctrl+b` keeps its
+  editor meaning (cursor left). Rebind it with `"backgroundKey"` in `subagents.json` (a Pi key id such as `alt+b`), or
+  turn it off with `"backgroundKey": "off"`.
+- After the handoff, `Esc` on the parent turn no longer stops the agent; `x` in the viewer and `/agents` still do. The
+  run moves from the foreground to the background concurrency pool, over the limit if the pool is full.
+- Nested agents, workflow agents, queued spawns and resumed runs cannot be handed off.
+
 ### Resuming agents
 
 Every agent result names the agent: `Agent ID: <id>` (foreground and background results alike). Pass it back to continue
@@ -166,6 +181,7 @@ To have them follow Pi's project trust decision instead, set `"projectTrust": "p
 | Setting | Default | Meaning |
 |---|---|---|
 | Background concurrency (`/agents → Settings`) | `10` | How many background agents run at once. |
+| `backgroundKey` (`subagents.json`) | `ctrl+b` | Key that sends running foreground `Agent` calls to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)); `"off"` disables it. |
 | Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call is killed at the limit and the agent sees the timeout; any other tool still running a minute later is stopped and the agent is told to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none; a timeout the main agent asks for is kept. |
 
 ## Notes

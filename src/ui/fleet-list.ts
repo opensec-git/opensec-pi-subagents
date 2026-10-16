@@ -17,7 +17,7 @@ import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
-import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
+import { ConversationViewer, VIEWPORT_HEIGHT_PCT, type ViewerBackgroundAction } from "./conversation-viewer.js";
 import { RefreshTicker } from "./refresh-ticker.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -150,6 +150,12 @@ export class FleetList {
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
     /** Shared with the widget by the extension, so both redraw on one frame. */
     private ticker: RefreshTicker = new RefreshTicker(),
+    /**
+     * The viewer's `b` for this row's run, supplied by the extension: only it
+     * knows which runs have a tool call waiting to be released, and it owns the
+     * widget this list shares with. Omitted → no `b` affordance.
+     */
+    private backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction,
   ) {}
 
   // ---- Lifecycle ----
@@ -394,7 +400,7 @@ export class FleetList {
    * peek: unknowable focus (no tui seen yet, nothing focused) counts as the
    * editor so activation keeps working.
    */
-  private editorHasFocus(): boolean {
+  editorHasFocus(): boolean {
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
     if (focused == null) return true;
     const c = focused as { getText?: unknown; setText?: unknown };
@@ -453,6 +459,7 @@ export class FleetList {
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,
+          this.backgroundAction?.(record, message => this.ui?.notify(message, "info")),
         );
       },
       {

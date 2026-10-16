@@ -160,6 +160,17 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
+  it("round-trips backgroundKey; normalizes case and drops blank or non-string values", () => {
+    saveSettings({ backgroundKey: "alt+b" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ backgroundKey: "alt+b" });
+    writeProject({ backgroundKey: " Ctrl+Shift+B " } as any);
+    expect(loadSettings(projectDir)).toEqual({ backgroundKey: "ctrl+shift+b" });
+    writeProject({ backgroundKey: "  " } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ backgroundKey: 2 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("round-trips viewerMarkdown; keeps valid values, drops invalid", () => {
     saveSettings({ viewerMarkdown: "off" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "off" });
@@ -555,6 +566,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
+        setBackgroundKey: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),
@@ -669,6 +681,13 @@ describe("settings persistence", () => {
       expect(appliers.setWidgetMode).toHaveBeenCalledWith("off");
       applySettings({}, appliers);
       expect(appliers.setWidgetMode).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
+    it("applies backgroundKey; skips it when absent", () => {
+      applySettings({ backgroundKey: "off" }, appliers);
+      expect(appliers.setBackgroundKey).toHaveBeenCalledWith("off");
+      applySettings({}, appliers);
+      expect(appliers.setBackgroundKey).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
     it("applies viewerMarkdown; skips it when absent", () => {
@@ -806,6 +825,7 @@ describe("settings persistence", () => {
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
+        setBackgroundKey: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
         setMaxSubagentDepth: vi.fn(),

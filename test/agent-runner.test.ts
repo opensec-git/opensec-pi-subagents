@@ -2822,6 +2822,31 @@ describe("agent-runner turn limits", () => {
 // nothing checked that the signal actually reaches the session, so a child could
 // be marked stopped while it keeps running and burning tokens.
 describe("agent-runner abort signal forwarding", () => {
+  // A signal that fired BEFORE the child was prompted (upstream #261). `addEventListener`
+  // never fires on an already-aborted signal, and pi's `session.abort()` is a no-op
+  // until a run is active — so the only way to honor it is not to prompt.
+  it("does not prompt when the signal fired before session creation", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("resumeAgent does not prompt when its signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+
+    await resumeAgent(session as any, "continue", { signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
   it("aborts the session when the parent signal fires mid-run", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     const controller = new AbortController();

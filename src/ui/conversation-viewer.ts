@@ -50,6 +50,12 @@ const STREAM_FRAME_MS = 80;
  */
 type Block = { msg: object; source: string; lines: string[] | undefined };
 
+/** The `b` affordance: whether this run can be handed to the background now, and the handoff. */
+export interface ViewerBackgroundAction {
+  available(): boolean;
+  send(): void;
+}
+
 /** Cycle order for the viewer's `m` key. */
 const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
 
@@ -221,6 +227,12 @@ export class ConversationViewer implements Component {
      * the same thing. Omitted → `m` still cycles, viewer-locally.
      */
     private onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
+    /**
+     * Hand this run to the background. `available` is read live — it turns
+     * false the instant the handoff lands or the run ends. Omitted → no `b`
+     * affordance (history views).
+     */
+    private onBackground?: ViewerBackgroundAction,
   ) {
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
@@ -260,6 +272,16 @@ export class ConversationViewer implements Component {
     if (matchesKey(data, "enter") && this.canSteer()) {
       this.stopArmed = false;
       this.openComposer();
+      return;
+    }
+
+    // Hand a live foreground run to the background. Single press, unlike stop:
+    // the transition is one-way but keeps the agent working, so a stray key
+    // costs a notification rather than the run.
+    if (matchesKey(data, "b") && this.canSendToBackground()) {
+      this.stopArmed = false;
+      this.onBackground?.send();
+      this.tui.requestRender();
       return;
     }
 
@@ -400,6 +422,8 @@ export class ConversationViewer implements Component {
       const sep = th.fg("dim", " · ");
       const actions: string[] = [];
       if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
+      // Abbreviated for the same reason as the Markdown group below.
+      if (this.canSendToBackground()) actions.push(th.fg("dim", "b bg"));
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
@@ -431,6 +455,15 @@ export class ConversationViewer implements Component {
   /** Stoppable only when a stop handler exists and the agent is still active. */
   private isStoppable(): boolean {
     return !!this.onStop && (this.record.status === "running" || this.record.status === "queued");
+  }
+
+  /**
+   * Asked of the owner rather than derived from the record: only the caller
+   * blocked on this run knows it can let go of it, and `blocking` alone also
+   * matches spawns nobody can hand off (the agent generator).
+   */
+  private canSendToBackground(): boolean {
+    return this.onBackground?.available() === true;
   }
 
   /** The mode in force: an `m` press, else the setting, else the default. */

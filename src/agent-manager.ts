@@ -781,6 +781,9 @@ export class AgentManager {
   private endRun(run: LiveRun): void {
     if (run.settled) return;
     run.settled = true;
+    // Nobody waits on a settled run; a later foreground resume must not look
+    // like a spawn `sendToBackground` could hand off.
+    run.record.blocking = false;
     if (run.graceTimer) clearTimeout(run.graceTimer);
     if (this.runs.get(run.id) === run) this.runs.delete(run.id);
     this.releaseRunSlot(run);
@@ -994,20 +997,37 @@ export class AgentManager {
    * an aborted signal, so a `spawnAndWait` on it would wait forever — pi has no
    * tool-execution timeout to bail it out.
    *
-   * The listener is left in place when the agent starts. `startAgent` adds its
-   * own, so both fire on a later abort, but `abort()` on an already-stopped
-   * record is a no-op — so detaching would only be tidiness, and tidiness the
-   * `abortAll`/`dispose` paths could not offer anyway.
+   * The listener is removable (`record.detachParentAbort`): `startAgent`
+   * replaces it with its own, and `sendToBackground` must be able to take it
+   * off, or the caller that armed it could stop a run it no longer owns.
    */
   private armQueuedAbort(id: string, signal?: AbortSignal): boolean {
     if (signal === undefined) return true;
+    const record = this.agents.get(id);
     if (signal.aborted) {
-      const record = this.agents.get(id);
       if (record) this.stopQueued(record);
       return false;
     }
-    signal.addEventListener("abort", () => this.abort(id), { once: true });
+    if (record) this.armParentAbort(record, signal);
     return true;
+  }
+
+  /**
+   * Stop `record` when its caller's `signal` aborts, replacing any listener an
+   * earlier stage armed — at most one is live per record, so one call to
+   * `detachParentAbort` cuts the run loose from its caller.
+   */
+  private armParentAbort(record: AgentRecord, signal: AbortSignal | undefined): void {
+    this.detachParentAbort(record);
+    if (signal === undefined) return;
+    const onParentAbort = () => this.abort(record.id);
+    signal.addEventListener("abort", onParentAbort, { once: true });
+    record.detachParentAbort = () => signal.removeEventListener("abort", onParentAbort);
+  }
+
+  private detachParentAbort(record: AgentRecord): void {
+    record.detachParentAbort?.();
+    record.detachParentAbort = undefined;
   }
 
   /**
@@ -1197,20 +1217,13 @@ export class AgentManager {
 
     try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
 
-    // Wire parent abort signal to stop the subagent when the parent is interrupted
-    let detachParentSignal: (() => void) | undefined;
-    if (options.signal) {
-      // A queued spawn can start minutes after the caller handed us its signal,
-      // by which time it may already be aborted — and `addEventListener` would
-      // never fire, leaving a child the parent can no longer reach.
-      if (options.signal.aborted) this.abort(id);
-      else {
-        const onParentAbort = () => this.abort(id);
-        options.signal.addEventListener("abort", onParentAbort, { once: true });
-        detachParentSignal = () => options.signal!.removeEventListener("abort", onParentAbort);
-      }
-    }
-    const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
+    // Wire parent abort signal to stop the subagent when the parent is interrupted.
+    // A queued spawn can start minutes after the caller handed us its signal,
+    // by which time it may already be aborted — and `addEventListener` would
+    // never fire, leaving a child the parent can no longer reach.
+    if (options.signal?.aborted) this.abort(id);
+    else this.armParentAbort(record, options.signal);
+    const detach = () => this.detachParentAbort(record);
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
@@ -1545,6 +1558,48 @@ export class AgentManager {
       throw new Error(record.error ?? "Agent failed to start");
     }
     return { id, record };
+  }
+
+  /**
+   * Hand a live run to the background without restarting it. The session,
+   * promise, in-flight turn, transcript and worktree all continue under the
+   * same id; what changes is who answers for it. The caller's parent-abort
+   * listener comes off (its Esc no longer reaches the run — `abort()` and
+   * `/agents` still do), the slot moves to the background pool, and the run
+   * then settles through the ordinary background path: `endRun` releases the
+   * run's live pool, and the settle reads the live `isBackground`, so the
+   * result is delivered as a background completion.
+   *
+   * Releasing the caller is the caller's job — the `Agent` tool races its own
+   * wake-up against `spawnAndWait`. This only refuses what it can see: a run
+   * nobody is blocking on (a background or detached spawn, one already handed
+   * off, or a foreground resume — `blocking` is cleared when the spawned run
+   * settles), one that reports through something other than the session (a
+   * nested child, a workflow's agent), and one that is stopped or queued.
+   *
+   * The background slot is taken even when the pool is full: suspending a
+   * live run is not an option, so it runs over the limit and queued
+   * background work waits for the count to drop, as with `bypassQueue`.
+   */
+  sendToBackground(id: string): boolean {
+    const record = this.agents.get(id);
+    const run = this.runs.get(id);
+    if (!record?.blocking || !isTopLevelAgent(record) || record.status !== "running" || !record.promise) return false;
+    if (!run || run.settled || run.record !== record) return false;
+
+    this.detachParentAbort(record);
+    if (!run.slotReleased) {
+      if (run.pool === "foreground") this.runningForeground--;
+      else if (run.pool === "background") this.runningBackground--;
+      this.runningBackground++;
+    }
+    run.pool = "background";
+    record.blocking = false;
+    record.isBackground = true;
+    record.resultConsumed = false;
+    // A freed foreground slot may have unblocked a queued blocking spawn.
+    this.drainQueue();
+    return true;
   }
 
   /**

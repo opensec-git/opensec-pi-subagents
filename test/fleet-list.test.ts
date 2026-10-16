@@ -4,6 +4,7 @@ import type { AgentManager } from "../src/agent-manager.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
 import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
+import type { ViewerBackgroundAction } from "../src/ui/conversation-viewer.js";
 import {
   FLEET_TICK_MS,
   FleetList,
@@ -86,6 +87,8 @@ interface Harness {
   closeWorkflowDialog: () => Promise<void>;
   /** The overlay component (a real ConversationViewer) once one is opened. */
   overlayComponent: () => { handleInput(data: string): void } | undefined;
+  /** Notices the fleet pushed through `ui.notify`, as `level: message`. */
+  notices: () => string[];
   /** Feed a key to the registered input handler; returns the consume result. */
   press: (data: string) => { consume?: boolean } | undefined;
   /** Render the currently-registered below-editor widget at the given width. */
@@ -119,8 +122,10 @@ function harness(
   opts: {
     viewerMarkdown?: () => ViewerMarkdownMode;
     onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction;
   } = {},
 ): Harness {
+  const notices: string[] = [];
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
   let editorText = "";
@@ -134,7 +139,7 @@ function harness(
     setWidget: (_key, content) => { widgetFactory = content as any; },
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
-    notify: () => {},
+    notify: (message, level) => { notices.push(`${level}: ${message}`); },
     custom: ((factory: any) => {
       opened = true;
       return new Promise<undefined>((resolve) => {
@@ -148,7 +153,7 @@ function harness(
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown, undefined, opts.backgroundAction);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -169,6 +174,7 @@ function harness(
     ui,
     manager,
     overlayComponent: () => overlayComponent,
+    notices: () => notices,
     press: (data) => inputHandler?.(data),
     render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, theme).render(width) : []),
     setEditorText: (t) => { editorText = t; },
@@ -538,6 +544,33 @@ describe("FleetList overlay lifecycle", () => {
     // Selection follows a2 ("two") to its new position, not whatever is at idx 2 now.
     expect(h.render().find(l => l.includes("two"))).toContain("●");
     expect(h.render().find(l => l.includes("three"))).toContain("○");
+  });
+
+  it("wires the viewer's b to the extension's action for that row, notifying through the session UI", () => {
+    const agents = [makeRecord({ id: "live", description: "the one" })];
+    const backgroundAction = vi.fn((record: AgentRecord, notify: (message: string) => void) => ({
+      available: () => true,
+      send: () => notify(`sent ${record.id}`),
+    }));
+    const h = harness(agents, { backgroundAction });
+    h.press(DOWN);  // activate (main)
+    h.press(DOWN);  // → the agent
+    h.press(ENTER); // open the conversation viewer
+
+    expect(backgroundAction).toHaveBeenCalledWith(agents[0], expect.any(Function));
+    h.overlayComponent()!.handleInput("b");
+    expect(h.notices()).toEqual(["info: sent live"]);
+  });
+
+  it("offers no b when the extension supplies no action", () => {
+    const agents = [makeRecord({ id: "live", description: "the one" })];
+    const h = harness(agents);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(() => h.overlayComponent()!.handleInput("b")).not.toThrow();
+    expect(h.notices()).toEqual([]);
   });
 
   it("wires the viewer's steer composer to manager.steer with the agent id", () => {
