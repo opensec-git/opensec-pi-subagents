@@ -913,10 +913,20 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
   });
 
-  it("leaves a nested child in memory, since nothing can address it later", async () => {
-    // The default exists so `@handle` can reopen a conversation. A nested agent
-    // never gets a handle, so its transcript would be unreachable by anything —
-    // pure disk and /resume clutter.
+  it("persists a nested child too, so its owner can resume it after eviction", async () => {
+    // A nested agent has no handle, but its parent holds its id and can resume
+    // it long after the record is evicted — which needs the session file.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", { pi, nested: true });
+
+    expect(sessionManagerCreate).toHaveBeenCalled();
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+  });
+
+  it("leaves a nested child in memory when rememberAgents is off", async () => {
+    setRememberAgents(false);
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     createAgentSession.mockResolvedValue({ session: createSession("OK").session });
 

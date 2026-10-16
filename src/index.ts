@@ -976,12 +976,11 @@ export default function (pi: ExtensionAPI) {
         // agent, so its frontmatter is what governs — `output_transcript: false`
         // must keep holding, since record.outputFile is the sole gate every
         // downstream consumer keys off and a resume must not re-open it.
-        const config = getAgentConfig(record.type);
         // No turn limit here: the resumed run keeps the one its first run had.
         let resumedRecord: AgentRecord | undefined;
         try {
-          resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
-            outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+          resumedRecord = await startBackgroundResume(ctx, record.id, mention.message, {
+            outputTranscript: resumeWritesTranscript(record.type),
           });
         } catch (err) {
           ctx.ui.notify(`Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`, "warning");
@@ -998,64 +997,40 @@ export default function (pi: ExtensionAPI) {
       // `no_transcript`.
     }
 
-    // Evicted, but its conversation is still on disk: reopen it. This is an
-    // ordinary spawn carrying a session file, so the new record picks up the
-    // widget, fleet row, transcript and completion notification unchanged —
-    // and `reclaim` hands it back the names the tombstone was holding.
+    // Evicted, but its conversation is still on disk: reopen it — the same
+    // path the model's `Agent({ resume })` takes. The reopened record keeps the
+    // agent's id and takes back the names the tombstone was holding, and runs
+    // with the agent's own model, directory, worktree and isolation.
     if (resolved?.kind === "tombstone") {
       const entry = resolved.entry;
       const target = `@${entry.alias ?? entry.handle}`;
 
-      // Checked here rather than left to SessionManager.open: that runs inside
-      // runAgent, whose rejection lands on the record as an agent error, not in
-      // the catch below. A `/new` in another pi window or a manual delete makes
-      // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
-      // the entry — a row that can only ever fail is worse than none — and say
-      // so rather than quietly sending this message to an unrelated agent.
+      // Checked here for the specific wording; the manager checks again. A
+      // `/new` in another pi window or a manual delete makes the conversation
+      // unrecoverable (Claude Code's `not_reachable`), so drop the entry — a
+      // row that can only ever fail is worse than none — and say so rather
+      // than quietly sending this message to an unrelated agent.
       if (!existsSync(entry.sessionFile)) {
-        manager.dropTombstone(entry.handle);
+        manager.dropTombstone(entry.id);
         ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
         return { action: "handled" };
       }
-
-      // The Agent tool deliberately falls back to general-purpose for a type it
-      // cannot resolve (#183), which covers a deleted file AND a merely
-      // disabled one. A resume must not inherit that: reopening this
-      // conversation under a different agent's prompt and tools is not
-      // continuing it, and the new record would re-tombstone under the
-      // substitute, so the handle would never find its way back.
-      reloadCustomAgents();
-      const dispatch = resolveSpawnType(entry.type);
-      if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
-        // The tombstone stays: re-enabling the agent makes the handle work
-        // again, which a drop would foreclose.
+      // The tombstone stays: re-enabling the agent makes the handle work
+      // again, which a drop would foreclose.
+      if (reopenTypeProblem(entry.type)) {
         ctx.ui.notify(`Could not resume ${target} — the ${entry.type} agent is no longer available.`, "warning");
         return { action: "handled" };
       }
 
       try {
-        // spawnResolved, not spawnTopLevel: the latter strips
-        // `resumeSessionFile` and `reclaim` as untrusted. This path is the
-        // exception — both come from a tombstone this extension wrote.
-        const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
-          description: entry.description,
-          reclaim: { handle: entry.handle, alias: entry.alias },
-          resumeSessionFile: entry.sessionFile,
-          isBackground: true,
+        // Awaited past startup, so a failure (an unreadable session file, a
+        // worktree that cannot be restored) lands in the catch below instead
+        // of being announced as a resume. The tombstone stays on failure.
+        await startBackgroundResume(ctx, entry.id, mention.message, {
+          outputTranscript: resumeWritesTranscript(entry.type),
         });
-        // The agent may still be starting — wait, so a startup failure lands in
-        // the catch below instead of being announced as a resume.
-        await manager.awaitStartup(id);
-        // The tombstone deliberately stays. `resolveMention` prefers the live
-        // record holding these same names, so it cannot shadow the resume — and
-        // if this run dies before establishing its own session, the original
-        // transcript is still the right thing for the next mention to reopen.
-        // Once the resumed record is evicted it overwrites this entry in place,
-        // keyed by the same handle, so nothing accumulates.
         ctx.ui.notify(`Resuming ${target}`, "info");
       } catch (err) {
-        // The type is already settled above, so what is left is a spawn-time
-        // failure: a strict worktree-isolation error, an unusable cwd.
         ctx.ui.notify(
           `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
           "warning",
@@ -1326,49 +1301,92 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Launch a detached resume of an existing agent and wire everything a
-   * re-running agent needs: transcript anchoring, activity tracking, join-mode
-   * batching, the widget/fleet refresh, and the `subagents:created` event.
+   * Refuse to reopen an evicted agent under a substitute: the Agent tool falls
+   * back to general-purpose for a type it cannot resolve (#183), which covers a
+   * deleted file AND a merely disabled one. Reopening the conversation under
+   * another agent's prompt and tools is not continuing it.
+   */
+  function reopenTypeProblem(type: string): string | undefined {
+    reloadCustomAgents();
+    const dispatch = resolveSpawnType(type);
+    return !dispatch.ok || dispatch.fellBackFrom !== undefined
+      ? `the ${type} agent is no longer available.`
+      : undefined;
+  }
+
+  /** Whether a resumed agent writes its `.output` transcript: its OWN type decides. */
+  function resumeWritesTranscript(type: string): boolean {
+    return getAgentConfig(type)?.outputTranscript ?? getOutputTranscriptDefault();
+  }
+
+  /**
+   * The per-run wiring every resume needs, live or reopened: the transcript
+   * (appended to, never truncated) and the activity tracker's session.
+   *
+   * `onRecord` runs before the run starts; `onStarted` once the session exists
+   * and before the prompt is sent, so the stream is anchored past the turns
+   * already on disk and the resumed prompt is written exactly once.
+   */
+  function resumeWiring(
+    ctx: ExtensionContext,
+    id: string,
+    opts: { outputTranscript: boolean; toolCallId?: string; joinMode?: JoinMode },
+    state: AgentActivity,
+  ): { onRecord: (rec: AgentRecord) => void; onStarted: () => void } {
+    return {
+      onRecord: (rec) => {
+        // Assigned unconditionally: the completion notification carries this as
+        // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR
+        // the id left by the spawn that created the record. Keeping it would
+        // point the orchestrator's new result at a tool call answered runs ago.
+        rec.toolCallId = opts.toolCallId;
+        if (opts.joinMode) rec.joinMode = opts.joinMode;
+        // Reuse the agent's transcript rather than starting a fresh one: the
+        // path is deterministic per agent+session, so writing an initial entry
+        // would truncate the previous run's turns (see ensureOutputFile).
+        if (opts.outputTranscript) {
+          rec.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+          ensureOutputFile(rec.outputFile);
+        }
+      },
+      // Fires when the run actually starts — immediately, on queue drain, or
+      // once a reopened session exists. A resume stopped while still queued
+      // never started streaming, so no subscription is left behind.
+      onStarted: () => {
+        const rec = manager.getRecord(id);
+        state.session = rec?.session;
+        if (rec?.session && rec.outputFile) {
+          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, rec.session.messages.length);
+        }
+      },
+    };
+  }
+
+  /**
+   * Launch a detached resume of an agent — live, or evicted and reopened from
+   * its session file — and wire everything a re-running agent needs:
+   * transcript anchoring, activity tracking, join-mode batching, the
+   * widget/fleet refresh, and the `subagents:created` event.
    *
    * Shared by the Agent tool's `resume` + `run_in_background` branch and the
    * `@handle message` prompt mention — they differ only in how they report the
    * outcome. Returns the record, or undefined when the manager refused because
-   * the agent is still running (see AgentManager.resume).
-   *
-   * Callers must have already established that the record has a session.
+   * the agent is still running (see AgentManager.resume). Throws, with the
+   * reason, when the agent cannot be resumed.
    */
   async function startBackgroundResume(
     ctx: ExtensionContext,
-    existing: AgentRecord,
+    id: string,
     prompt: string,
     opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
-    const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
-    // Assigned unconditionally: the completion notification carries this as
-    // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR the
-    // id left by the spawn that created the record. Keeping it would point the
-    // orchestrator's new result at a tool call that was answered runs ago.
-    existing.toolCallId = opts.toolCallId;
-    if (joinMode) existing.joinMode = joinMode;
-    // Reuse the agent's transcript rather than starting a fresh one: the
-    // path is deterministic per agent+session, so writing an initial entry
-    // would truncate the previous run's turns (see ensureOutputFile).
-    if (opts.outputTranscript) {
-      existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
-      ensureOutputFile(existing.outputFile);
-    }
-    // Anchor streaming past the turns already on disk, captured BEFORE the
-    // run starts. The resumed prompt lands as an ordinary user message at
-    // this index, so it is written exactly once.
-    const transcriptAnchor = existing.session?.messages.length ?? 0;
-
+    const known = manager.getRecord(id) ?? manager.findTombstone(id);
     // `opts.maxTurns` is an explicit override; without one the resumed run
     // enforces the limit the agent's first run had.
-    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns ?? existing.maxTurns);
-    // resumeAgent has no onSessionCreated — the session predates this run —
-    // so seed it directly, or the widget shows no context % for the agent.
-    bgState.session = existing.session;
+    const knownMaxTurns = known?.maxTurns === 0 ? undefined : known?.maxTurns;
+    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns ?? knownMaxTurns);
+    const wiring = resumeWiring(ctx, id, { ...opts, joinMode }, bgState);
 
     // No `signal`: a background spawn deliberately omits it, and a detached
     // resume must behave the same. Passing it would abort this agent when
@@ -1377,20 +1395,13 @@ export default function (pi: ExtensionAPI) {
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
       pi,
+      ctx,
+      checkType: reopenTypeProblem,
       maxTurns: opts.maxTurns,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       onTurnEnd: bgCallbacks.onTurnEnd,
-      // Fires when the run actually starts — immediately, or on queue
-      // drain. Wiring it here (rather than after resume() returns) means a
-      // resume stopped while still queued never started streaming, so
-      // there is no subscription left behind for a later run to trip over.
-      onStarted: () => {
-        const rec = manager.getRecord(id);
-        if (rec?.session && rec.outputFile) {
-          rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
-        }
-      },
+      ...wiring,
     });
     if (!record) return undefined;
 
@@ -1416,8 +1427,8 @@ export default function (pi: ExtensionAPI) {
     // the wrong one in cross-extension mirrors keyed by id.
     pi.events.emit("subagents:created", {
       id,
-      type: existing.type,
-      description: existing.description,
+      type: record.type,
+      description: record.description,
       isBackground: true,
     });
 
@@ -1707,7 +1718,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from (the `Agent ID:` of an earlier result). Continues from previous context, with the agent's own model, working directory and worktree. Finished agents stay resumable as long as their saved session exists, also after a restart. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2050,36 +2061,41 @@ Terse command-style prompts produce shallow, generic work.
         // Only an explicit `max_turns` overrides the limit the agent's first
         // run had; the type's config default must not replace it.
         const resumeMaxTurns = params.max_turns != null ? normalizeMaxTurns(params.max_turns) : undefined;
-        const existing = manager.getRecord(params.resume);
-        if (!existing || !isTopLevelAgent(existing)) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+        // An id, or a handle as the user types it. A live record first; then
+        // an evicted top-level agent, reopened from its session file.
+        const live = resolveAgentRef(params.resume);
+        const resolved = live ? undefined : manager.resolveMention(params.resume);
+        const evicted = resolved?.kind === "tombstone" ? resolved.entry : undefined;
+        const target = live && isTopLevelAgent(live) ? live : evicted;
+        if (!target) {
+          return textResult(
+            `Agent not found: "${params.resume}". Agents stay resumable while their session file exists ` +
+            `(subagent sessions are saved unless rememberAgents is off); this one is unknown or was never saved.`,
+          );
         }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
+        const id = target.id;
+        if (live && !live.session) {
+          return textResult(`Agent "${params.resume}" has no session to resume — it never got far enough to start one.`);
         }
+        // A detached resume hands control back while the record stays
+        // "running", so nothing stops the model from resuming the same agent
+        // again mid-run. manager.resume() refuses that; say why here, where the
+        // model can act on it, instead of letting it read as a generic failure.
+        if (live && (live.status === "running" || live.status === "queued")) {
+          return textResult(
+            `Agent "${params.resume}" is still ${live.status} — it can only be resumed once its current run finishes.\n` +
+            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+          );
+        }
+        const resumeTranscript = resumeWritesTranscript(target.type);
 
         // Background resume: detached run that notifies on completion, mirroring
-        // a background spawn. Previously run_in_background was silently ignored
-        // on resume (this branch returned before the background branch below),
-        // so a resumed agent always blocked the main loop until it finished.
+        // a background spawn.
         if (runInBackground) {
-          const id = existing.id;
-          // A detached resume hands control back while the record stays
-          // "running", so nothing stops the model from resuming the same agent
-          // again mid-run. manager.resume() refuses that (it would orphan the
-          // live run's abort controller); say why here, where the model can act
-          // on it, instead of letting it read as a generic failure.
-          if (existing.status === "running" || existing.status === "queued") {
-            return textResult(
-              `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
-            );
-          }
-
           let record: AgentRecord | undefined;
           try {
-            record = await startBackgroundResume(ctx, existing, params.prompt, {
-              outputTranscript,
+            record = await startBackgroundResume(ctx, id, params.prompt, {
+              outputTranscript: resumeTranscript,
               maxTurns: resumeMaxTurns,
               toolCallId,
             });
@@ -2094,7 +2110,7 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(
             `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
             `Agent ID: ${id}\n` +
-            `Type: ${existing.type}\n` +
+            `Type: ${record.type}\n` +
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
             `\nYou will be notified when this agent completes.\n` +
@@ -2103,17 +2119,48 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
+        // Foreground: the same transcript and activity wiring as a background
+        // resume, so the `.output` file and the widget follow this run too.
+        const knownMaxTurns = target.maxTurns === 0 ? undefined : target.maxTurns;
+        const { state: fgResumeState, callbacks: fgResumeCallbacks } = createActivityTracker(resumeMaxTurns ?? knownMaxTurns);
+        const wiring = resumeWiring(ctx, id, { outputTranscript: resumeTranscript }, fgResumeState);
         let record: AgentRecord | undefined;
         try {
-          record = await manager.resume(params.resume, params.prompt, signal, { maxTurns: resumeMaxTurns, pi });
+          record = await manager.resume(id, params.prompt, signal, {
+            maxTurns: resumeMaxTurns,
+            pi,
+            ctx,
+            checkType: reopenTypeProblem,
+            onToolActivity: fgResumeCallbacks.onToolActivity,
+            onAssistantUsage: fgResumeCallbacks.onAssistantUsage,
+            onTurnEnd: fgResumeCallbacks.onTurnEnd,
+            onRecord: (rec) => {
+              wiring.onRecord(rec);
+              agentActivity.set(id, fgResumeState);
+              widget.markRunning(id);
+              widget.ensureTimer();
+              fleet.ensureTimer();
+            },
+            onStarted: wiring.onStarted,
+          });
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err));
+        } finally {
+          agentActivity.delete(id);
+          widget.markFinished(id);
+          fleet.onAgentFinished(id);
         }
         if (!record) {
           return textResult(
             `Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.\n` +
             `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
           );
+        }
+        // A foreground resume flushes its transcript itself: only a background
+        // settle path does that for a live record.
+        if (record.outputCleanup) {
+          try { record.outputCleanup(); } catch { /* ignore */ }
+          record.outputCleanup = undefined;
         }
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
@@ -2124,7 +2171,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
         return textResult(
-          // A resumed run can now hit its turn limit, so say so the way a first
+          // A resumed run can hit its turn limit, so say so the way a first
           // run's headline does rather than presenting partial output as done.
           (getForegroundOutcomeNote(record.status) ? `Agent resumed${getForegroundOutcomeNote(record.status)}.\n\n` : "") +
           (record.result?.trim() || "No output.") +

@@ -578,11 +578,9 @@ export interface RunOptions {
    */
   resumeSessionFile?: string;
   /**
-   * True when another agent spawned this one. Only top-level agents get a
-   * handle, so only they can be reopened by name — which is the whole reason
-   * `rememberAgents` persists a session at all. A nested run's transcript would
-   * be unreachable by anything, so it stays in memory unless its own
-   * frontmatter asks otherwise.
+   * True when another agent spawned this one. Its session is persisted under
+   * `rememberAgents` like a top-level one: the owning parent can resume it by
+   * id long after its record is evicted, which needs the session file.
    */
   nested?: boolean;
   /**
@@ -1012,9 +1010,11 @@ export async function runAgent(
   );
 
   // Omitting this SDK option uses saved settings, not the live parent's effort.
-  // A reopened session keeps its saved effort unless explicitly overridden.
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking
-    ?? (options.resumeSessionFile ? undefined : ctx.thinkingLevel);
+  // A reopened session keeps the level it ran with — saved in its file —
+  // unless explicitly overridden: neither the parent's current level nor the
+  // type's frontmatter (which may have changed since) replaces it.
+  const thinkingLevel = options.thinkingLevel
+    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? ctx.thinkingLevel);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -1138,7 +1138,7 @@ export async function runAgent(
   // Frontmatter wins when it says anything; otherwise the project default,
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
-  const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
+  const persistSession = agentConfig?.persistSession ?? rememberAgents;
   const sessionManager = options.resumeSessionFile
     // Reopening an existing conversation: the file already carries its own
     // header (cwd, parent) and history, so none of the create-time options

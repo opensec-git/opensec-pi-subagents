@@ -1016,7 +1016,12 @@ describe("resuming an evicted agent by name", () => {
     const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
     const record = manager.getRecord(id);
     record.sessionFile = sessionPath();
-    writeFileSync(record.sessionFile, "");
+    // A real session header: an empty or unparseable file is refused before
+    // the reopen is announced (it would silently start a fresh conversation).
+    writeFileSync(record.sessionFile, `${JSON.stringify({
+      type: "session", version: 3, id: "0b9f3c1e-2a4d-4c8e-9f10-1a2b3c4d5e6f",
+      timestamp: new Date(0).toISOString(), cwd: process.cwd(),
+    })}\n`);
     record.completedAt = Date.now() - 11 * 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
     return manager;

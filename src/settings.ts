@@ -149,13 +149,14 @@ export interface SubagentsSettings {
    */
   agentMentions?: AgentMentionMode;
   /**
-   * Whether subagents persist their pi session by default, so `@handle` can
-   * reopen an agent's conversation long after its in-memory record is gone.
-   * Defaults to `true`. Per-agent `persist_session:` frontmatter overrides it
-   * in both directions. Turning it off restores the previous behaviour, where
-   * a handle stops resolving roughly ten minutes after the agent finishes and
-   * mentioning it starts a fresh run instead. Persisted sessions also appear
-   * nested under the spawning session in pi's `/resume`.
+   * Whether subagents persist their pi session by default, so the model
+   * (`Agent({ resume })`) and `@handle` can reopen an agent's conversation long
+   * after its in-memory record is gone, including after a restart. Defaults to
+   * `true`. Per-agent `persist_session:` frontmatter overrides it in both
+   * directions. Turning it off restores the previous behaviour, where an agent
+   * can be resumed only for roughly ten minutes after it finishes and a
+   * mention after that starts a fresh run instead. Persisted sessions also
+   * appear nested under the spawning session in pi's `/resume`.
    */
   rememberAgents?: boolean;
   /**

@@ -287,3 +287,127 @@ describe("resume of a worktree-isolated agent", () => {
   });
 });
 
+describe("resume after the record is evicted", () => {
+  // The manager drops finished records ten minutes after they finish. Only
+  // setInterval is faked — that is the cleanup timer — so the sessions, the
+  // tools and the faux model run on real time.
+  afterEach(() => vi.useRealTimers());
+
+  /** Age a record past the cutoff and let the real cleanup timer evict it. */
+  function evict(id: string) {
+    const registry = (globalThis as Record<symbol, { getRecord(id: string): { completedAt?: number } | undefined }>)[
+      Symbol.for("pi-subagents:manager")
+    ];
+    const record = registry.getRecord(id);
+    if (!record) throw new Error(`no record ${id}`);
+    record.completedAt = Date.now() - 11 * 60_000;
+    vi.advanceTimersByTime(60_000);
+    if (registry.getRecord(id)) throw new Error(`record ${id} was not evicted`);
+  }
+
+  for (const background of [false, true]) {
+    it(`reopens the agent's session file under the same id (${background ? "background" : "foreground"} resume)`, async () => {
+      vi.useFakeTimers({ toFake: ["setInterval"] });
+      const childContexts: string[][] = [];
+      let resumeResult = "";
+      run = await runPrintMode({
+        prompt: "go",
+        live: false,
+        maxModelCalls: 20,
+        respond: (ctx) => {
+          if (isParent(ctx)) {
+            const results = agentResults(ctx);
+            if (results.length === 0) {
+              return agentCall({ description: "fg", prompt: "CODEWORD BANANA. Reply ACK-1.", run_in_background: false });
+            }
+            const id = agentIdIn(textOf(results[0])) as string;
+            if (results.length === 1) {
+              evict(id);
+              return agentCall({ resume: id, prompt: "What was the codeword?", description: "resume", run_in_background: background });
+            }
+            if (results.length === 2) resumeResult = textOf(results[1]);
+            return "Done.";
+          }
+          childContexts.push(ctx.messages.map((m) => `${m.role}:${textOf(m)}`));
+          return childContexts.length === 1 ? "ACK-1" : "BANANA";
+        },
+      });
+
+      expect(resumeResult).not.toMatch(/not found/i);
+      expect(childContexts).toHaveLength(2);
+      expect(childContexts[1]).toEqual([
+        "user:CODEWORD BANANA. Reply ACK-1.",
+        "assistant:ACK-1",
+        "user:What was the codeword?",
+      ]);
+      // Same id: what the model holds keeps working.
+      const firstId = agentIdIn(textOf(agentResults({ messages: run.parentSession.messages } as Context)[0]));
+      expect(resumeResult).toContain(`Agent ID: ${firstId}`);
+      expect(recordOf(run)?.status).toBe("completed");
+    });
+  }
+
+  it("keeps the agent's worktree isolation when reopened", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval"] });
+    const repo = mkdtempSync(join(tmpdir(), "wt-reopen-"));
+    try {
+      const git = (...a: string[]) => execFileSync("git", a, { cwd: repo, stdio: "pipe" }).toString().trim();
+      git("init", "-q");
+      git("config", "user.email", "t@t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "README.md"), "x");
+      git("add", "README.md");
+      git("commit", "-q", "-m", "init");
+
+      let phase: "first" | "resume" = "first";
+      let firstPwd = "";
+      const resumeToolResults: string[] = [];
+      let step = 0;
+      let last = "";
+      run = await runPrintMode({
+        prompt: "go",
+        cwd: repo,
+        live: false,
+        maxModelCalls: 30,
+        respond: (ctx) => {
+          if (isParent(ctx)) {
+            const results = agentResults(ctx);
+            if (results.length === 0) {
+              return agentCall({ description: "wt", prompt: "isolated", isolation: "worktree", run_in_background: false });
+            }
+            const id = agentIdIn(textOf(results[0])) as string;
+            if (results.length === 1) {
+              phase = "resume";
+              evict(id);
+              return agentCall({ resume: id, prompt: "more", description: "resume", run_in_background: false });
+            }
+            last = textOf(results[1]);
+            return "Done.";
+          }
+          const results = ctx.messages.filter((m) => m.role === "toolResult");
+          if (phase === "first") {
+            if (results.length === 0) return fauxToolCall("bash", { command: "pwd" });
+            if (results.length === 1) {
+              firstPwd = textOf(results[0]).trim();
+              return fauxToolCall("write", { path: "first.txt", content: "first\n" });
+            }
+            return "WT-1 done";
+          }
+          step++;
+          if (step > 1) resumeToolResults.push(textOf(results.at(-1) ?? {}));
+          if (step === 1) return fauxToolCall("bash", { command: "pwd" });
+          if (step === 2) return fauxToolCall("write", { path: "resumed.txt", content: "resumed\n" });
+          return "WT-2 done";
+        },
+      });
+
+      expect(resumeToolResults[0]?.trim()).toBe(firstPwd);
+      expect(existsSync(join(repo, "resumed.txt"))).toBe(false);
+      const branch = /Changes saved to branch `([^`]+)`/.exec(last)?.[1] as string;
+      expect(git("ls-tree", "--name-only", branch).split("\n")).toEqual(expect.arrayContaining(["first.txt", "resumed.txt"]));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+

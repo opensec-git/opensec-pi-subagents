@@ -22,7 +22,8 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import { sessionFileProblem } from "./session-file.js";
+import type { AgentInvocation, AgentRecord, AgentResumeState, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, restoreWorktree } from "./worktree.js";
@@ -193,6 +194,21 @@ interface SpawnOptions {
    * `spawnTopLevel` strips it from anything a caller sends.
    */
   reclaim?: { handle: string; alias?: string };
+  /**
+   * Reopen under this id instead of a fresh one, so an evicted agent the model
+   * resumes by id keeps that id. Internal, like `reclaim`: only the manager's
+   * own reopen path sets it, from a tombstone, and only when no live record
+   * holds the id.
+   */
+  reuseId?: string;
+  /**
+   * Restore this worktree (at its path, from its branch) instead of creating a
+   * fresh one — the reopen of an evicted worktree agent. Internal.
+   */
+  restoreWorktree?: {
+    worktree: { path: string; branch: string; baseSha: string; workPath: string };
+    prior?: { hasChanges: boolean; branch?: string; path?: string };
+  };
   model?: Model<any>;
   maxTurns?: number;
   isolated?: boolean;
@@ -329,6 +345,23 @@ interface ResumeOptions {
   /** The extension API for git calls (restoring a worktree). Default: the latest spawn's. */
   pi?: ExtensionAPI;
   /**
+   * The session context to reopen an evicted agent in. Without it, only an
+   * agent still in memory can be resumed.
+   */
+  ctx?: ExtensionContext;
+  /**
+   * Refuse to reopen an evicted agent whose type no longer resolves to itself
+   * (deleted, disabled): its conversation must not continue under another
+   * agent's prompt and tools. Returns the reason, or undefined to allow.
+   */
+  checkType?: (type: SubagentType) => string | undefined;
+  /**
+   * Called synchronously with the record that will run, before its run starts:
+   * the live record, or the one a reopen creates. Where callers attach the
+   * transcript file and per-run fields.
+   */
+  onRecord?: (record: AgentRecord) => void;
+  /**
    * Background resume only: called synchronously when the run actually starts —
    * immediately, or later from drainQueue. Callers wire per-run side effects
    * (output-file streaming) here rather than at the call site, so a resume that
@@ -419,6 +452,40 @@ function settleResumeStatus(
   } else record.status = run.steered ? "steered" : "completed";
 }
 
+function isTopLevelTombstone(entry: AgentResumeState): entry is AgentTombstone {
+  return entry.handle !== undefined && isTopLevelAgent(entry);
+}
+
+/**
+ * Everything needed to reopen a record's conversation and run it as it ran,
+ * or undefined when there is no session file to reopen.
+ */
+export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined {
+  if (!record.sessionFile) return undefined;
+  return {
+    id: record.id,
+    type: record.type,
+    description: record.description,
+    sessionFile: record.sessionFile,
+    completedAt: record.completedAt ?? Date.now(),
+    handle: record.handle,
+    alias: record.alias,
+    parentAgentId: record.parentAgentId,
+    workflowId: record.workflowId,
+    depth: record.depth,
+    maxSubagentDepth: record.maxSubagentDepth,
+    rootSessionId: record.rootSessionId,
+    model: record.invocation?.modelId,
+    cwd: record.cwd,
+    baseCwd: record.baseCwd,
+    isolated: record.isolated,
+    // Absent when no run settled to report one: the type's default applies.
+    maxTurns: "maxTurns" in record ? (record.maxTurns ?? 0) : undefined,
+    worktree: record.worktree ? { ...record.worktree } : undefined,
+    worktreeResult: record.worktreeResult ? { ...record.worktreeResult } : undefined,
+  };
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -446,12 +513,13 @@ export class AgentManager {
   private startups = new Map<string, Promise<void>>();
 
   /**
-   * Evicted agents that can still be reached by name, keyed by handle. Outlives
-   * the 10-minute record cleanup — that timer exists to bound memory, not to
-   * expire a conversation the user might still want — and is cleared alongside
-   * completed records on session start/switch.
+   * Evicted agents that can still be resumed, keyed by id: by the model through
+   * their id and, for top-level agents, by `@handle`. Outlives the 10-minute
+   * record cleanup — that timer exists to bound memory, not to expire a
+   * conversation that may still be continued — and is bounded by
+   * MAX_TOMBSTONES. Rebuilt from the parent session on session start.
    */
-  private tombstones = new Map<string, AgentTombstone>();
+  private tombstones = new Map<string, AgentResumeState>();
 
   /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
@@ -559,7 +627,10 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
-    const id = randomUUID().slice(0, 17);
+    if (options.reuseId !== undefined && this.agents.has(options.reuseId)) {
+      throw new Error(`Agent ${options.reuseId} is already loaded.`);
+    }
+    const id = options.reuseId ?? randomUUID().slice(0, 17);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -602,6 +673,7 @@ export class AgentManager {
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
+      isolated: options.isolated,
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -773,7 +845,31 @@ export class AgentManager {
     // because cross-extension RPC forwards its options unvalidated — a schema
     // that omits the field can't stop a caller that never saw the schema.
     let worktreeCwd: string | undefined;
-    if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
+    // What an earlier run of a reopened agent left on its branch. A resumed
+    // run that changes nothing keeps reporting that, not "no changes".
+    const priorWorktreeResult = options.restoreWorktree?.prior;
+    if (options.restoreWorktree) {
+      if (!isWorktreeIsolationEnabled()) {
+        releaseSlot();
+        throw new Error(`Cannot resume agent ${id}: it ran in a git worktree, and worktree isolation is turned off in this project.`);
+      }
+      const wt = { ...options.restoreWorktree.worktree };
+      const error = await restoreWorktree(pi, baseCwd, wt, priorWorktreeResult);
+      if (error) {
+        releaseSlot();
+        throw new Error(`Cannot resume agent ${id} in its git worktree: ${error}. Nothing was run.`);
+      }
+      record.worktree = wt;
+      record.worktreeResult = priorWorktreeResult;
+      worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
+      this.worktreeRepos.add(baseCwd);
+      if (record.status !== "running") {
+        releaseSlot();
+        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        this.drainQueue();
+        return;
+      }
+    } else if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
       const wt = await createWorktree(pi, baseCwd, id);
       if (!wt) {
         releaseSlot();
@@ -954,11 +1050,11 @@ export class AgentManager {
             } catch { /* ignore — never block cleanup */ }
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
+          record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
           // Appended to the prose only. A structured child's caller parses
           // `structuredJson`, which stays untouched — but `result` is also
           // what a human reads, so the note still belongs on it.
-          const note = worktreeNote(wtResult, baseCwd, customCwd !== undefined);
+          const note = worktreeNote(record.worktreeResult, baseCwd, customCwd !== undefined);
           if (note) record.result = (record.result ?? "") + note;
         }
 
@@ -987,10 +1083,10 @@ export class AgentManager {
         if (record.worktree) {
           try {
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
+            record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
             // A failed run can still have changed files: say where they went,
             // on the error every failure surface shows.
-            const note = worktreeNote(wtResult, baseCwd, customCwd !== undefined);
+            const note = worktreeNote(record.worktreeResult, baseCwd, customCwd !== undefined);
             if (note) record.error = (record.error ?? "") + note;
           } catch { /* ignore cleanup errors */ }
         }
@@ -1175,7 +1271,14 @@ export class AgentManager {
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    // Evicted: reopen its conversation from the session file, as `@handle`
+    // does, so the model can resume an agent for as long as that file exists
+    // — not only in the ten minutes its record stays in memory.
+    if (!record) {
+      const entry = this.tombstones.get(id);
+      return entry ? this.reopen(entry, prompt, signal, options) : undefined;
+    }
+    if (!record.session) return undefined;
     if (isBusy(record)) return undefined;
 
     // `abort()` marks a record "stopped" at once, while its run is still
@@ -1209,6 +1312,7 @@ export class AgentManager {
     }
     // Stopped while it was being prepared.
     if (record.status !== "queued") return record;
+    options?.onRecord?.(record);
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1319,6 +1423,93 @@ export class AgentManager {
     })();
     record.promise = promise;
     await promise;
+    return record;
+  }
+
+  /**
+   * Resume an evicted agent: an ordinary spawn under the same id, reopening
+   * its session file, with what it ran with — its model, working directory,
+   * worktree (restored from its branch), extension isolation and turn limit —
+   * rather than the parent's current settings. The spawn path then gives the
+   * run everything a first run gets: turn limits, worktree cleanup, the
+   * transcript, the completion notification.
+   *
+   * The tombstone stays: a live record holding the same id and names takes
+   * precedence everywhere, and if this run dies before its session exists the
+   * original transcript is still the one to reopen. Its eviction overwrites
+   * the entry in place.
+   */
+  private async reopen(
+    entry: AgentResumeState,
+    prompt: string,
+    signal: AbortSignal | undefined,
+    options: ResumeOptions | undefined,
+  ): Promise<AgentRecord> {
+    const pi = options?.pi ?? this.pi;
+    const ctx = options?.ctx;
+    if (!pi || !ctx) {
+      throw new Error(`Agent ${entry.id} has finished and is no longer in memory, and it cannot be reopened from here.`);
+    }
+    const problem = sessionFileProblem(entry.sessionFile);
+    if (problem) {
+      // Gone for good: a row that can only ever fail is worse than none.
+      if (!existsSync(entry.sessionFile)) this.tombstones.delete(entry.id);
+      throw new Error(`Cannot resume agent ${entry.id}: ${problem}.`);
+    }
+    const typeProblem = options?.checkType?.(entry.type);
+    if (typeProblem) throw new Error(`Cannot resume agent ${entry.id}: ${typeProblem}`);
+
+    // The model the session ran on, when this session can still reach it;
+    // otherwise the type's/parent's, as for a fresh spawn.
+    const slash = entry.model?.indexOf("/") ?? -1;
+    const model = entry.model && slash > 0
+      ? ctx.modelRegistry.find(entry.model.slice(0, slash), entry.model.slice(slash + 1))
+      : undefined;
+    // A parent session in another directory (`/resume` of an older session)
+    // must not move the agent: keep the directory it ran in.
+    const cwd = entry.cwd ?? (entry.baseCwd !== undefined && entry.baseCwd !== ctx.cwd ? entry.baseCwd : undefined);
+
+    const spawnOptions: SpawnOptions = {
+      description: entry.description,
+      reuseId: entry.id,
+      reclaim: entry.handle !== undefined ? { handle: entry.handle, alias: entry.alias } : undefined,
+      resumeSessionFile: entry.sessionFile,
+      model,
+      maxTurns: options?.maxTurns ?? entry.maxTurns,
+      isolated: entry.isolated,
+      cwd,
+      restoreWorktree: entry.worktree ? { worktree: entry.worktree, prior: entry.worktreeResult } : undefined,
+      parentAgentId: entry.parentAgentId,
+      workflowId: entry.workflowId,
+      depth: entry.depth,
+      maxSubagentDepth: entry.maxSubagentDepth,
+      rootSessionId: entry.rootSessionId,
+      invocation: {
+        ...(entry.isolated ? { isolated: true } : {}),
+        ...(entry.worktree ? { isolation: "worktree" as const } : {}),
+      },
+      onToolActivity: options?.onToolActivity,
+      onAssistantUsage: options?.onAssistantUsage,
+      onTurnEnd: options?.onTurnEnd,
+      onCompaction: options?.onCompaction,
+      // The session exists and the prompt is not sent yet — the same moment a
+      // live resume calls it.
+      onSessionCreated: () => { try { options?.onStarted?.(); } catch { /* ignore caller wiring errors */ } },
+      onSpawned: (spawnedId) => {
+        const rec = this.agents.get(spawnedId);
+        if (rec) options?.onRecord?.(rec);
+      },
+    };
+    if (options?.isBackground) {
+      const newId = this.spawn(pi, ctx, entry.type, prompt, { ...spawnOptions, isBackground: true, signal });
+      // A startup failure (the worktree cannot be restored, the directory is
+      // gone) rejects here and drops the record; the tombstone stays.
+      await this.awaitStartup(newId);
+      const rec = this.agents.get(newId);
+      if (!rec) throw new Error(`Agent ${entry.id} could not be reopened.`);
+      return rec;
+    }
+    const { record } = await this.spawnAndWait(pi, ctx, entry.type, prompt, { ...spawnOptions, signal });
     return record;
   }
 
@@ -1509,7 +1700,7 @@ export class AgentManager {
     // resurrectable, so a later Explore must become `explore-2` rather than
     // shadowing a conversation the user can still reach.
     for (const entry of this.tombstones.values()) {
-      taken.add(entry.handle);
+      if (entry.handle) taken.add(entry.handle);
       if (entry.alias) taken.add(entry.alias);
     }
     return taken;
@@ -1538,11 +1729,17 @@ export class AgentManager {
     // Only once nothing live answers: a tombstone is a conversation to reopen,
     // and reopening one while its record still exists would fork the session.
     for (const entry of this.tombstones.values()) {
+      if (!isTopLevelTombstone(entry)) continue;
       if (entry.handle.toLowerCase() === wanted || entry.alias?.toLowerCase() === wanted || entry.id === name) {
         return { kind: "tombstone", entry };
       }
     }
     return undefined;
+  }
+
+  /** The resume state of an evicted agent, by id. */
+  findTombstone(id: string): AgentResumeState | undefined {
+    return this.tombstones.get(id);
   }
 
   /**
@@ -1554,13 +1751,16 @@ export class AgentManager {
    * creates already wins in `resolveMention`, and overwrites the entry in place
    * when it is itself evicted.
    */
-  dropTombstone(handle: string): void {
-    this.tombstones.delete(handle);
+  dropTombstone(idOrHandle: string): void {
+    if (this.tombstones.delete(idOrHandle)) return;
+    for (const [id, entry] of this.tombstones) {
+      if (entry.handle === idOrHandle) this.tombstones.delete(id);
+    }
   }
 
-  /** Evicted agents whose conversation can still be reopened, newest first. */
+  /** Evicted top-level agents whose conversation can still be reopened, newest first. */
   listTombstones(): AgentTombstone[] {
-    return [...this.tombstones.values()].sort((a, b) => b.completedAt - a.completedAt);
+    return [...this.tombstones.values()].filter(isTopLevelTombstone).sort((a, b) => b.completedAt - a.completedAt);
   }
 
   listAgents(): AgentRecord[] {
@@ -1608,27 +1808,37 @@ export class AgentManager {
   }
 
   /**
-   * Preserve enough of a departing record for `@handle` to reopen its
-   * conversation later. Nothing to keep unless it has both a handle to be
-   * addressed by and a session file to reopen — an in-memory session leaves no
-   * transcript, so the mention would have nothing to continue from.
+   * Preserve enough of a departing record to reopen its conversation later.
+   * Nothing to keep without a session file — an in-memory session leaves no
+   * transcript, so a resume would have nothing to continue from.
    */
   private tombstone(record: AgentRecord): void {
-    if (!record.handle || !record.sessionFile) return;
-    this.tombstones.set(record.handle, {
-      handle: record.handle,
-      alias: record.alias,
-      id: record.id,
-      type: record.type,
-      description: record.description,
-      sessionFile: record.sessionFile,
-      completedAt: record.completedAt ?? Date.now(),
-    });
+    const state = resumeStateOf(record);
+    if (state) this.keepTombstone(state);
+  }
+
+  private keepTombstone(state: AgentResumeState): void {
+    this.tombstones.set(state.id, state);
     // Bound the memory a long session can accumulate. Oldest first, since the
     // agent someone still wants to reach is the one they used most recently.
     while (this.tombstones.size > MAX_TOMBSTONES) {
       const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
-      this.tombstones.delete(oldest.handle);
+      this.tombstones.delete(oldest.id);
+    }
+  }
+
+  /**
+   * Make agents of an earlier activation (before a restart, `/resume`,
+   * `/fork` or `/reload`) resumable again, from what was persisted in the
+   * parent session. Later entries for the same id win. A live record keeps
+   * precedence: it is the newer state of the same agent.
+   */
+  restoreTombstones(states: readonly AgentResumeState[]): void {
+    for (const state of states) {
+      if (this.agents.has(state.id)) continue;
+      const current = this.tombstones.get(state.id);
+      if (current && current.completedAt > state.completedAt) continue;
+      this.keepTombstone(state);
     }
   }
 

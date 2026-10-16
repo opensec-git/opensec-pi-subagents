@@ -286,6 +286,37 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  it("resumes an evicted child it owns from its session file, and refuses one it does not", async () => {
+    const tombstones = new Map([
+      ["gone-own", { parentAgentId: "parent-1" }],
+      ["gone-foreign", { parentAgentId: "other" }],
+    ]);
+    (manager as any).findTombstone = (id: string) => tombstones.get(id);
+    vi.mocked(manager.resume).mockResolvedValue({ id: "gone-own", status: "completed", result: "again" } as any);
+    const [agent] = tools();
+
+    const own = await execute(agent, { resume: "gone-own", subagent_type: "scout", description: "r", prompt: "Continue" });
+    expect(own.isError).toBe(false);
+    expect(own.content[0].text).toContain("again");
+    expect(manager.resume).toHaveBeenCalledWith(
+      "gone-own", "Continue", undefined, expect.objectContaining({ ctx: expect.anything(), pi: expect.anything() }),
+    );
+
+    vi.mocked(manager.resume).mockClear();
+    const foreign = await execute(agent, { resume: "gone-foreign", subagent_type: "scout", description: "r", prompt: "Continue" });
+    expect(foreign.isError).toBe(true);
+    expect(manager.resume).not.toHaveBeenCalled();
+  });
+
+  it("reports why a resume was refused", async () => {
+    records.set("child-9", { id: "child-9", status: "completed", parentAgentId: "parent-1" });
+    vi.mocked(manager.resume).mockRejectedValueOnce(new Error("Cannot resume agent child-9: its branch `b` no longer exists."));
+    const [agent] = tools();
+    const result = await execute(agent, { resume: "child-9", subagent_type: "scout", description: "r", prompt: "Continue" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("its branch `b` no longer exists");
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error

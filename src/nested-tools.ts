@@ -89,7 +89,14 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  /** An evicted child, still resumable from its session file. */
+  findTombstone?(id: string): { parentAgentId?: string } | undefined;
+  resume(
+    id: string,
+    prompt: string,
+    signal?: AbortSignal,
+    options?: { pi?: ExtensionAPI; ctx?: ExtensionContext },
+  ): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -184,12 +191,18 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
-        if (!ownsRecord(existing, context.parentAgentId)) {
+        // Evicted after it finished: reopened from its session file, under the
+        // same ownership rule.
+        const evicted = existing ? undefined : context.manager.findTombstone?.(params.resume);
+        const owned = existing
+          ? ownsRecord(existing, context.parentAgentId)
+          : evicted?.parentAgentId === context.parentAgentId;
+        if (!owned) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
         let resumed: AgentRecord | undefined;
         try {
-          resumed = await context.manager.resume(params.resume, params.prompt, signal);
+          resumed = await context.manager.resume(params.resume, params.prompt, signal, { pi: context.pi, ctx });
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err), true);
         }

@@ -380,7 +380,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       }
       let record: AgentRecord | undefined;
       try {
-        record = await manager.resume(id, prompt, deps.signal, { pi });
+        // A child evicted after it finished is reopened from its session file.
+        record = await manager.resume(id, prompt, deps.signal, { pi, ctx });
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
