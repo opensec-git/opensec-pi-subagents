@@ -499,7 +499,8 @@ describe("caps and validation", () => {
     const { host } = stubHost();
     const result = await run('throw new Error("script blew up");', { host });
     expect(result.status).toBe("failed");
-    expect(result.error).toBe("script blew up");
+    // Top-level script errors name the script line.
+    expect(result.error).toMatch(/^script blew up \(at workflow\.js:\d+:\d+\)$/);
   });
 });
 

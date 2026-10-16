@@ -402,12 +402,12 @@ describe("cleanupWorktree — failure path", () => {
     expect(result.branch).toBeUndefined();
   });
 
-  it("swallows a git failure inside a still-present worktree and reports no changes", async () => {
+  it("swallows a git failure inside a still-present worktree and keeps it", async () => {
     // The outer catch. The directory exists — so the existsSync guard above
     // does not fire — but git cannot operate in it, which is what a corrupted
-    // or externally-detached worktree looks like. The agent's work is lost
-    // either way; what matters is that cleanup does not reject out of the
-    // manager's settle path and take the whole record down with it.
+    // or externally-detached worktree looks like. Cleanup must not reject out of
+    // the manager's settle path, and since the state could not be read the
+    // worktree is kept and its path reported rather than removed (0.19.5).
     const wt = (await createWorktree(pi, repoDir, "corrupt"))!;
     writeFileSync(join(wt.path, "work.txt"), "agent output");
     // Break the worktree's link back to the repo.
@@ -415,25 +415,32 @@ describe("cleanupWorktree — failure path", () => {
 
     const result = await cleanupWorktree(pi, repoDir, wt, "corrupted agent");
 
-    expect(result.hasChanges).toBe(false);
+    expect(result.hasChanges).toBe(true);
     expect(result.branch).toBeUndefined();
+    expect(result.path).toBe(wt.path);
+    expect(existsSync(join(wt.path, "work.txt"))).toBe(true);
   });
 
-  it("reports no changes when the preservation commit fails", async () => {
+  it("keeps the worktree when the preservation commit fails", async () => {
     // `git commit` failing resolves with a non-zero code rather than throwing,
     // so the outer catch is only reached if the result is inspected.
     const wt = (await createWorktree(pi, repoDir, "commit-fails"))!;
     writeFileSync(join(wt.path, "work.txt"), "agent output");
 
     const result = await cleanupWorktree(
-      failingPi(args => args[0] === "commit", { code: 1, killed: false }),
+      // Commits now run as `git -c commit.gpgsign=false commit …` and retry with a
+      // fallback identity, so match `commit` anywhere in the argv.
+      failingPi(args => args.includes("commit"), { code: 1, killed: false }),
       repoDir,
       wt,
       "commit fails",
     );
 
-    expect(result.hasChanges).toBe(false);
+    // Kept with its path reported, not force-removed while claiming no changes (0.19.5).
+    expect(result.hasChanges).toBe(true);
     expect(result.branch).toBeUndefined();
+    expect(result.path).toBe(wt.path);
+    expect(existsSync(join(wt.path, "work.txt"))).toBe(true);
   });
 
   it("creates the branch BEFORE removing the worktree, so a removal failure cannot lose commits", async () => {

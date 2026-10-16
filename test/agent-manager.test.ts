@@ -2157,7 +2157,7 @@ describe("AgentManager — background resume", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
   });
 
-  it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {
+  it("foreground resume awaits inline and fires onComplete once", async () => {
     const onComplete = vi.fn();
     manager = new AgentManager(onComplete);
     const id = await spawnSettled(manager);
@@ -2168,8 +2168,11 @@ describe("AgentManager — background resume", () => {
 
     expect(record?.status).toBe("completed");
     expect(record?.result).toBe("inline result");
-    // Foreground resume returns its result inline and never notified (historical).
-    expect(onComplete).not.toHaveBeenCalled();
+    // Foreground resume returns its result inline and fires onComplete for
+    // lifecycle symmetry (events, persisted record); the record is consumed, so
+    // the extension sends no notification for it.
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith(record);
   });
 
   // A detached resume returns while the record is still "running", so nothing

@@ -136,6 +136,8 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
   });
 
   it("interval job: fires repeatedly, runCount grows", async () => {
+    // Stored intervals are raised to the one-minute floor; lower it for this test.
+    scheduler = new SubagentScheduler(50);
     const manager = makeFaithfulManager("completed");
     const pi = makePi();
     scheduler.start(pi, makeCtx(), manager, store);

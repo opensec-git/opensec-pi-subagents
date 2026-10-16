@@ -259,14 +259,14 @@ describe("SubagentScheduler — fire path", () => {
 
   it("interval jobs fire repeatedly via setInterval", () => {
     scheduler.addJob({
-      name: "every-10s", description: "tick", schedule: "10s",
+      name: "every-1m", description: "tick", schedule: "1m",
       subagent_type: "general-purpose", prompt: "tick",
     });
 
     expect(manager.spawn).toHaveBeenCalledTimes(0);
-    vi.advanceTimersByTime(10_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(20_000);
+    vi.advanceTimersByTime(120_000);
     expect(manager.spawn).toHaveBeenCalledTimes(3);
   });
 
@@ -315,11 +315,11 @@ describe("SubagentScheduler — fire path", () => {
 
   it("fire passes bypassQueue: true to manager.spawn", () => {
     scheduler.addJob({
-      name: "every-1s", description: "x", schedule: "1s",
+      name: "every-1m", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.bypassQueue).toBe(true);
@@ -332,12 +332,12 @@ describe("SubagentScheduler — fire path", () => {
     // The model is left out on purpose: agent-manager fills in the effective one
     // once the session reports it.
     scheduler.addJob({
-      name: "every-1s", description: "x", schedule: "1s",
+      name: "every-1m", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
       thinking: "high", max_turns: 12, isolated: true,
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.invocation).toEqual({
       thinking: "high",
@@ -351,21 +351,21 @@ describe("SubagentScheduler — fire path", () => {
   it("fire normalizes an unlimited turn budget out of the snapshot", () => {
     // 0 means unlimited; "max turns: 0" would read as a limit of none.
     scheduler.addJob({
-      name: "unlimited", description: "x", schedule: "1s",
+      name: "unlimited", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x", max_turns: 0,
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn.mock.calls[0][4].invocation.maxTurns).toBeUndefined();
   });
 
   it("disabled jobs do not fire", () => {
     const job = scheduler.addJob({
-      name: "off", description: "x", schedule: "1s",
+      name: "off", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
     });
     scheduler.updateJob(job.id, { enabled: false });
-    vi.advanceTimersByTime(5_000);
+    vi.advanceTimersByTime(300_000);
     expect(manager.spawn).toHaveBeenCalledTimes(0);
   });
 

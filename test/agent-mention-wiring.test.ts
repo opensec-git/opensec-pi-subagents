@@ -408,7 +408,8 @@ describe("resolving which agent a handle means", () => {
     const id = await spawnBackground(tools);
     await flush();
     managerRegistry().getRecord(id).resultConsumed = true;
-    await lifecycle.get("session_before_switch")();
+    // session_before_switch can be canceled; the eviction happens on session_start.
+    await lifecycle.get("session_start")({}, ctx());
     expect(managerRegistry().getRecord(id)).toBeUndefined();
 
     vi.mocked(resumeAgent).mockClear();

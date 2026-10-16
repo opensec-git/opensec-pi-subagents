@@ -213,7 +213,9 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     // Foreground results count as consumed the moment they're returned inline,
     // so clearCompleted(true)'s #108 preservation deliberately does not cover
     // them. This is the ONLY path that makes a foreground id stop resolving.
-    await lifecycle.get("session_before_switch")?.();
+    // session_before_switch can be canceled, so the eviction happens on the new
+    // session's session_start.
+    await lifecycle.get("session_start")?.({}, ctx());
 
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(read)).toContain("Agent not found");
