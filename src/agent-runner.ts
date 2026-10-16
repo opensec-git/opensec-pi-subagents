@@ -829,6 +829,9 @@ export async function runAgent(
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
+  // Project and local memory live in the real project, not in a worktree copy:
+  // the copy is deleted when the agent finishes, and its memory with it.
+  const memoryCwd = options.configCwd ?? options.worktreeBase ?? configCwd;
   if (agentConfig?.memory) {
     const existingNames = new Set(toolNames);
     const denied = agentConfig.disallowedTools ? new Set(agentConfig.disallowedTools) : undefined;
@@ -839,12 +842,12 @@ export async function runAgent(
       // Read-write memory: add any missing memory tool names (read/write/edit)
       const extraNames = getMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
+      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, memoryCwd);
     } else {
       // Read-only memory: only add read tool name, use read-only prompt
       const extraNames = getReadOnlyMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
+      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, memoryCwd);
     }
   }
 

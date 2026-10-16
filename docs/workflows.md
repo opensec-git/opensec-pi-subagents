@@ -244,7 +244,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `model` | string | `provider/modelId`, or fuzzy like `haiku` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
-| `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
+| `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error. With `isolation: "worktree"` it runs in the agent's worktree after its changes are committed, and what the command itself changes is discarded |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 

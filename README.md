@@ -138,7 +138,16 @@ Subagents follow Pi's project trust decision for the parent session.
 
 - Schedules: interval schedules must be at least `1m` (stored shorter intervals are raised to one minute); intervals and
   relative delays are capped at `3650d`.
-- Worktree isolation is optional and commits an isolated agent's changes to its branch on completion.
+- Worktree isolation is optional and commits an isolated agent's changes to its branch on completion. The worktree is
+  removed afterwards unless that would delete work a branch cannot carry: files git ignores that the agent created
+  (dependency, cache and build directories such as `node_modules`, `dist`, `build` and `coverage` do not count), or git
+  repositories it created or changed inside the worktree. Then the worktree is kept and the result names its path and
+  the reason; remove it with `git worktree remove --force <path>` when you are done. Stash entries made while the
+  agent ran are reported too, since they are not on the branch.
+- A workflow `gate` on an isolated agent runs after the agent's changes are committed; whatever the gate changes
+  (snapshots, coverage, build output) is discarded and never reaches the branch.
+- A worktree agent's `memory: project` and `memory: local` directories are in the real project, not the copy, so
+  they outlast the worktree.
 - Review `/agents → Settings` before enabling delegation or isolation for write-capable agents.
 
 ## Security

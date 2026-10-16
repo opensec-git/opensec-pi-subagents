@@ -260,8 +260,9 @@ interface SpawnOptions {
    */
   cwd?: string;
   /**
-   * Last chance to look at an isolated agent's worktree, awaited immediately
-   * before it is committed to a branch and removed.
+   * Last chance to look at an isolated agent's worktree, awaited after the
+   * agent's changes are committed and before the worktree is removed. Whatever
+   * it changes in the tree is discarded, so it never reaches the branch.
    *
    * Exists because that removal happens inside the settle path, before
    * `spawnAndWait` resolves: by the time a caller has the finished record, the
@@ -409,20 +410,25 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
  * its state could not be read). Empty when the worktree held nothing.
  */
 function worktreeNote(
-  wtResult: { hasChanges: boolean; branch?: string; path?: string },
+  wtResult: { hasChanges: boolean; branch?: string; path?: string; kept?: boolean; notes?: string[] },
   baseCwd: string,
   customCwd: boolean,
 ): string {
+  const lines: string[] = [];
   if (wtResult.hasChanges && wtResult.branch) {
     // With a caller-supplied cwd the branch lives in THAT repo, not the
     // parent session's — say so, or the orchestrator merges in the wrong repo.
     const repoNote = customCwd ? ` in \`${baseCwd}\`` : "";
-    return `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd ? ` (run in \`${baseCwd}\`)` : ""}`;
+    lines.push(`Changes saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd ? ` (run in \`${baseCwd}\`)` : ""}`);
   }
-  if (wtResult.hasChanges && wtResult.path) {
-    return `\n\n---\nChanges could not be saved to a branch; the worktree was kept at \`${wtResult.path}\`.`;
+  // `kept` comes with its reasons in `notes`: the branch alone would lose them.
+  if (wtResult.hasChanges && wtResult.path && (wtResult.kept || !wtResult.branch)) {
+    lines.push(wtResult.kept
+      ? `The worktree was kept at \`${wtResult.path}\` because removing it would delete work:`
+      : `Changes could not be saved to a branch; the worktree was kept at \`${wtResult.path}\`.`);
   }
-  return "";
+  for (const note of wtResult.notes ?? []) lines.push(`- ${note}`);
+  return lines.length > 0 ? `\n\n---\n${lines.join("\n")}` : "";
 }
 
 /**
@@ -1061,15 +1067,10 @@ export class AgentManager {
 
         // Clean up worktree if used
         if (record.worktree) {
-          // The one moment the child's tree still exists and the child is done
-          // writing to it. try/catch, not decoration: a hook that throws must
-          // not leave the worktree behind.
-          if (options.onBeforeWorktreeCleanup) {
-            try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
-            } catch { /* ignore — never block cleanup */ }
-          }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+          // The hook runs inside cleanup: after the child's changes are
+          // committed and while its tree still exists; what it changes is
+          // discarded, so a gate's output never lands on the branch.
+          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, options.onBeforeWorktreeCleanup);
           record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
           // Appended to the prose only. A structured child's caller parses
           // `structuredJson`, which stays untouched — but `result` is also

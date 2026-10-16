@@ -968,42 +968,21 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     vi.mocked(cleanupWorktree).mockImplementation(async () => ({ hasChanges: false }));
   });
 
-  it("fires with the worktree path, before the worktree is cleaned up", async () => {
-    const { order } = await trace();
+  it("hands the hook to cleanup, which runs it while the worktree still exists", async () => {
+    const { cleanupWorktree } = await trace();
     resolvedRun();
-    const seen: string[] = [];
-
-    manager = new AgentManager();
-    await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
-      description: "test",
-      isolation: "worktree",
-      onBeforeWorktreeCleanup: async (path) => {
-        order.push("hook");
-        seen.push(path);
-      },
-    });
-
-    expect(seen).toEqual(["/wt/copy"]);
-    // Order is the whole point: after cleanup the path is a branch, not a tree.
-    expect(order).toEqual(["hook", "cleanup"]);
-  });
-
-  it("cleans up anyway when the hook throws", async () => {
-    const { order } = await trace();
-    resolvedRun();
+    const hook = async () => {};
 
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
       description: "test",
       isolation: "worktree",
-      onBeforeWorktreeCleanup: async () => {
-        order.push("hook");
-        throw new Error("gate blew up");
-      },
+      onBeforeWorktreeCleanup: hook,
     });
 
-    // A hook that fails must not leak a worktree, and must not fail the agent.
-    expect(order).toEqual(["hook", "cleanup"]);
+    // Cleanup runs it after committing the child's work and before removing
+    // the tree (see worktree.test.ts); here only the hand-off is the manager's.
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, mockCtx.cwd, expect.objectContaining({ path: "/wt/copy" }), "test", hook);
     expect(record.status).toBe("completed");
   });
 
@@ -1186,7 +1165,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
       mockCtx, "general-purpose", "test",
       expect.objectContaining({ cwd: "/wt/copy/packages/api", configCwd: "/tmp", worktreeBase: "/" }),
     );
-    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/", expect.anything(), "test");
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/", expect.anything(), "test", undefined);
   });
 
   it("plain worktree (no cwd) keeps the historical root working dir even when workPath differs", async () => {

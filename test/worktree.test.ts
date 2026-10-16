@@ -506,3 +506,125 @@ describe("worktree isolation switch", () => {
     }
   });
 });
+
+// Cleanup decides "changed" from git's view of the tree, and `remove --force`
+// deletes everything git does not track. Work outside that view — ignored
+// output, a repository the agent cloned, a stash — must be kept or reported,
+// never deleted under a "no changes" or "saved to branch" result.
+describe("cleanupWorktree — work a branch cannot carry", () => {
+  let repoDir: string;
+  let pi: ExtensionAPI;
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+  beforeEach(() => {
+    repoDir = initGitRepo();
+    pi = mockPi();
+    writeFileSync(join(repoDir, ".gitignore"), "out/\n*.log\nnode_modules/\n");
+    git(repoDir, "add", ".gitignore");
+    git(repoDir, "commit", "-qm", "ignore rules");
+  });
+  afterEach(async () => {
+    try { await pruneWorktrees(pi, repoDir); } catch { /* ignore */ }
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("keeps a worktree whose only output is ignored files, and says so", async () => {
+    const wt = (await createWorktree(pi, repoDir, "ign-only"))!;
+    mkdirSync(join(wt.path, "out"));
+    writeFileSync(join(wt.path, "out", "report.md"), "important\n");
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "report");
+
+    expect(result).toMatchObject({ hasChanges: true, kept: true, path: wt.path });
+    expect(result.branch).toBeUndefined();
+    expect(result.notes?.join("\n")).toMatch(/ignores.*out\//);
+    expect(existsSync(join(wt.path, "out", "report.md"))).toBe(true);
+    rmSync(wt.path, { recursive: true, force: true });
+  });
+
+  it("saves tracked changes to a branch and keeps the worktree for the ignored ones", async () => {
+    const wt = (await createWorktree(pi, repoDir, "ign-mixed"))!;
+    writeFileSync(join(wt.path, "README.md"), "changed\n");
+    writeFileSync(join(wt.path, "run.log"), "log\n");
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "mixed");
+
+    expect(result).toMatchObject({ hasChanges: true, kept: true, branch: "pi-agent-ign-mixed" });
+    expect(git(repoDir, "show", "pi-agent-ign-mixed:README.md")).toBe("changed");
+    expect(existsSync(join(wt.path, "run.log"))).toBe(true);
+    rmSync(wt.path, { recursive: true, force: true });
+  });
+
+  it("does not keep a worktree for regenerable ignored output", async () => {
+    const wt = (await createWorktree(pi, repoDir, "ign-deps"))!;
+    mkdirSync(join(wt.path, "node_modules", "left-pad"), { recursive: true });
+    writeFileSync(join(wt.path, "node_modules", "left-pad", "index.js"), "x\n");
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "deps");
+
+    expect(result.hasChanges).toBe(false);
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
+  it("keeps a worktree holding a git repository the branch only points to", async () => {
+    const wt = (await createWorktree(pi, repoDir, "nested"))!;
+    const nested = join(wt.path, "vendor", "lib");
+    mkdirSync(nested, { recursive: true });
+    git(nested, "init", "-q");
+    git(nested, "config", "user.email", "t@t");
+    git(nested, "config", "user.name", "t");
+    writeFileSync(join(nested, "lib.c"), "int x;\n");
+    git(nested, "add", "-A");
+    git(nested, "commit", "-qm", "lib");
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "nested");
+
+    expect(result).toMatchObject({ hasChanges: true, kept: true, branch: "pi-agent-nested" });
+    expect(result.notes?.join("\n")).toMatch(/git repositories.*vendor\/lib/);
+    expect(existsSync(join(nested, "lib.c"))).toBe(true);
+    rmSync(wt.path, { recursive: true, force: true });
+  });
+
+  it("reports a stash made during the run instead of a silent 'no changes'", async () => {
+    const wt = (await createWorktree(pi, repoDir, "stash"))!;
+    writeFileSync(join(wt.path, "README.md"), "stashed edit\n");
+    git(wt.path, "stash", "-q");
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "stash");
+
+    expect(result.hasChanges).toBe(false);
+    expect(result.notes?.join("\n")).toMatch(/1 new stash entry/);
+    git(repoDir, "stash", "drop", "-q");
+  });
+
+  it("runs the hook after committing, and keeps what it changes off the branch", async () => {
+    const wt = (await createWorktree(pi, repoDir, "gate"))!;
+    writeFileSync(join(wt.path, "README.md"), "agent edit\n");
+    let statusDuringHook: string | undefined;
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "gated", async (path) => {
+      statusDuringHook = git(path, "status", "--porcelain");
+      writeFileSync(join(path, "README.md"), "gate rewrote this\n");
+      writeFileSync(join(path, "snapshot.txt"), "gate output\n");
+    });
+
+    // Committed before the gate ran, so the gate saw a clean, committed tree.
+    expect(statusDuringHook).toBe("");
+    expect(result.branch).toBe("pi-agent-gate");
+    expect(git(repoDir, "show", "pi-agent-gate:README.md")).toBe("agent edit");
+    expect(git(repoDir, "ls-tree", "--name-only", "pi-agent-gate")).not.toContain("snapshot.txt");
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
+  it("still cleans up when the hook throws", async () => {
+    const wt = (await createWorktree(pi, repoDir, "gate-throws"))!;
+
+    const result = await cleanupWorktree(pi, repoDir, wt, "throws", async () => {
+      throw new Error("gate blew up");
+    });
+
+    expect(result.hasChanges).toBe(false);
+    expect(existsSync(wt.path)).toBe(false);
+  });
+});

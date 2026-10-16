@@ -276,6 +276,21 @@ describe("agent-runner final output capture", () => {
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
   });
 
+  it("resolves project memory against the real project, not the worktree copy", async () => {
+    const { getAgentConfig } = await import("../src/agent-types.js");
+    const { buildReadOnlyMemoryBlock } = await import("../src/memory.js");
+    const base = vi.mocked(getAgentConfig).getMockImplementation()!("Explore")!;
+    vi.mocked(getAgentConfig).mockImplementation(() => ({ ...base, memory: "project" }));
+    const { session } = createSession("MEMORY");
+    createAgentSession.mockResolvedValue({ session });
+    try {
+      await runAgent(ctx, "Explore", "Say MEMORY", { pi, cwd: "/wt/copy", worktreeBase: "/repo" });
+      expect(vi.mocked(buildReadOnlyMemoryBlock).mock.lastCall?.[2]).toBe("/repo");
+    } finally {
+      vi.mocked(getAgentConfig).mockImplementation(() => base);
+    }
+  });
+
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {
     const { buildAgentPrompt } = await import("../src/prompts.js");
     const { session } = createSession("ISOLATED");
