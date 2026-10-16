@@ -24,6 +24,7 @@ function makeMockManager() {
     spawn: spawnFn,
     awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(() => ({ promise: Promise.resolve("done") })),
+    isRunActive: vi.fn(() => false),
   } as any;
 }
 
@@ -174,15 +175,34 @@ describe("SubagentScheduler — lifecycle", () => {
   });
 
   // Once a fire happens and `lastRun` is set, getNextRun should pivot to it.
-  it("getNextRun uses lastRun when present for interval jobs", () => {
+  it("getNextRun reports the armed timer for interval jobs, not lastRun + interval", () => {
     const job = scheduler.addJob({
       name: "ran-once", description: "x", schedule: "1h",
       subagent_type: "general-purpose", prompt: "p",
     });
+    // lastRun is when the previous run COMPLETED; the timer was re-armed when
+    // it FIRED. Basing the next run on lastRun skewed it by the run's length.
     const lastRun = new Date(Date.now() - 30 * 60_000).toISOString(); // 30m ago
-    scheduler.updateJob(job.id, { lastRun });
-    const next = scheduler.getNextRun(job.id);
-    expect(next).toBe(new Date(new Date(lastRun).getTime() + 3_600_000).toISOString());
+    const armedAt = Date.now();
+    scheduler.updateJob(job.id, { lastRun }); // re-arms the timer now
+    const next = new Date(scheduler.getNextRun(job.id)!).getTime();
+    expect(next).toBeGreaterThanOrEqual(armedAt + 3_600_000);
+    expect(next).toBeLessThan(armedAt + 3_600_000 + 1_000);
+  });
+
+  it("getNextRun advances by the interval from each fire, whatever the run's length", () => {
+    vi.useFakeTimers();
+    try {
+      const job = scheduler.addJob({
+        name: "skew", description: "x", schedule: "1h",
+        subagent_type: "general-purpose", prompt: "p",
+      });
+      const firstFire = Date.now() + 3_600_000;
+      vi.advanceTimersByTime(3_600_000);
+      expect(scheduler.getNextRun(job.id)).toBe(new Date(firstFire + 3_600_000).toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects past one-shot timestamps upfront — no record created", () => {
@@ -259,14 +279,14 @@ describe("SubagentScheduler — fire path", () => {
 
   it("interval jobs fire repeatedly via setInterval", () => {
     scheduler.addJob({
-      name: "every-10s", description: "tick", schedule: "10s",
+      name: "every-1m", description: "tick", schedule: "1m",
       subagent_type: "general-purpose", prompt: "tick",
     });
 
     expect(manager.spawn).toHaveBeenCalledTimes(0);
-    vi.advanceTimersByTime(10_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(20_000);
+    vi.advanceTimersByTime(120_000);
     expect(manager.spawn).toHaveBeenCalledTimes(3);
   });
 
@@ -315,11 +335,11 @@ describe("SubagentScheduler — fire path", () => {
 
   it("fire passes bypassQueue: true to manager.spawn", () => {
     scheduler.addJob({
-      name: "every-1s", description: "x", schedule: "1s",
+      name: "every-1m", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn).toHaveBeenCalledTimes(1);
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.bypassQueue).toBe(true);
@@ -332,12 +352,12 @@ describe("SubagentScheduler — fire path", () => {
     // The model is left out on purpose: agent-manager fills in the effective one
     // once the session reports it.
     scheduler.addJob({
-      name: "every-1s", description: "x", schedule: "1s",
+      name: "every-1m", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
       thinking: "high", max_turns: 12, isolated: true,
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.invocation).toEqual({
       thinking: "high",
@@ -351,21 +371,21 @@ describe("SubagentScheduler — fire path", () => {
   it("fire normalizes an unlimited turn budget out of the snapshot", () => {
     // 0 means unlimited; "max turns: 0" would read as a limit of none.
     scheduler.addJob({
-      name: "unlimited", description: "x", schedule: "1s",
+      name: "unlimited", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x", max_turns: 0,
     });
 
-    vi.advanceTimersByTime(1_000);
+    vi.advanceTimersByTime(60_000);
     expect(manager.spawn.mock.calls[0][4].invocation.maxTurns).toBeUndefined();
   });
 
   it("disabled jobs do not fire", () => {
     const job = scheduler.addJob({
-      name: "off", description: "x", schedule: "1s",
+      name: "off", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
     });
     scheduler.updateJob(job.id, { enabled: false });
-    vi.advanceTimersByTime(5_000);
+    vi.advanceTimersByTime(300_000);
     expect(manager.spawn).toHaveBeenCalledTimes(0);
   });
 

@@ -21,9 +21,21 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { type LongTimer, setLongTimeout } from "./long-timer.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
+
+/**
+ * Shortest interval a job may repeat at. Every fire spawns an agent outside the
+ * concurrency queue, so a seconds-scale interval would flood the session.
+ */
+export const MIN_INTERVAL_MS = 60_000;
+
+/** Longest interval or relative delay accepted ("3650d", about ten years). */
+export const MAX_SCHEDULE_MS = 3650 * 86_400_000;
+
+const UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
 
 /** Event emitted on `pi.events` for cross-extension consumers. */
 export type ScheduleChangeEvent =
@@ -31,6 +43,7 @@ export type ScheduleChangeEvent =
   | { type: "removed"; jobId: string }
   | { type: "updated"; job: ScheduledSubagent }
   | { type: "fired"; jobId: string; agentId: string; name: string }
+  | { type: "skipped"; jobId: string; agentId: string; reason: string }
   | { type: "error"; jobId: string; error: string };
 
 /** Params accepted at job creation — ID, timestamps, and state are derived. */
@@ -49,7 +62,18 @@ export interface NewJobInput {
 
 export class SubagentScheduler {
   private jobs = new Map<string, Cron>();
-  private intervals = new Map<string, NodeJS.Timeout>();
+  private intervals = new Map<string, LongTimer>();
+  /** Agent spawned by each job's latest fire, for the overlap guard. */
+  private lastAgent = new Map<string, string>();
+  /**
+   * When each armed interval or one-shot timer fires next (epoch ms). The
+   * interval timer is re-armed from the FIRE time, so the next run is that,
+   * not the previous run's completion plus the interval.
+   */
+  private nextFire = new Map<string, number>();
+
+  /** `minIntervalMs` lowers the interval floor for stored jobs (tests only). */
+  constructor(private readonly minIntervalMs = MIN_INTERVAL_MS) {}
   private store: ScheduleStore | undefined;
   private pi: ExtensionAPI | undefined;
   private ctx: ExtensionContext | undefined;
@@ -71,8 +95,9 @@ export class SubagentScheduler {
   stop(): void {
     for (const cron of this.jobs.values()) cron.stop();
     this.jobs.clear();
-    for (const t of this.intervals.values()) clearTimeout(t);
+    for (const t of this.intervals.values()) t.cancel();
     this.intervals.clear();
+    this.nextFire.clear();
     this.store = undefined;
     this.pi = undefined;
     this.ctx = undefined;
@@ -131,6 +156,7 @@ export class SubagentScheduler {
     const store = this.requireStore();
     if (!store.get(id)) return false;
     this.unscheduleJob(id);
+    this.lastAgent.delete(id);
     const ok = store.remove(id);
     if (ok) this.emit({ type: "removed", jobId: id });
     return ok;
@@ -155,9 +181,10 @@ export class SubagentScheduler {
     if (!job?.enabled) return undefined;
     if (job.scheduleType === "once") return job.schedule;
     if (job.scheduleType === "interval" && job.intervalMs) {
-      // Before the first fire there's no `lastRun`, so fall back to "now" —
-      // accurate at create time (setInterval was just armed) and within
-      // intervalMs of correct in any pre-first-fire view.
+      // The armed timer's own target when there is one. Otherwise (not armed
+      // in this process) an estimate from the last run.
+      const armed = this.nextFire.get(jobId);
+      if (armed !== undefined) return new Date(armed).toISOString();
       const base = job.lastRun ? new Date(job.lastRun).getTime() : Date.now();
       return new Date(base + job.intervalMs).toISOString();
     }
@@ -171,18 +198,27 @@ export class SubagentScheduler {
     if (!store) return;
     try {
       if (job.scheduleType === "interval" && job.intervalMs) {
-        const t = setInterval(() => this.executeJob(job.id), job.intervalMs);
-        this.intervals.set(job.id, t);
+        // Chained long timers, not setInterval: a delay above 2^31-1 ms is
+        // clamped to 1 ms, which turned "30d" into a fire every millisecond.
+        // The floor also covers jobs stored before the minimum existed.
+        const every = Math.min(Math.max(job.intervalMs, this.minIntervalMs), MAX_SCHEDULE_MS);
+        const arm = () => {
+          this.nextFire.set(job.id, Date.now() + every);
+          this.intervals.set(job.id, setLongTimeout(() => {
+            arm();
+            void this.executeJob(job.id);
+          }, every));
+        };
+        arm();
       } else if (job.scheduleType === "once") {
         const target = new Date(job.schedule).getTime();
         const delay = target - Date.now();
         if (delay > 0) {
-          const t = setTimeout(() => {
-            this.executeJob(job.id);
-            // Auto-disable one-shots after they fire (mirrors pi-cron-schedule)
-            store.update(job.id, { enabled: false });
-            const updated = store.get(job.id);
-            if (updated) this.emit({ type: "updated", job: updated });
+          this.nextFire.set(job.id, target);
+          const t = setLongTimeout(() => {
+            this.intervals.delete(job.id);
+            this.nextFire.delete(job.id);
+            this.fireOnce(job.id, store);
           }, delay);
           this.intervals.set(job.id, t);
         } else {
@@ -191,7 +227,10 @@ export class SubagentScheduler {
           this.emit({ type: "error", jobId: job.id, error: `Scheduled time ${job.schedule} is in the past` });
         }
       } else {
-        const cron = new Cron(job.schedule, () => this.executeJob(job.id));
+        // `catch: true` as a backstop: executeJob never rejects, but croner
+        // runs the callback in an async trigger that would otherwise turn a
+        // throw into an unhandled rejection — which ends pi.
+        const cron = new Cron(job.schedule, { catch: true }, () => { void this.executeJob(job.id); });
         this.jobs.set(job.id, cron);
       }
     } catch (err) {
@@ -207,27 +246,66 @@ export class SubagentScheduler {
     }
     const t = this.intervals.get(id);
     if (t) {
-      clearTimeout(t);
-      clearInterval(t);
+      t.cancel();
       this.intervals.delete(id);
     }
+    this.nextFire.delete(id);
+  }
+
+  /** Fire a one-shot, then disable it (mirrors pi-cron-schedule). Never throws. */
+  private fireOnce(id: string, store: ScheduleStore): void {
+    void this.executeJob(id);
+    // Queued behind the fire's own writes by the store, so it lands last.
+    store.updateAsync(id, { enabled: false }).then(
+      () => {
+        const updated = store.get(id);
+        if (updated) this.emit({ type: "updated", job: updated });
+      },
+      (err) => this.emit({ type: "error", jobId: id, error: err instanceof Error ? err.message : String(err) }),
+    );
   }
 
   /**
    * Fire a job: persist running state, spawn (bypassing the concurrency
-   * queue), persist completion. Fire-and-forget: the timer tick returns
-   * immediately so other jobs keep firing.
+   * queue), persist completion. Called detached from a timer or Cron tick, so
+   * it never rejects: a failure (a busy store lock, a full disk) becomes an
+   * `error` event, never an exception out of a timer callback — pi exits on
+   * those.
    */
-  private executeJob(id: string): void {
+  private async executeJob(id: string): Promise<void> {
+    try {
+      await this.fireJob(id);
+    } catch (err) {
+      this.emit({ type: "error", jobId: id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  /**
+   * The fire itself. Synchronous up to the spawn — `updateAsync` applies at
+   * once when the lock is free, so the order of writes and events is what it
+   * always was — and returns the bookkeeping that may still be waiting on a
+   * lock another process holds.
+   */
+  private fireJob(id: string): Promise<void> {
     const store = this.store;
     const pi = this.pi;
     const ctx = this.ctx;
     const manager = this.manager;
-    if (!store || !pi || !ctx || !manager) return;
+    if (!store || !pi || !ctx || !manager) return Promise.resolve();
     const job = store.get(id);
-    if (!job?.enabled) return;
+    if (!job?.enabled) return Promise.resolve();
 
-    store.update(id, { lastStatus: "running" });
+    // Overlap guard: fires bypass the concurrency queue, so a run that outlasts
+    // its interval would otherwise stack another agent on top of it every tick.
+    // A stopped run still winding down counts as active: "stopped" is set
+    // before the run has ended.
+    const previous = this.lastAgent.get(id);
+    if (previous && manager.isRunActive(previous)) {
+      this.emit({ type: "skipped", jobId: id, agentId: previous, reason: "the previous run is still active" });
+      return Promise.resolve();
+    }
+
+    const marked = store.updateAsync(id, { lastStatus: "running" });
 
     // Resolve model at fire time — registry contents may have changed since the
     // job was created (auth added/removed). Fall back silently to spawn-default
@@ -274,17 +352,19 @@ export class SubagentScheduler {
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      // Ordered after `marked` by the store.
+      const recorded = store.updateAsync(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
       this.emit({ type: "error", jobId: id, error });
-      return;
+      return Promise.all([marked, recorded]).then(() => {});
     }
 
+    this.lastAgent.set(id, agentId);
     this.emit({ type: "fired", jobId: id, agentId, name: job.name });
 
-    const finalize = (status: "success" | "error") => {
+    const finalize = async (status: "success" | "error") => {
       const next = this.getNextRun(id);
       const current = store.get(id);
-      store.update(id, {
+      await store.updateAsync(id, {
         lastRun: new Date().toISOString(),
         lastStatus: status,
         runCount: (current?.runCount ?? 0) + 1,
@@ -296,19 +376,30 @@ export class SubagentScheduler {
     // can't infer success/failure from the promise — read record.status instead.
     // Terminal states: completed/steered = success; error/aborted/stopped = error.
     // awaitStartup first: with isolation: "worktree" the run promise only exists
-    // once the repo copy is made, and a failed copy rejects here.
-    manager.awaitStartup(agentId)
-      .then(() => manager.getRecord(agentId)?.promise)
-      .then(() => {
+    // once the repo copy is made, and a failed copy rejects here. Detached, so a
+    // long run does not hold this fire; its own failure becomes an event.
+    void (async () => {
+      let failed = true;
+      try {
+        await marked.catch(() => {});
+        await manager.awaitStartup(agentId);
+        await manager.getRecord(agentId)?.promise;
         const r = manager.getRecord(agentId);
-        const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
-        finalize(failed ? "error" : "success");
-      })
-      .catch(() => finalize("error"));
+        failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
+      } catch { /* a failed startup is a failed run */ }
+      try {
+        await finalize(failed ? "error" : "success");
+      } catch (err) {
+        this.emit({ type: "error", jobId: id, error: err instanceof Error ? err.message : String(err) });
+      }
+    })();
+    return marked.then(() => {});
   }
 
   private emit(event: ScheduleChangeEvent): void {
-    if (this.pi) this.pi.events.emit("subagents:scheduled", event);
+    // Guarded: emit runs from timer callbacks, where a throw (a stale pi after
+    // a session switch) would be an uncaught exception.
+    try { this.pi?.events.emit("subagents:scheduled", event); } catch { /* ignore */ }
   }
 
   private requireStore(): ScheduleStore {
@@ -330,7 +421,12 @@ export class SubagentScheduler {
     if (rel !== null) return { type: "once", normalized: rel };
     // "5m" — interval
     const ivl = SubagentScheduler.parseInterval(trimmed);
-    if (ivl !== null) return { type: "interval", intervalMs: ivl, normalized: trimmed };
+    if (ivl !== null) {
+      if (ivl < MIN_INTERVAL_MS) {
+        throw new Error(`Interval "${trimmed}" is too short: jobs can repeat at most once a minute ("1m").`);
+      }
+      return { type: "interval", intervalMs: ivl, normalized: trimmed };
+    }
     // ISO timestamp — one-shot. Reject past timestamps upfront so we never
     // create a dead-on-arrival record (scheduleJob's safety net still catches
     // micro-races from `+0s`-style relatives).
@@ -361,26 +457,36 @@ export class SubagentScheduler {
       };
     }
     try {
-      // Croner validates by construction.
-      new Cron(expr, () => {});
+      // Croner validates by construction. Parse only: passing a callback (as
+      // this once did) also SCHEDULES the job — croner arms a non-unref'd
+      // timer that re-arms itself forever and is never stopped, so every
+      // validation leaked a live timer that kept the process alive.
+      new Cron(expr);
       return { valid: true };
     } catch (e) {
       return { valid: false, error: e instanceof Error ? e.message : "Invalid cron expression" };
     }
   }
 
-  /** "+10s"/"+5m"/"+1h"/"+2d" → ISO timestamp. */
+  /** "+10s"/"+5m"/"+1h"/"+2d" → ISO timestamp. Throws past MAX_SCHEDULE_MS. */
   static parseRelativeTime(s: string): string | null {
     const m = s.match(/^\+(\d+)(s|m|h|d)$/);
     if (!m) return null;
-    const ms = parseInt(m[1], 10) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
+    const ms = SubagentScheduler.boundedMs(s, Number(m[1]) * UNIT_MS[m[2] as keyof typeof UNIT_MS]);
     return new Date(Date.now() + ms).toISOString();
   }
 
-  /** "10s"/"5m"/"1h"/"2d" → milliseconds. */
+  /** "10s"/"5m"/"1h"/"2d" → milliseconds. Throws past MAX_SCHEDULE_MS. */
   static parseInterval(s: string): number | null {
     const m = s.match(/^(\d+)(s|m|h|d)$/);
     if (!m) return null;
-    return parseInt(m[1], 10) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
+    return SubagentScheduler.boundedMs(s, Number(m[1]) * UNIT_MS[m[2] as keyof typeof UNIT_MS]);
+  }
+
+  private static boundedMs(input: string, ms: number): number {
+    if (!Number.isSafeInteger(ms) || ms > MAX_SCHEDULE_MS) {
+      throw new Error(`Schedule "${input}" is too far out: the limit is 3650d.`);
+    }
+    return ms;
   }
 }

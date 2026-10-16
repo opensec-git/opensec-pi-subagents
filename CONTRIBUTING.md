@@ -1,4 +1,4 @@
-# Contributing to @tintinweb/pi-subagents
+# Contributing to @kushalkhemka/opensec-pi-subagents
 
 This guide exists to save both sides time.
 
@@ -68,5 +68,5 @@ Other guidelines:
 
 ## Questions?
 
-Open an [issue](https://github.com/tintinweb/pi-subagents/issues) — questions and
+Open an [issue](https://github.com/opensec-git/opensec-pi-subagents/issues) — questions and
 discussion are welcome.

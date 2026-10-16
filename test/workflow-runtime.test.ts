@@ -499,7 +499,8 @@ describe("caps and validation", () => {
     const { host } = stubHost();
     const result = await run('throw new Error("script blew up");', { host });
     expect(result.status).toBe("failed");
-    expect(result.error).toBe("script blew up");
+    // Top-level script errors name the script line.
+    expect(result.error).toMatch(/^script blew up \(at workflow\.js:\d+:\d+\)$/);
   });
 });
 
@@ -565,6 +566,26 @@ describe("abort", () => {
       expect(corrected?.modelId).toBe("anthropic/claude-haiku-4-5");
       // The settle path spreads the same object, so it carries them too.
       expect(rows.at(-1)?.model).toBe("haiku 4.5");
+    });
+
+    it("puts an isolated child's branch and kept worktree on its finished row", async () => {
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          return request.index === 0
+            ? { ok: true, text: "{}", branch: "pi-agent-a" }
+            : { ok: false, error: "failed", branch: "pi-agent-b", worktreePath: "/wt/b" };
+        },
+        abortAgent() {},
+      };
+
+      await run('await agent("one", { isolation: "worktree" }); return await agent("two", { isolation: "worktree" });', {
+        host,
+        onProgress(e) { seen.push([...e]); },
+      });
+
+      expect(rowsFor(seen, 0).at(-1)).toMatchObject({ state: "done", branch: "pi-agent-a" });
+      expect(rowsFor(seen, 1).at(-1)).toMatchObject({ state: "error", branch: "pi-agent-b", worktreePath: "/wt/b" });
     });
 
     it("fills in a row for an agent that named no model at all", async () => {

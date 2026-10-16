@@ -89,12 +89,13 @@ describe("agent type registry", () => {
       expect(config.skills).toBe(true);
     });
 
-    it("Explore has read-only tools", () => {
-      const config = getConfig("Explore");
-      expect(config.builtinToolNames).toEqual(["read", "bash", "grep", "find", "ls"]);
-      expect(config.builtinToolNames).not.toContain("edit");
-      expect(config.builtinToolNames).not.toContain("write");
-    });
+    for (const type of ["Explore", "Plan"]) {
+      it(`${type} is read-only by its tools: no write, edit or bash, and no extension tools`, () => {
+        const config = getConfig(type);
+        expect(config.builtinToolNames).toEqual(["read", "grep", "find", "ls"]);
+        expect(config.extensions).toBe(false);
+      });
+    }
 
     it("Explore inherits the parent model and thinking level by default", () => {
       const cfg = getAgentConfig("Explore");

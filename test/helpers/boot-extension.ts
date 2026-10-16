@@ -11,6 +11,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
 export interface BootedPi {
@@ -115,6 +116,12 @@ export interface Hermetic {
 export function hermeticDir(opts: {
   settings?: Record<string, unknown>;
   agentFiles?: Record<string, string>;
+  /**
+   * Record the project as trusted in the hermetic agent dir's trust store, as
+   * `/trust` would. Needed for code the project ships itself (saved workflows,
+   * agent extension paths), which a folder Pi trusted without asking may not run.
+   */
+  trusted?: boolean;
 } = {}): Hermetic {
   const dir = mkdtempSync(join(tmpdir(), "pi-boot-"));
   const agentDir = mkdtempSync(join(tmpdir(), "pi-boot-agentdir-"));
@@ -132,6 +139,8 @@ export function hermeticDir(opts: {
       writeFileSync(join(dir, ".pi", "agents", `${name}.md`), content);
     }
   }
+
+  if (opts.trusted) new ProjectTrustStore(agentDir).set(dir, true);
 
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.HOME = agentDir;

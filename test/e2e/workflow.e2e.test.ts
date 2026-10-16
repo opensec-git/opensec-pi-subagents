@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { getAgentDir, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
@@ -183,6 +184,8 @@ describe("Workflow end to end", () => {
     const run = await runPrintMode({
       prompt: "run the saved workflow",
       cwd,
+      // Saved project workflows run only in a project trusted to run its code.
+      beforeRun: () => new ProjectTrustStore(getAgentDir()).set(cwd, true),
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {

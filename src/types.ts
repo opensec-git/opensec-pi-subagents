@@ -31,6 +31,16 @@ export type MemoryScope = "user" | "project" | "local";
 export type IsolationMode = "worktree" | "off";
 
 /** Unified agent configuration — used for both default and user-defined agents. */
+/** Where an isolated agent's work went (see `WorktreeCleanupResult` in worktree.ts). */
+export interface WorktreeOutcome {
+  hasChanges: boolean;
+  branch?: string;
+  path?: string;
+  /** The worktree was left on disk, for the reasons in `notes`. */
+  kept?: boolean;
+  notes?: string[];
+}
+
 export interface AgentConfig {
   name: string;
   /** UI name. `display_name` wins; Claude Code's `name` is accepted as a fallback. */
@@ -130,19 +140,51 @@ export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
 export type AgentMentionMode = 'model' | 'direct' | 'off';
 
 /**
- * What survives a record's eviction so `@handle` keeps working. The live record
- * is discarded after ~10 minutes, but the pi session it wrote is still on disk,
- * and this is the little that is needed to find and describe it again.
+ * What survives a record's eviction so the agent can be resumed: by the model
+ * (`Agent({ resume: id })`, nested `Agent`, workflow `agent({ resume })`) and,
+ * for top-level agents, by `@handle`. The live record (and its in-memory
+ * session) is discarded ~10 minutes after it finishes, to bound memory; the pi
+ * session it wrote is still on disk, and this is what is needed to reopen it
+ * and run it as it ran before: its own model, working directory, worktree,
+ * extension isolation and turn limit — not the parent's current ones.
+ *
+ * Top-level agents also write it into the parent session (`subagents:record`
+ * entries), so it is rebuilt after a restart, `/resume`, `/fork` or `/reload`.
  */
-export interface AgentTombstone {
-  handle: string;
-  alias?: string;
+export interface AgentResumeState {
   id: string;
   type: SubagentType;
   description: string;
-  /** Always set — a record with no session file is never tombstoned. */
+  /** The agent's pi session file. A record without one is never kept. */
   sessionFile: string;
   completedAt: number;
+  /** Top-level agents only. */
+  handle?: string;
+  alias?: string;
+  /** Owner, for nested children: only that parent may resume it. */
+  parentAgentId?: string;
+  /** Owning workflow run, for a workflow's children. */
+  workflowId?: string;
+  depth?: number;
+  maxSubagentDepth?: number;
+  rootSessionId?: string;
+  /** `provider/id` of the model the agent's session ran on. */
+  model?: string;
+  /** Caller-supplied working directory, if any. */
+  cwd?: string;
+  /** The directory it ran from; for a worktree agent, the repo. */
+  baseCwd?: string;
+  /** Ran without extensions. */
+  isolated?: boolean;
+  /** Turn limit of its runs; 0 = unlimited. Absent = the type's default. */
+  maxTurns?: number;
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; stashTop?: string };
+  worktreeResult?: WorktreeOutcome;
+}
+
+/** A top-level agent's resume state: the one `@handle` can address. */
+export interface AgentTombstone extends AgentResumeState {
+  handle: string;
 }
 
 /**
@@ -202,10 +244,19 @@ export interface AgentRecord {
   resultConsumed?: boolean;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
+  /** Ran without extensions (`isolated`), so a reopened session does too. */
+  isolated?: boolean;
+  /** Caller-supplied working directory (`SpawnOptions.cwd`), if any. */
+  cwd?: string;
+  /**
+   * The directory the agent was started from: `cwd`, else the parent session's.
+   * For a worktree agent, the repo its worktree and branch belong to.
+   */
+  baseCwd?: string;
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; stashTop?: string };
   /** Worktree cleanup result after agent completion. */
-  worktreeResult?: { hasChanges: boolean; branch?: string };
+  worktreeResult?: WorktreeOutcome;
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
@@ -240,6 +291,11 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+  /**
+   * The turn limit the first run enforced (undefined = unlimited). A resumed
+   * run gets the same limit, counted afresh, unless its caller passes one.
+   */
+  maxTurns?: number;
   /** Nesting depth: top-level subagent = 1. */
   depth?: number;
   /**

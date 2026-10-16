@@ -3,12 +3,10 @@
  * growing size.
  *
  * The highest-value benchmark in the repo: this is the only frame-rate path
- * whose cost is unbounded in the data it renders. `buildContentLines()` rebuilds
- * the *entire* transcript on every render — "rebuild every render (live data, no
- * cache needed)", conversation-viewer.ts — and the viewer subscribes to the
- * session, so a running agent redraws it on every token (coalesced by pi at
- * ~62 Hz). Everything above the viewport is built and thrown away, and
- * `handleInput` builds it a second time on every scroll key just to count lines.
+ * whose cost is unbounded in the data it renders. The viewer keeps the built
+ * transcript between frames and rebuilds only messages that changed, so a warm
+ * frame here measures validation plus the viewport; a first frame, or a width
+ * or mode change, still builds every line.
  *
  * Both markdown modes are measured. `assistant` is the default and sends
  * assistant text through pi's Markdown parser; `off` is the raw wrap path. The

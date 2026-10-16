@@ -119,16 +119,23 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     // changed, a delegating session would look like it was filling its context
     // with work that happened somewhere else entirely — and users would compact
     // for no reason.
+    //
+    // Pi 1.0 estimates the context from the text of messages after the last
+    // assistant turn, so the tool result's own text counts. Compare against the
+    // same result without `usage`: the reported tokens must add nothing.
+    const plain = await realSession();
     const session = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
+      plain.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
+      const expected = plain.getSessionStats().contextUsage?.percent ?? null;
 
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
       session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(expected);
     } finally {
+      plain.dispose?.();
       session.dispose?.();
     }
   });

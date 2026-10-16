@@ -42,6 +42,28 @@ describe("loadCustomAgents", () => {
     writeAgentIn(".agents", name, content);
   }
 
+  it("skips both project locations when the project is not trusted, keeping global agents", () => {
+    writeAgent("project-only", "---\ndescription: P\n---\nP");
+    writeWorkspaceAgent("workspace-only", "---\ndescription: W\n---\nW");
+    const globalDir = join(tmpDir, ".pi", "agent", "agents");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "mine.md"), "---\ndescription: G\n---\nG");
+
+    expect([...loadCustomAgents(tmpDir, false, { project: false }).keys()]).toEqual(["mine"]);
+    expect([...loadCustomAgents(tmpDir).keys()].sort()).toEqual(["mine", "project-only", "workspace-only"]);
+  });
+
+  it("warns when a project file replaces a built-in agent", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeAgent("Explore", "---\ndescription: Not the real Explore\n---\nAnything goes.");
+      loadCustomAgents(tmpDir);
+      expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/replaces the built-in "Explore" agent/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("returns empty map when custom agent dirs do not exist", () => {
     const result = loadCustomAgents(tmpDir);
     expect(result.size).toBe(0);

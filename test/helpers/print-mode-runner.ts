@@ -53,6 +53,9 @@ import {
   fauxAssistantMessage,
   fauxText,
   fauxToolCall,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  type Message,
   type Model,
   type ToolCall,
 } from "@earendil-works/pi-ai";
@@ -147,6 +150,13 @@ export interface RunPrintModeOptions {
    * which is worse than not running them: it hides a real regression in noise.
    */
   live?: { provider: string; model: string } | false;
+  /**
+   * The parent session's project trust, as Pi would have decided it. Set, the
+   * parent's loader and session share one settings manager carrying it, so
+   * `ctx.isProjectTrusted()` answers this. Omitted keeps the old setup, where
+   * the loader builds its own (trusted) manager.
+   */
+  projectTrusted?: boolean;
 }
 
 export interface PrintModeRun {
@@ -221,6 +231,23 @@ export function routeBySession(routes: {
         : "Done.";
     }
     return resolveReply(routes.parentInitial, context);
+  };
+}
+
+/**
+ * Pi 1.0 hands providers a transcript whose system prompt and tool set live in
+ * `system` messages (`toolsAdded`/`toolsRemoved`), not in `Context.systemPrompt`
+ * / `Context.tools`. Responders are written against the classic shape, so fold
+ * the transcript back into it: current prompt and tools, non-system messages.
+ * A context that already carries `tools` (pre-1.0 Pi) passes through.
+ */
+export function legacyContext(context: Context): Context {
+  if (context.tools || !context.messages.some((m) => m.role === "system")) return context;
+  const messages = context.messages as Message[];
+  return {
+    systemPrompt: getCurrentSystemPrompt(messages),
+    tools: getCurrentTools(messages),
+    messages: messages.filter((m) => m.role !== "system"),
   };
 }
 
@@ -329,7 +356,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
       }
       const max = options.maxModelCalls ?? 16;
       const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(context, state));
+        toAssistantMessage(await respond(legacyContext(context), state));
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }
@@ -337,9 +364,17 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   // --- build the parent host session with the extension loaded ---
   // Resolved after globals are isolated, so it honors the hermetic dir.
   const agentDir = getAgentDir();
+  // Live: real settings so an omitted model resolves to your local default
+  // (settingsManager.getDefaultModel) and retries/compaction match your config.
+  // Faux: in-memory, deterministic, no disk.
+  const trust = options.projectTrusted === undefined ? undefined : { projectTrusted: options.projectTrusted };
+  const settingsManager = live
+    ? SettingsManager.create(cwd, agentDir, trust)
+    : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }, trust);
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
+    ...(trust ? { settingsManager } : {}),
     additionalExtensionPaths: [EXTENSION_PATH],
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
@@ -362,12 +397,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(cwd),
-    // Live: real settings so an omitted model resolves to your local default
-    // (settingsManager.getDefaultModel) and retries/compaction match your config.
-    // Faux: in-memory, deterministic, no disk.
-    settingsManager: live
-      ? SettingsManager.create(cwd, agentDir)
-      : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+    settingsManager,
   });
   session.setSessionName("print-mode-host");
 

@@ -72,6 +72,7 @@ import {
 import { runInChildSessionContext } from "./child-context.js";
 import { agentMentionReminder } from "./mention.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { LifetimeUsage } from "./usage.js";
 
 export interface MentionCloneOptions {
   /** The MAIN session's context — what the spawn is attributed to, and the
@@ -83,6 +84,10 @@ export interface MentionCloneOptions {
   message: string;
   /** The registered `Agent` tool, reused so the spawn is an ordinary one. */
   agentTool: ToolDefinition;
+  /** Aborts the clone's turn — the session it belongs to is going away. */
+  signal?: AbortSignal;
+  /** Called with each of the clone's assistant messages' usage: a real turn on the main model. */
+  onUsage?: (usage: LifetimeUsage) => void;
 }
 
 export interface MentionCloneResult {
@@ -98,7 +103,8 @@ export interface MentionCloneResult {
  * back to starting the agent directly.
  */
 export async function runMentionClone(opts: MentionCloneOptions): Promise<MentionCloneResult> {
-  const { ctx, type, message, agentTool } = opts;
+  const { ctx, type, message, agentTool, signal: stop, onUsage } = opts;
+  if (stop?.aborted) return { spawned: false, error: "the session ended before the clone started" };
 
   let spawned = false;
   const cloneAgentTool: ToolDefinition = {
@@ -125,12 +131,16 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        // Pi 1.0 types tool contexts as ExtensionToolContext (adds `tools` /
+        // `executeTool`); the Agent tool reads only ExtensionContext fields.
+        ctx as Parameters<typeof agentTool.execute>[4],
       );
     },
   };
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  const onStop = () => { void session?.abort().catch(() => {}); };
+  stop?.addEventListener("abort", onStop, { once: true });
   try {
     // Pi 0.80.8 moved createAgentSession from modelRegistry to modelRuntime;
     // agent-runner.ts carries the same shim for the same reason — pass both so
@@ -151,7 +161,17 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         cwd: ctx.cwd,
         // Nothing about the copy is worth persisting, and an in-memory manager
         // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        //
+        // Pi 1.0 made the session manager the canonical transcript: the agent's
+        // messages are re-projected from it at every turn boundary, so messages
+        // pushed onto agent state alone vanish once the clone's prompt commits.
+        // There the conversation travels as entries instead — `inMemory` takes
+        // preloaded entries from Pi 1.0 on, and older Pi ignores the argument.
+        sessionManager: (SessionManager.inMemory as (cwd: string, options?: unknown, entries?: unknown[]) => SessionManager)(
+          ctx.cwd,
+          undefined,
+          (ctx.sessionManager as { getBranch?: () => unknown[] }).getBranch?.() ?? [],
+        ),
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
         modelRegistry: ctx.modelRegistry,
@@ -175,11 +195,32 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // real thing, so the copy reasons under the instructions the user's model
     // is actually working under.
     const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
+    if (systemPrompt) useSystemPrompt(session, systemPrompt);
 
     // The conversation itself. Pushed rather than assigned so the array the
     // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
+    // Already there when the session was restored from the preloaded entries
+    // (Pi 1.0); pushing them again would duplicate the conversation.
+    const restored = session.agent.state.messages.some((m: { role: string }) => m.role !== "system");
+    if (!restored) session.agent.state.messages.push(...conversation.messages);
+
+    if (onUsage) {
+      session.subscribe((event) => {
+        if (event.type !== "message_end" || event.message.role !== "assistant") return;
+        const u = (event.message as { usage?: { input?: number; output?: number; cacheWrite?: number; cacheRead?: number; cost?: { total?: number } } }).usage;
+        if (!u) return;
+        try {
+          onUsage({
+            input: u.input ?? 0,
+            output: u.output ?? 0,
+            cacheWrite: u.cacheWrite ?? 0,
+            cacheRead: u.cacheRead ?? 0,
+            cost: u.cost?.total ?? 0,
+          });
+        } catch { /* accounting must not fail the clone */ }
+      });
+    }
+    if (stop?.aborted) return { spawned, error: "the session ended before the clone ran" };
 
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.
@@ -187,10 +228,66 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   } catch (err) {
     return { spawned, error: err instanceof Error ? err.message : String(err) };
   } finally {
+    stop?.removeEventListener("abort", onStop);
     session?.dispose?.();
   }
 
   return spawned
     ? { spawned: true }
     : { spawned: false, error: "the conversation clone did not start it" };
+}
+
+type CloneSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
+
+/** Find a property's descriptor on an object or its prototype chain. */
+function findDescriptor(target: object, key: string): PropertyDescriptor | undefined {
+  for (let o: object | null = target; o; o = Object.getPrototypeOf(o)) {
+    const d = Object.getOwnPropertyDescriptor(o, key);
+    if (d) return d;
+  }
+  return undefined;
+}
+
+/**
+ * Make the clone's requests carry `systemPrompt` verbatim.
+ *
+ * Before Pi 1.0 `agent.state.systemPrompt` was a plain field and assigning it
+ * was enough. From Pi 1.0 it is a getter replayed from the transcript's
+ * `role: "system"` messages, and assigning it throws in strict mode — which
+ * failed every clone, so every mention fell back to a direct start. Pi 1.0's
+ * own way to force a prompt (`before_agent_start` returning `systemPrompt`)
+ * projects it onto each request instead of recording it: the system messages
+ * collapse into one head holding the forced text and the tools declared so
+ * far. The clone does the same through the agent's `transformContext`, so the
+ * copied conversation's own system messages (Pi 1.0 records them as entries)
+ * cannot reintroduce the parent's sections either.
+ */
+function useSystemPrompt(session: CloneSession, systemPrompt: string): void {
+  const state = session.agent.state as unknown as Record<string, unknown>;
+  const descriptor = findDescriptor(state, "systemPrompt");
+  if (!descriptor || descriptor.writable || descriptor.set) {
+    state.systemPrompt = systemPrompt;
+    return;
+  }
+  type Transform = (messages: any[], signal?: AbortSignal) => Promise<any[]>;
+  const agent = session.agent as unknown as { transformContext?: Transform };
+  const previous = agent.transformContext;
+  agent.transformContext = async (messages, signal) => {
+    const transformed = previous ? await previous(messages, signal) : messages;
+    const tools = new Map<string, unknown>();
+    let timestamp: number | undefined;
+    for (const message of transformed) {
+      if (message?.role !== "system") continue;
+      timestamp ??= message.timestamp;
+      for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+      for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    }
+    const head = {
+      role: "system",
+      content: systemPrompt,
+      ...(tools.size > 0 ? { toolsAdded: [...tools.values()] } : {}),
+      timestamp: timestamp ?? Date.now(),
+    };
+    return [head, ...transformed.filter((message) => message?.role !== "system")];
+  };
 }

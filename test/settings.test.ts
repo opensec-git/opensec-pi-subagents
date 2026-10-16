@@ -50,6 +50,13 @@ describe("settings persistence", () => {
     writeFileSync(projectFile(), JSON.stringify(obj));
   }
 
+  it("ignores the project file when the project is not trusted", () => {
+    writeGlobal({ maxConcurrent: 16 });
+    writeProject({ maxConcurrent: 2, worktreeIsolation: false });
+    expect(loadSettings(projectDir, false)).toEqual({ maxConcurrent: 16 });
+    expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 2, worktreeIsolation: false });
+  });
+
   it("returns {} when both files are missing", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });

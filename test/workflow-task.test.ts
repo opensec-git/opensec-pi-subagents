@@ -15,6 +15,7 @@ import {
   completeWorkflowTask,
   createWorkflowTask,
   failWorkflowTask,
+  formatWorkflowNotification,
   pauseWorkflowTask,
   resumeWorkflowTask,
   type WorkflowTask,
@@ -128,5 +129,21 @@ describe("settling a run", () => {
 
     expect(task.control).toBeUndefined();
     expect(task.status).toBe("failed");
+  });
+});
+
+describe("the completion notification", () => {
+  it("lists isolated children's branches and kept worktrees, whatever the script returned", () => {
+    const task = createWorkflowTask({ id: "wf_abc123", script: "", startTime: 1_000 });
+    task.workflowProgress.push(
+      { type: "workflow_agent", index: 0, label: "fix", state: "done", branch: "pi-agent-a" },
+      { type: "workflow_agent", index: 1, label: "port", state: "error", branch: "pi-agent-b", worktreePath: "/wt/b" },
+      { type: "workflow_agent", index: 2, label: "read", state: "done" },
+    );
+    completeWorkflowTask(task, { status: "completed", value: { ok: true }, meta: { name: "w", description: "d" }, agentCount: 3, replayedCount: 0 } as never);
+
+    const text = formatWorkflowNotification(task, 2_000);
+    expect(text).toContain("<worktrees>\nfix: branch pi-agent-a\nport: branch pi-agent-b worktree kept at /wt/b\n</worktrees>");
+    expect(text).not.toContain("read:");
   });
 });

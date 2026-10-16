@@ -17,6 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
@@ -70,7 +71,8 @@ function stubManager(
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
+  const getRecord = vi.fn(() => undefined);
+  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
@@ -122,6 +124,37 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.description).toBe("review:bugs");
   });
 
+  it("reports an isolated child's branch beside a schema'd answer, which stays parseable JSON", async () => {
+    const stub = stubManager(() => record({
+      structuredJson: '{"files":["a.ts"]}',
+      result: "prose\n\n---\nChanges saved to branch `pi-agent-x`.",
+      worktreeResult: { hasChanges: true, branch: "pi-agent-x", path: "/wt/copy" },
+    }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+
+    expect(result).toMatchObject({ ok: true, text: '{"files":["a.ts"]}', branch: "pi-agent-x" });
+    expect(result.worktreePath).toBeUndefined();
+  });
+
+  it("names the branch and a kept worktree on a failed or stopped child's error", async () => {
+    const worktreeResult = { hasChanges: true, branch: "pi-agent-y", path: "/wt/kept", kept: true };
+    const failedHost = createWorkflowHost({
+      pi: {} as any, ctx: ctx(), manager: stubManager(() => record({ status: "error", error: "provider died", worktreeResult })).manager,
+    });
+    const failed = await failedHost.spawnAgent(request({ isolation: "worktree" }));
+    expect(failed).toMatchObject({ ok: false, branch: "pi-agent-y", worktreePath: "/wt/kept" });
+    expect(failed.error).toMatch(/provider died[\s\S]*pi-agent-y[\s\S]*\/wt\/kept/);
+
+    const stoppedHost = createWorkflowHost({
+      pi: {} as any, ctx: ctx(), manager: stubManager(() => record({ status: "stopped", worktreeResult })).manager,
+    });
+    const stopped = await stoppedHost.spawnAgent(request({ isolation: "worktree" }));
+    expect(stopped).toMatchObject({ ok: false, skipped: true, branch: "pi-agent-y" });
+    expect(stopped.error).toContain("pi-agent-y");
+  });
+
   it("passes isolation and the run's abort signal down to the spawn", async () => {
     const stub = stubManager();
     const controller = new AbortController();
@@ -137,7 +170,11 @@ describe("createWorkflowHost — spawn mapping", () => {
 
     const options = stub.spawnAndWait.mock.calls[0][4];
     expect(options.isolation).toBe("worktree");
-    expect(options.signal).toBe(controller.signal);
+    // Composed with a per-child stop (for a skip during worktree creation), so
+    // not the same object — but it follows the run's signal.
+    expect(options.signal.aborted).toBe(false);
+    controller.abort();
+    expect(options.signal.aborted).toBe(true);
     expect(options.rootSessionId).toBe("root-1");
   });
 
@@ -538,7 +575,7 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined, expect.objectContaining({ pi: expect.anything() }));
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
   });
 
@@ -635,14 +672,55 @@ const fileScript = 'export const meta = { name: "from-file", description: "file 
 /** Plain theme, so a rendered component can be asserted as text. */
 const plainTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
+describe("SubagentWorkflow tool — saved project workflows need a trusted project", () => {
+  let hermetic: Hermetic;
+  let tools: Map<string, any>;
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+  });
+
+  function boot(opts: { trusted?: boolean; untrustedSession?: boolean }) {
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: opts.trusted });
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+    const booted = makePi();
+    subagentsExtension(booted.pi);
+    tools = booted.tools;
+    return ctx({ cwd: hermetic.dir, ...(opts.untrustedSession ? { isProjectTrusted: () => false } : {}) });
+  }
+
+  it("does not run a project workflow in a folder Pi trusted without a decision", async () => {
+    const sessionCtx = boot({});
+    const result = await tools.get("SubagentWorkflow").execute("tc-u1", { name: "nightly" }, undefined, undefined, sessionCtx);
+    const text = textOf(result);
+    expect(text).toMatch(/was not run/);
+    expect(text).not.toMatch(/started/);
+  });
+
+  it("does not run a project workflow when the session does not trust the project", async () => {
+    const sessionCtx = boot({ trusted: true, untrustedSession: true });
+    const result = await tools.get("SubagentWorkflow").execute("tc-u2", { name: "nightly" }, undefined, undefined, sessionCtx);
+    expect(textOf(result)).toMatch(/was not run/);
+  });
+
+  it("runs it once the project is recorded as trusted", async () => {
+    const sessionCtx = boot({ trusted: true });
+    const result = await tools.get("SubagentWorkflow").execute("tc-u3", { name: "nightly" }, undefined, undefined, sessionCtx);
+    expect(textOf(result)).toMatch(/Workflow "from-file" started/);
+  });
+});
+
 describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   let hermetic: Hermetic;
   let booted: ReturnType<typeof makePi>;
   let tools: Map<string, any>;
 
   beforeEach(() => {
-    // Hermetic dir first — settings and agent files are read at boot.
-    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
+    // Hermetic dir first — settings and agent files are read at boot. Trusted:
+    // the saved workflows these tests run live in the project.
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: true });
     booted = makePi();
     subagentsExtension(booted.pi);
     tools = booted.tools;
@@ -990,10 +1068,18 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
-
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    const terminate = vi.spyOn(Worker.prototype, "terminate");
+    try {
+      await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
+      await vi.waitFor(() => expect(terminate).toHaveBeenCalled(), { timeout: 10_000 });
+      await new Promise(r => setTimeout(r, 300)); // past the notification hold
+      // No notification into the torn-down session: its `pi` is stale, and in
+      // pi a call on it throws.
+      const taskId = startedTaskId(result);
+      expect(booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(taskId))).toBe(false);
+    } finally {
+      terminate.mockRestore();
+    }
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

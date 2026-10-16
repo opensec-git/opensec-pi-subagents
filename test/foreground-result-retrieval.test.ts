@@ -154,15 +154,16 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("never hands the model an agent id — the id lives only in renderer details", async () => {
+  it("hands the model the agent id so it can resume the agent", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const { res, id } = await runForegroundSteeredAgent(tools);
 
-    // `content` is the only thing serialized to the API. If the id isn't here,
-    // the model cannot have obtained it — any id it passes is invented.
-    expect(textOf(res)).not.toContain(id);
-    expect(textOf(res)).not.toMatch(/Agent ID:/);
+    // `content` is the only thing serialized to the API. Without the id there,
+    // a foreground agent could never be resumed, and the tool description
+    // tells the model it can be — so it would invent one.
+    expect(textOf(res)).toContain(`Agent ID: ${id}`);
+    expect(textOf(res)).toContain("resume");
 
     // An invented id is correctly rejected — this is the reporter's error,
     // reproduced WITHOUT any record having been cleaned up.
@@ -213,7 +214,9 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     // Foreground results count as consumed the moment they're returned inline,
     // so clearCompleted(true)'s #108 preservation deliberately does not cover
     // them. This is the ONLY path that makes a foreground id stop resolving.
-    await lifecycle.get("session_before_switch")?.();
+    // session_before_switch can be canceled, so the eviction happens on the new
+    // session's session_start.
+    await lifecycle.get("session_start")?.({}, ctx());
 
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(read)).toContain("Agent not found");

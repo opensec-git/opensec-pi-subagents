@@ -82,6 +82,40 @@ interface ScanResult {
    * needs no globals — so the impure-literal check below cannot catch it.
    */
   sawInterpolation: boolean;
+  /**
+   * The first token outside a string or comment that a pure literal can never
+   * contain (a call, an arrow, a function or class, a tagged template), or
+   * undefined. Rejected before anything is evaluated: see {@link extractMeta}.
+   */
+  impure?: string;
+}
+
+/**
+ * Words that introduce code rather than data. Allowed only as property keys
+ * (`{ async: true }`), which is where the scanner exempts them.
+ */
+const IMPURE_WORDS = new Set(["function", "class", "async", "await", "new", "yield", "import", "get", "set"]);
+
+/** Index of the next non-whitespace, non-comment char at or after `i`, or -1. */
+function nextSignificant(source: string, i: number): number {
+  let j = i;
+  while (j < source.length) {
+    if (/\s/.test(source[j])) { j++; continue; }
+    if (source[j] === "/" && source[j + 1] === "/") {
+      const nl = source.indexOf("\n", j);
+      if (nl === -1) return -1;
+      j = nl + 1;
+      continue;
+    }
+    if (source[j] === "/" && source[j + 1] === "*") {
+      const close = source.indexOf("*/", j + 2);
+      if (close === -1) return -1;
+      j = close + 2;
+      continue;
+    }
+    return j;
+  }
+  return -1;
 }
 
 /**
@@ -94,6 +128,7 @@ function scanObjectLiteral(source: string, open: number): ScanResult {
   let depth = 0;
   let i = open;
   let sawInterpolation = false;
+  let impure: string | undefined;
   // What we are currently inside of. "code" means brace counting is live.
   let mode: "code" | "line-comment" | "block-comment" | "single" | "double" | "template" | "regex" = "code";
   // Template literals nest: `${ {a:1} }` re-enters code, and the closing brace
@@ -145,7 +180,30 @@ function scanObjectLiteral(source: string, open: number): ScanResult {
     if (c === "/" && next === "*") { mode = "block-comment"; i += 2; continue; }
     if (c === "'") { mode = "single"; i++; continue; }
     if (c === '"') { mode = "double"; i++; continue; }
-    if (c === "`") { mode = "template"; i++; continue; }
+    if (c === "`") {
+      // A backtick right after a value is a tagged template: a function call
+      // with no parentheses (`` Function`...`` `` builds and runs code).
+      if (impure === undefined && !isRegexPosition(source, i)) impure = "a tagged template";
+      mode = "template";
+      i++;
+      continue;
+    }
+    if (impure === undefined) {
+      if (c === "(") impure = "`(`";
+      else if (c === "=") impure = next === ">" ? "`=>`" : "`=`";
+      else if (c === "\\") impure = "a `\\` escape outside a string";
+      else if (/[A-Za-z_$]/.test(c) && (i === 0 || !/[\w$]/.test(source[i - 1]))) {
+        let j = i + 1;
+        while (j < source.length && /[\w$]/.test(source[j])) j++;
+        const word = source.slice(i, j);
+        if (IMPURE_WORDS.has(word)) {
+          const after = nextSignificant(source, j);
+          if (after === -1 || source[after] !== ":") impure = `\`${word}\``;
+        }
+        i = j;
+        continue;
+      }
+    }
     if (c === "/" && isRegexPosition(source, i)) { mode = "regex"; i++; continue; }
     if (c === "{") { depth++; i++; continue; }
     if (c === "}") {
@@ -156,12 +214,12 @@ function scanObjectLiteral(source: string, open: number): ScanResult {
         mode = "template";
         continue;
       }
-      if (depth === 0) return { end: i, sawInterpolation };
+      if (depth === 0) return { end: i, sawInterpolation, impure };
       continue;
     }
     i++;
   }
-  return { end: -1, sawInterpolation };
+  return { end: -1, sawInterpolation, impure };
 }
 
 /**
@@ -178,8 +236,9 @@ function isRegexPosition(source: string, i: number): boolean {
   while (j >= 0 && /\s/.test(source[j])) j--;
   if (j < 0) return true;
   const prev = source[j];
-  // Identifier/number/closer before `/` means division.
-  return !/[\w$)\]]/.test(prev);
+  // Identifier/number/closer before `/` means division. The same test tells a
+  // tagged template (value then backtick) from a plain one.
+  return !/[\w$)\]`]/.test(prev);
 }
 
 function fail(message: string): never {
@@ -225,7 +284,7 @@ export function extractMeta(source: string): MetaExtraction {
   const open = source.indexOf("{", declaration.index + declaration[0].length);
   if (open === -1) fail("`export const meta` must be assigned an object literal.\n" + PURE_LITERAL_HINT);
 
-  const { end: close, sawInterpolation } = scanObjectLiteral(source, open);
+  const { end: close, sawInterpolation, impure } = scanObjectLiteral(source, open);
   if (close === -1) fail("`meta` object literal is never closed — check for an unbalanced `{`.");
 
   // Caught here rather than by evaluation: a self-contained substitution such as
@@ -236,19 +295,27 @@ export function extractMeta(source: string): MetaExtraction {
     fail("`meta` must not use template interpolation (`${...}`).\n" + PURE_LITERAL_HINT);
   }
 
+  // Rejected before evaluation. This runs on pi's own thread (renderCall,
+  // execute, nested `workflow()` validation), and code needs no globals to do
+  // harm there: `(() => { while (true); })()` spins, and
+  // `(async () => { for (;;) await 0; })()` queues microtasks that a vm
+  // `timeout` never sees. A literal has no use for any of these tokens.
+  if (impure !== undefined) {
+    fail(`\`meta\` must not contain ${impure} — it must be data, not code.\n${PURE_LITERAL_HINT}`);
+  }
+
   const fragment = source.slice(open, close);
   let value: unknown;
   try {
     // Empty context: a pure literal needs no globals, so anything reaching for
     // one (a variable, a helper call) throws here and is reported as impure.
     //
-    // The timeout is not belt-and-braces. An IIFE needs no globals either, so
-    // `name: (() => { while (true); })()` is evaluable — and this runs on the
-    // host thread, before the script ever reaches the worker. Without a bound it
-    // would wedge pi itself. `timeout` only governs synchronous execution, which
-    // is all a literal can contain.
+    // Defense in depth behind the token check above: the timeout bounds
+    // synchronous code, and `microtaskMode: "afterEvaluate"` gives the context
+    // its own microtask queue, drained inside that same timeout, so a promise
+    // job created here can never run on (and starve) the host's queue.
     value = new Script(`(${fragment})`, { filename: "workflow-meta.js" })
-      .runInContext(createContext({}), { timeout: META_EVAL_TIMEOUT_MS });
+      .runInContext(createContext({}, { microtaskMode: "afterEvaluate" }), { timeout: META_EVAL_TIMEOUT_MS });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     if (/timed out|Script execution/i.test(detail)) {
@@ -295,15 +362,30 @@ export function extractMeta(source: string): MetaExtraction {
 /**
  * `meta.name` for a call line, without re-parsing on every frame.
  *
- * `renderCall` runs on every repaint, and extraction evaluates a literal in a
- * vm — cheap, but not free at that cadence. Keyed by the exact source, so an
- * edit-and-rerun cycle re-reads it and a hit is always the answer a fresh parse
- * would give.
+ * `renderCall` runs on every repaint and on every streamed argument delta, and
+ * extraction evaluates a literal in a vm: cheap, but not free at that cadence.
+ * Keyed by the exact source, so an edit-and-rerun cycle re-reads it and a hit
+ * is always the answer a fresh parse would give. Bounded: keyed by whole
+ * scripts, an unbounded map grew by one entry per streamed prefix (a 95 KB
+ * script in 16-char deltas held ~1 GB).
  */
 const workflowNames = new Map<string, string>();
+const WORKFLOW_NAME_CACHE_SIZE = 16;
+
+export interface WorkflowCallNameOptions {
+  /**
+   * False while the call's arguments are still streaming: the source is then a
+   * prefix that changes on every delta, so parsing it would only fill the cache
+   * with names nobody will ask for again. Defaults to true.
+   */
+  parse?: boolean;
+}
 
 /** The label a `SubagentWorkflow` call renders under, from whichever field it carries. */
-export function workflowCallName(args: { script?: string; scriptPath?: string; name?: string }): string {
+export function workflowCallName(
+  args: { script?: string; scriptPath?: string; name?: string },
+  options: WorkflowCallNameOptions = {},
+): string {
   const source = args.script;
   if (source === undefined || source === "") {
     // A path-only call would need a synchronous file read per repaint to do
@@ -313,7 +395,13 @@ export function workflowCallName(args: { script?: string; scriptPath?: string; n
     return args.name !== undefined && args.name !== "" ? args.name : "workflow";
   }
   const cached = workflowNames.get(source);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    // Refresh recency so the entry being repainted is the last one evicted.
+    workflowNames.delete(source);
+    workflowNames.set(source, cached);
+    return cached;
+  }
+  if (options.parse === false) return "workflow";
   let name = "workflow";
   try {
     name = extractMeta(source).meta.name;
@@ -321,5 +409,14 @@ export function workflowCallName(args: { script?: string; scriptPath?: string; n
     // An invalid script still gets a call line; `execute` reports why.
   }
   workflowNames.set(source, name);
+  while (workflowNames.size > WORKFLOW_NAME_CACHE_SIZE) {
+    const oldest = workflowNames.keys().next().value as string;
+    workflowNames.delete(oldest);
+  }
   return name;
+}
+
+/** Entries in the call-line name cache. For tests. */
+export function workflowCallNameCacheSize(): number {
+  return workflowNames.size;
 }

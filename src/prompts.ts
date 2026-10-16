@@ -73,7 +73,8 @@ Platform: ${env.platform}`;
   const worktreeBlock = extras?.worktreeBase
     ? `\n\n<worktree_isolation>
 Your working directory is an isolated git worktree copy of ${extras.worktreeBase}.
-Work only inside it — never in ${extras.worktreeBase}, even if other instructions name that path as your working directory.
+Work only inside it — never in ${extras.worktreeBase}, even if other instructions name that path as your working directory.${
+  extras.memoryBlock ? "\nThe one exception is your agent memory directory named below, which lives in the real project so it outlasts this copy." : ""}
 </worktree_isolation>`
     : "";
 

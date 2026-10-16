@@ -39,11 +39,10 @@ export function getStatusNote(status: string): string {
  *   - It already holds the agent's ENTIRE output inline, whereas the background
  *     notification carries a 500-char preview. So only here can we truthfully
  *     say there is nothing more to fetch — which is the whole point, because
- *   - it has no agent id. The id travels in the tool result's renderer
- *     `details`, which is never serialized to the model. A parent that reads
- *     "output may be partial" as "truncated, go retrieve the rest" therefore
- *     has nothing valid to call `get_subagent_result` with, and will invent an
- *     id (#174).
+ *   - a parent that reads "output may be partial" as "truncated, go retrieve
+ *     the rest" calls `get_subagent_result` for nothing (#174). The result does
+ *     carry the agent id now (`agentIdLine`), but only so the agent can be
+ *     resumed; there is still nothing more to fetch.
  *
  * Only the lead clause varies between the three, and each variation carries
  * information: `wrapped up` vs `aborted` tells the parent whether the output is
@@ -77,6 +76,15 @@ export function getForegroundOutcomeNote(status: string): string {
     default:
       return "";
   }
+}
+
+/**
+ * The line that hands the model an inline (foreground) agent's id. The
+ * background envelope already carries one; without it here a foreground agent
+ * could never be resumed, and a model told it can resume would invent an id.
+ */
+export function agentIdLine(id: string): string {
+  return `\n\nAgent ID: ${id} (pass it as \`resume\` to continue this agent)`;
 }
 
 /**

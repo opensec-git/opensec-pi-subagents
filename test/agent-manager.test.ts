@@ -968,42 +968,21 @@ describe("AgentManager — onBeforeWorktreeCleanup", () => {
     vi.mocked(cleanupWorktree).mockImplementation(async () => ({ hasChanges: false }));
   });
 
-  it("fires with the worktree path, before the worktree is cleaned up", async () => {
-    const { order } = await trace();
+  it("hands the hook to cleanup, which runs it while the worktree still exists", async () => {
+    const { cleanupWorktree } = await trace();
     resolvedRun();
-    const seen: string[] = [];
-
-    manager = new AgentManager();
-    await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
-      description: "test",
-      isolation: "worktree",
-      onBeforeWorktreeCleanup: async (path) => {
-        order.push("hook");
-        seen.push(path);
-      },
-    });
-
-    expect(seen).toEqual(["/wt/copy"]);
-    // Order is the whole point: after cleanup the path is a branch, not a tree.
-    expect(order).toEqual(["hook", "cleanup"]);
-  });
-
-  it("cleans up anyway when the hook throws", async () => {
-    const { order } = await trace();
-    resolvedRun();
+    const hook = async () => {};
 
     manager = new AgentManager();
     const { record } = await manager.spawnAndWait(mockPi, mockCtx, "X", "test", {
       description: "test",
       isolation: "worktree",
-      onBeforeWorktreeCleanup: async () => {
-        order.push("hook");
-        throw new Error("gate blew up");
-      },
+      onBeforeWorktreeCleanup: hook,
     });
 
-    // A hook that fails must not leak a worktree, and must not fail the agent.
-    expect(order).toEqual(["hook", "cleanup"]);
+    // Cleanup runs it after committing the child's work and before removing
+    // the tree (see worktree.test.ts); here only the hand-off is the manager's.
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, mockCtx.cwd, expect.objectContaining({ path: "/wt/copy" }), "test", hook);
     expect(record.status).toBe("completed");
   });
 
@@ -1186,7 +1165,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
       mockCtx, "general-purpose", "test",
       expect.objectContaining({ cwd: "/wt/copy/packages/api", configCwd: "/tmp", worktreeBase: "/" }),
     );
-    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/", expect.anything(), "test");
+    expect(cleanupWorktree).toHaveBeenCalledWith(mockPi, "/", expect.anything(), "test", undefined);
   });
 
   it("plain worktree (no cwd) keeps the historical root working dir even when workPath differs", async () => {
@@ -1477,8 +1456,9 @@ describe("AgentManager — abortAll", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
 
-  it("stops both queued and running agents and returns the total count", () => {
+  it("stops both queued and running agents and returns the total count", async () => {
     manager = new AgentManager(undefined, 1);
+    manager.setStopGraceMs(20);
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
 
     const running = manager.spawn(mockPi, mockCtx, "X", "r", {
@@ -1495,6 +1475,10 @@ describe("AgentManager — abortAll", () => {
     expect(manager.abortAll()).toBe(2);
     expect(manager.getRecord(running)?.status).toBe("stopped");
     expect(manager.getRecord(queued)?.status).toBe("stopped");
+    // The running agent's run never ends (it ignores the abort), so it still
+    // holds its slot until the stop grace abandons it.
+    expect(manager.hasRunning()).toBe(true);
+    await new Promise(r => setTimeout(r, 60));
     expect(manager.hasRunning()).toBe(false);
   });
 
@@ -2157,7 +2141,7 @@ describe("AgentManager — background resume", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
   });
 
-  it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {
+  it("foreground resume awaits inline and fires onComplete once", async () => {
     const onComplete = vi.fn();
     manager = new AgentManager(onComplete);
     const id = await spawnSettled(manager);
@@ -2168,8 +2152,11 @@ describe("AgentManager — background resume", () => {
 
     expect(record?.status).toBe("completed");
     expect(record?.result).toBe("inline result");
-    // Foreground resume returns its result inline and never notified (historical).
-    expect(onComplete).not.toHaveBeenCalled();
+    // Foreground resume returns its result inline and fires onComplete for
+    // lifecycle symmetry (events, persisted record); the record is consumed, so
+    // the extension sends no notification for it.
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith(record);
   });
 
   // A detached resume returns while the record is still "running", so nothing
@@ -2504,4 +2491,47 @@ describe("AgentManager — effective model and thinking write-back", () => {
 
     expect(record.invocation).toEqual({ thinking: "max" });
   });
+});
+
+describe("AgentManager — resume after a stop", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  // abort() marks the record "stopped" before its run has wound down. A resume
+  // that starts then races the old run: pi rejects the prompt ("Agent is
+  // already processing"), and the old settle path rewrites the new run's
+  // status and fires a second completion while it is still running.
+  for (const isBackground of [false, true]) {
+    it(`waits for the stopped run to settle before a ${isBackground ? "background" : "foreground"} resume starts`, async () => {
+      const onComplete = vi.fn();
+      manager = new AgentManager(onComplete);
+      let finishFirst!: () => void;
+      vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => {
+        finishFirst = () => resolve({ responseText: "first", session: mockSession(), aborted: false, steered: false });
+      }) as any);
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", { description: "task", isBackground: true });
+      await Promise.resolve();
+      // A session exists once the run is underway; the mock never reports one.
+      manager.getRecord(id)!.session = mockSession();
+
+      expect(manager.abort(id)).toBe(true);
+      expect(manager.getRecord(id)!.status).toBe("stopped");
+
+      vi.mocked(resumeAgent).mockClear();
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "resumed" });
+      const resumed = manager.resume(id, "go on", undefined, { isBackground });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(resumeAgent).not.toHaveBeenCalled();
+
+      finishFirst();
+      const record = await resumed;
+      await record?.promise;
+
+      expect(resumeAgent).toHaveBeenCalledTimes(1);
+      expect(record?.status).toBe("completed");
+      expect(record?.result).toBe("resumed");
+      // One completion for the stopped run, one for the resume — none stray.
+      expect(onComplete).toHaveBeenCalledTimes(2);
+    });
+  }
 });

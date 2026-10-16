@@ -254,7 +254,7 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
-    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir", { projectTrusted: true });
     // Same claim as before `rememberAgents` flipped the default — the effective
     // cwd reaches the session manager — now via the persistent constructor.
     expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp/worktree", undefined, expect.anything());
@@ -262,6 +262,33 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
+  });
+
+  it("hands the parent's project trust to the child's settings, loader and session", async () => {
+    const { session } = createSession("UNTRUSTED");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, isProjectTrusted: () => false }, "Explore", "Say UNTRUSTED", { pi });
+
+    expect(settingsManagerCreate).toHaveBeenCalledWith(expect.any(String), "/mock/agent-dir", { projectTrusted: false });
+    const settingsManager = settingsManagerCreate.mock.results[0].value;
+    expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
+  });
+
+  it("resolves project memory against the real project, not the worktree copy", async () => {
+    const { getAgentConfig } = await import("../src/agent-types.js");
+    const { buildReadOnlyMemoryBlock } = await import("../src/memory.js");
+    const base = vi.mocked(getAgentConfig).getMockImplementation()!("Explore")!;
+    vi.mocked(getAgentConfig).mockImplementation(() => ({ ...base, memory: "project" }));
+    const { session } = createSession("MEMORY");
+    createAgentSession.mockResolvedValue({ session });
+    try {
+      await runAgent(ctx, "Explore", "Say MEMORY", { pi, cwd: "/wt/copy", worktreeBase: "/repo" });
+      expect(vi.mocked(buildReadOnlyMemoryBlock).mock.lastCall?.[2]).toBe("/repo");
+    } finally {
+      vi.mocked(getAgentConfig).mockImplementation(() => base);
+    }
   });
 
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {
@@ -913,10 +940,20 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
   });
 
-  it("leaves a nested child in memory, since nothing can address it later", async () => {
-    // The default exists so `@handle` can reopen a conversation. A nested agent
-    // never gets a handle, so its transcript would be unreachable by anything —
-    // pure disk and /resume clutter.
+  it("persists a nested child too, so its owner can resume it after eviction", async () => {
+    // A nested agent has no handle, but its parent holds its id and can resume
+    // it long after the record is evicted — which needs the session file.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", { pi, nested: true });
+
+    expect(sessionManagerCreate).toHaveBeenCalled();
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+  });
+
+  it("leaves a nested child in memory when rememberAgents is off", async () => {
+    setRememberAgents(false);
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     createAgentSession.mockResolvedValue({ session: createSession("OK").session });
 

@@ -10,9 +10,10 @@ import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownThe
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import { getCachedSessionContextPercent, getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -24,15 +25,30 @@ export const VIEWPORT_HEIGHT_PCT = 70;
 /**
  * Cap on a single tool result or bash output before the viewer elides the rest.
  *
- * The cap is not cosmetic — it bounds render cost. `buildContentLines()` runs on
- * every render *and* on every scroll key (`handleInput` calls it to compute
- * `maxScroll`), so an uncapped 200 KB result costs ~6 ms per keystroke to parse
- * as Markdown, against ~0.5 ms once capped and effectively nothing on a cache
- * hit (best of 5, width 76). 16 KB is roughly a screenful at every terminal size
- * and still ~30x the 500 characters this replaces, which was small enough to cut
- * most real results mid-sentence.
+ * The cap is not cosmetic — it bounds render cost. A message's lines are
+ * rebuilt whenever the width or Markdown mode changes, and the streaming tail
+ * on every frame it changes, so an uncapped 200 KB result costs ~6 ms per
+ * rebuild to parse as Markdown, against ~0.5 ms once capped (best of 5, width
+ * 76). 16 KB is roughly a screenful at every terminal size and still ~30x the
+ * 500 characters this replaces, which was small enough to cut most real
+ * results mid-sentence.
  */
 export const RESULT_MAX_CHARS = 16_000;
+
+/**
+ * Session events that fire per streamed token or tool-output chunk. They are
+ * coalesced into one redraw per frame; every other event redraws at once.
+ */
+const STREAMING_EVENTS = new Set(["message_update", "tool_execution_update"]);
+/** Redraw cadence while streaming — the widget's spinner frame. */
+const STREAM_FRAME_MS = 80;
+
+/**
+ * One message's rendered lines, already clamped to the width they were built
+ * for. `source` is what they were built from, compared only for messages that
+ * may still change (see `ConversationViewer.contentView`).
+ */
+type Block = { msg: object; source: string; lines: string[] | undefined };
 
 /** Cycle order for the viewer's `m` key. */
 const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
@@ -159,6 +175,21 @@ export class ConversationViewer implements Component {
    * Weak so a compacted-away message doesn't pin its render.
    */
   private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
+  /**
+   * The transcript, kept between frames. `blocks[i]` renders `messages[i]`;
+   * `lines` holds every block's lines (and separators) in order, and
+   * `blockStart[i]` is where block `i`'s part of it begins. All of it is valid
+   * for `cacheWidth` and `cacheMode` only.
+   */
+  private blocks: Block[] = [];
+  private blockStart: number[] = [];
+  private lines: string[] = [];
+  private cacheWidth = -1;
+  private cacheMode: ViewerMarkdownMode | undefined;
+  /** Messages from this index on may still change in place; earlier ones are settled. */
+  private unsettledFrom = 0;
+  /** Pending coalesced redraw for streaming events. */
+  private streamRenderTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private tui: TUI,
@@ -193,8 +224,17 @@ export class ConversationViewer implements Component {
   ) {
     this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
-    this.unsubscribe = session.subscribe(() => {
+    this.unsubscribe = session.subscribe((event) => {
       if (this.closed) return;
+      if (STREAMING_EVENTS.has((event as { type?: string } | undefined)?.type ?? "")) {
+        // A token delta changes at most the activity line; one redraw per
+        // frame is enough, and unthrottled it was one per token.
+        this.streamRenderTimer ??= setTimeout(() => {
+          this.streamRenderTimer = undefined;
+          if (!this.closed) this.tui.requestRender();
+        }, STREAM_FRAME_MS);
+        return;
+      }
       this.tui.requestRender();
     });
   }
@@ -251,7 +291,8 @@ export class ConversationViewer implements Component {
     }
     if (this.stopArmed) this.stopArmed = false;
 
-    const totalLines = this.buildContentLines(this.lastInnerW).length;
+    // Cached: this validates the transcript, it does not rebuild it.
+    const totalLines = this.contentLength(this.contentView(this.lastInnerW));
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, totalLines - viewportHeight);
 
@@ -314,33 +355,33 @@ export class ConversationViewer implements Component {
     // nested child's spend.
     const tokens = getLifetimeTotal(this.record.lifetimeUsage);
     if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
+      const percent = getCachedSessionContextPercent(this.activity?.session);
       headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
     }
     const cost = this.showCost ? formatCost(getLifetimeCost(this.record.lifetimeUsage)) : "";
     if (cost) headerParts.push(cost);
 
     lines.push(row(
-      `${statusIcon} ${renderAgentName(this.record.type, th, { bold: true })}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
+      `${statusIcon} ${renderAgentName(this.record.type, th, { bold: true })}${modeTag}  ${th.fg("muted", sanitizeTerminalText(this.record.description))} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
     ));
     const invocationLine = this.invocationLine();
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
 
-    // Content area — rebuild every render (live data, no cache needed)
-    const contentLines = this.buildContentLines(innerW);
+    // Content area — cached lines, rebuilt only where the transcript changed.
+    const content = this.contentView(innerW);
+    const totalLines = this.contentLength(content);
     const viewportHeight = this.viewportHeight();
-    const maxScroll = Math.max(0, contentLines.length - viewportHeight);
+    const maxScroll = Math.max(0, totalLines - viewportHeight);
 
     if (this.autoScroll) {
       this.scrollOffset = maxScroll;
     }
 
     const visibleStart = Math.min(this.scrollOffset, maxScroll);
-    const visible = contentLines.slice(visibleStart, visibleStart + viewportHeight);
-
     for (let i = 0; i < viewportHeight; i++) {
-      lines.push(row(visible[i] ?? ""));
+      const at = visibleStart + i;
+      lines.push(row((at < content.base.length ? content.base[at] : content.tail[at - content.base.length]) ?? ""));
     }
 
     // Footer
@@ -370,10 +411,10 @@ export class ConversationViewer implements Component {
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
       // it's the first thing dropped so it never crowds out the hints.
-      const scrollPct = contentLines.length <= viewportHeight
+      const scrollPct = totalLines <= viewportHeight
         ? "100%"
-        : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
-      const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
+        : `${Math.round(((visibleStart + viewportHeight) / totalLines) * 100)}%`;
+      const count = th.fg("dim", `${totalLines} lines · ${scrollPct}`);
       const withCount = [count, ...actions].join(sep);
       const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
         ? withCount
@@ -399,12 +440,13 @@ export class ConversationViewer implements Component {
 
   /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
   private rawLines(text: string, width: number, dim: boolean): string[] {
-    const lines = wrapTextWithAnsi(text, width);
+    const lines = wrapTextWithAnsi(sanitizeTerminalText(text), width);
     return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
+  private markdownLines(msg: AgentSession["messages"][number], raw: string, width: number, dim: boolean): string[] {
+    const text = sanitizeTerminalText(raw);
     let entry = this.markdownCache.get(msg);
     if (!entry) {
       entry = {
@@ -471,10 +513,16 @@ export class ConversationViewer implements Component {
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    this.cacheWidth = -1;
+  }
 
   dispose(): void {
     this.closed = true;
+    if (this.streamRenderTimer) {
+      clearTimeout(this.streamRenderTimer);
+      this.streamRenderTimer = undefined;
+    }
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = undefined;
@@ -506,84 +554,166 @@ export class ConversationViewer implements Component {
     return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
   }
 
-  private buildContentLines(width: number): string[] {
-    if (width <= 0) return [];
+  /** Every content line, transcript then activity indicator, as one copy. Rendering uses `contentView`. */
+  buildContentLines(width: number): string[] {
+    const { base, tail } = this.contentView(width);
+    return [...base, ...tail];
+  }
 
+  private contentLength(view: { base: string[]; tail: string[] }): number {
+    return view.base.length + view.tail.length;
+  }
+
+  /**
+   * The content area as cached transcript lines (`base`, owned by the viewer —
+   * do not mutate) plus the live activity indicator (`tail`).
+   *
+   * Only messages that changed are rebuilt. A message is matched to its block
+   * by identity; messages from `unsettledFrom` on (the last one when the
+   * previous frame was drawn, and anything after it) are also compared by
+   * content, because older pi streams into the last message in place and a
+   * message can be edited and then pushed past before the next frame. Earlier
+   * messages are settled: pi never rewrites a message once another follows it,
+   * and compaction replaces the objects, which the identity check catches.
+   */
+  private contentView(width: number): { base: string[]; tail: string[] } {
+    if (width <= 0) return { base: [], tail: [] };
     const th = this.theme;
     const messages = this.session.messages;
-    const lines: string[] = [];
 
     if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
+      return { base: [truncateToWidth(th.fg("dim", "(waiting for first message...)"), width)], tail: [] };
     }
 
     const mode = this.markdownMode();
-    let needsSeparator = false;
-    for (const msg of messages) {
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
-        }
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: string[] = [];
-        for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
-          }
-        }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          const text = textParts.join("\n").trim();
-          lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
-            : this.markdownLines(msg, text, width, false)));
-        }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
-        }
-      } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
-        if (!text) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.rawLines(text, width, true));
-          if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-        }
-      } else {
-        continue;
-      }
-      needsSeparator = true;
+    if (width !== this.cacheWidth || mode !== this.cacheMode) {
+      this.blocks = [];
+      this.blockStart = [];
+      this.lines = [];
+      this.cacheWidth = width;
+      this.cacheMode = mode;
+      this.unsettledFrom = 0;
     }
+
+    // First block that no longer matches its message.
+    let stale = Math.min(this.blocks.length, messages.length);
+    for (let i = 0; i < stale; i++) {
+      const block = this.blocks[i];
+      if (block.msg !== messages[i] || (i >= this.unsettledFrom && block.source !== this.messageSource(messages[i]))) {
+        stale = i;
+        break;
+      }
+    }
+
+    if (stale < this.blocks.length || stale < messages.length) {
+      this.lines.length = stale < this.blockStart.length ? this.blockStart[stale] : this.lines.length;
+      this.blocks.length = stale;
+      this.blockStart.length = stale;
+      let needsSeparator = this.blocks.some(b => b.lines !== undefined);
+      const separator = truncateToWidth(th.fg("dim", "───"), width);
+      for (let i = stale; i < messages.length; i++) {
+        const msg = messages[i];
+        const source = this.messageSource(msg);
+        const body = this.messageLines(msg, width, mode);
+        this.blocks.push({ msg, source, lines: body });
+        this.blockStart.push(this.lines.length);
+        if (!body) continue;
+        if (needsSeparator) this.lines.push(separator);
+        for (const line of body) this.lines.push(line);
+        needsSeparator = true;
+      }
+    }
+    this.unsettledFrom = messages.length - 1;
 
     // Streaming indicator for running agents
+    const tail: string[] = [];
     if (this.record.status === "running" && this.activity) {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
-      lines.push("");
-      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+      tail.push("", truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", sanitizeTerminalText(act)), width));
     }
 
+    return { base: this.lines, tail };
+  }
+
+  /**
+   * Everything a message's rendered lines depend on, besides width and mode.
+   * Cheap next to rendering: string joins, no wrapping or parsing.
+   */
+  private messageSource(msg: AgentSession["messages"][number]): string {
+    const m = msg as any;
+    switch (m.role) {
+      case "user":
+        return typeof m.content === "string" ? m.content : extractText(m.content);
+      case "assistant": {
+        let out = "";
+        for (const c of m.content) {
+          if (c.type === "text" && c.text) out += `t${c.text.length}:${c.text}`;
+          else if (c.type === "toolCall") out += `c${c.name ?? c.toolName ?? "unknown"}\n`;
+        }
+        return out;
+      }
+      case "toolResult":
+        return extractText(m.content);
+      case "bashExecution":
+        return `${String(m.command)}\n${m.output ?? ""}`;
+      default:
+        return "";
+    }
+  }
+
+  /** One message's lines without its separator, clamped to `width`; undefined when it renders nothing. */
+  private messageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | undefined {
+    const th = this.theme;
+    const lines: string[] = [];
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : extractText(msg.content);
+      if (!text.trim()) return undefined;
+      lines.push(th.fg("accent", "[User]"));
+      for (const line of wrapTextWithAnsi(sanitizeTerminalText(text.trim()), width)) {
+        lines.push(line);
+      }
+    } else if (msg.role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: string[] = [];
+      for (const c of msg.content) {
+        if (c.type === "text" && c.text) textParts.push(c.text);
+        else if (c.type === "toolCall") {
+          toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+        }
+      }
+      lines.push(th.bold("[Assistant]"));
+      if (textParts.length > 0) {
+        const text = textParts.join("\n").trim();
+        lines.push(...(mode === "off"
+          ? this.rawLines(text, width, false)
+          : this.markdownLines(msg, text, width, false)));
+      }
+      for (const name of toolCalls) {
+        lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${sanitizeTerminalText(name)}]`), width));
+      }
+    } else if (msg.role === "toolResult") {
+      const { text, elided } = capResult(extractText(msg.content).trim());
+      if (!text) return undefined;
+      lines.push(th.fg("dim", "[Result]"));
+      lines.push(...(mode === "all"
+        ? this.markdownLines(msg, text, width, true)
+        : this.rawLines(text, width, true)));
+      if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+    } else if ((msg as any).role === "bashExecution") {
+      const bash = msg as any;
+      lines.push(truncateToWidth(th.fg("muted", `  $ ${sanitizeTerminalText(String(bash.command))}`), width));
+      if (bash.output?.trim()) {
+        // Same cap as a tool result, never Markdown: command output is the one
+        // thing here that is definitionally not authored as Markdown.
+        const { text, elided } = capResult(bash.output.trim());
+        lines.push(...this.rawLines(text, width, true));
+        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
+      }
+    } else {
+      return undefined;
+    }
     return lines.map(l => truncateToWidth(l, width));
   }
 }

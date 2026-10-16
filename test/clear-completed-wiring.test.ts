@@ -165,7 +165,8 @@ describe("issue #108: unread completed background agents survive session events"
     expect(textOf(first)).toContain("THE-RESULT-PAYLOAD");
 
     // Now a session switch SHOULD clean it up (consumed records are not preserved).
-    await lifecycle.get("session_before_switch")?.();
+    // session_before_switch can be canceled, so the eviction happens on session_start.
+    await lifecycle.get("session_start")?.({}, ctx());
 
     const second = await tools.get("get_subagent_result").execute("tc-read2", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(second)).toContain("Agent not found");

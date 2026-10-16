@@ -25,7 +25,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -89,7 +89,20 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  /** Whether the agent's run is still in flight, including a stopped one still winding down. */
+  isRunActive?(id: string): boolean;
+  /** An evicted child, still resumable from its session file. */
+  findTombstone?(id: string): { parentAgentId?: string } | undefined;
+  resume(
+    id: string,
+    prompt: string,
+    signal?: AbortSignal,
+    options?: {
+      pi?: ExtensionAPI;
+      ctx?: ExtensionContext;
+      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+    },
+  ): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -102,6 +115,12 @@ export interface NestedToolContext {
   allowedSubagents: "all" | string[];
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
+  /**
+   * Whether the session this branch descends from trusts its project. False
+   * keeps the project's agent files out of the registry, as at the top level.
+   * Omitted counts as trusted.
+   */
+  projectTrusted?: boolean;
 }
 
 function textResult(text: string, isError = false) {
@@ -116,18 +135,19 @@ function ownsRecord(record: AgentRecord | undefined, parentAgentId: string): rec
  * How the caller received this record, which decides the outcome wording.
  *
  *   - "inline": a foreground spawn or a resume. The full output is in this very
- *     result and no agent id was handed back, so the note must say there is
- *     nothing left to fetch — otherwise the parent invents an id, calls
- *     `get_subagent_result`, and hits "not owned by this parent" (#174, the same
- *     trap the top-level foreground path fell into).
+ *     result, so the note must say there is nothing left to fetch — otherwise
+ *     the parent calls `get_subagent_result` for nothing (#174, the same trap
+ *     the top-level foreground path fell into). The agent id is appended so
+ *     the parent can resume the child.
  *   - "fetched": `get_subagent_result` on a background child. The parent holds a
  *     valid id and can poll again, so the background wording applies.
  */
 type ResultPosition = "inline" | "fetched";
 
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
+  const idLine = position === "inline" ? agentIdLine(record.id) : "";
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
+    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${idLine}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -139,15 +159,36 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
-  return note ? `Nested agent${note}.\n\n${text}` : text;
+  return (note ? `Nested agent${note}.\n\n${text}` : text) + idLine;
 }
 
 /** Build child-safe orchestration tools scoped to one parent agent instance. */
 export function createNestedSubagentTools(context: NestedToolContext): ToolDefinition[] {
+  /**
+   * Nested children are hidden from every reporting surface, so their spend
+   * would otherwise be unattributable. Fold it into every ancestor's record: the
+   * top-level one appears in lifecycle events, completion notifications, and
+   * `/agents`, and those all read `lifetimeUsage`. The whole chain is walked,
+   * not just the immediate parent — a spawn callback only fires for that child's
+   * OWN turns, so stopping at one level would hide a great-grandchild from the
+   * only record anyone can see. (The live widget/fleet counters read their own
+   * per-agent activity tracker, which still sees only the top-level agent's own
+   * turns.) Used for spawns and resumes alike.
+   */
+  const bookIntoAncestors = (usage: { input: number; output: number; cacheWrite: number }): void => {
+    for (let id: string | undefined = context.parentAgentId; id !== undefined; ) {
+      const ancestor = context.manager.getRecord(id);
+      if (!ancestor) break;
+      addUsage(ancestor.lifetimeUsage, usage);
+      id = ancestor.parentAgentId;
+    }
+  };
+
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  const loadRegistry = () =>
+    buildAgentRegistry(loadCustomAgents(context.configCwd, false, { project: context.projectTrusted !== false }));
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined
@@ -183,13 +224,28 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
-        if (!ownsRecord(existing, context.parentAgentId)) {
+        // Evicted after it finished: reopened from its session file, under the
+        // same ownership rule.
+        const evicted = existing ? undefined : context.manager.findTombstone?.(params.resume);
+        const owned = existing
+          ? ownsRecord(existing, context.parentAgentId)
+          : evicted?.parentAgentId === context.parentAgentId;
+        if (!owned) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        let resumed: AgentRecord | undefined;
+        try {
+          resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+            pi: context.pi,
+            ctx,
+            onAssistantUsage: bookIntoAncestors,
+          });
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err), true);
+        }
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
-          : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+          : textResult(`Nested agent "${params.resume}" is still running — it can only be resumed once its current run finishes.`, true);
       }
 
       if (context.depth >= context.maxSubagentDepth) {
@@ -271,23 +327,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
-        // Nested children are hidden from every reporting surface, so their spend
-        // would otherwise be unattributable. Fold it into every ancestor's record:
-        // the top-level one appears in lifecycle events, completion notifications,
-        // and `/agents`, and those all read `lifetimeUsage`. The whole chain is
-        // walked, not just the immediate parent — a spawn callback only fires for
-        // that child's OWN turns, so stopping at one level would hide a
-        // great-grandchild from the only record anyone can see. (The live
-        // widget/fleet counters read their own per-agent activity tracker, which
-        // still sees only the top-level agent's own turns.)
-        onAssistantUsage: (usage) => {
-          for (let id: string | undefined = context.parentAgentId; id !== undefined; ) {
-            const ancestor = context.manager.getRecord(id);
-            if (!ancestor) break;
-            addUsage(ancestor.lifetimeUsage, usage);
-            id = ancestor.parentAgentId;
-          }
-        },
+        onAssistantUsage: bookIntoAncestors,
         depth: childDepth,
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: context.maxSubagentDepth,
@@ -378,10 +418,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // Wait for completion if requested. Cancellation (e.g. the parent's tool
       // call is aborted) stops only this wait; the nested child keeps running and
       // stays unconsumed. Queued records have no promise until the manager starts
-      // them, so poll — abortably — until they leave the queue, then await.
-      if (params.wait && (record.status === "queued" || record.status === "running")) {
+      // them, so wait — abortably — on the queue's start gate (polling without
+      // one) until they leave the queue, then await.
+      if (params.wait && (record.status === "queued" || record.status === "running" || context.manager.isRunActive?.(record.id))) {
         while (record.status === "queued") {
-          await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
+          await abortable(record.startGate ?? new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
         if (record.promise) await abortable(record.promise, signal);
       }

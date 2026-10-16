@@ -124,6 +124,8 @@ A script you will run more than once belongs somewhere durable. Copy it out of t
 
 First hit wins, in that order, so a project file shadows a same-named global one.
 
+The two project locations are used only when Pi trusts the project to run its own code: the folder was trusted at Pi's prompt (or by `defaultProjectTrust`, or a CLI flag), or `/trust` recorded it. Pi trusts a folder without asking when it holds nothing Pi gates, and `.pi/workflows` is not gated, so a cloned repo that ships only workflows does not get them run by name until you run `/trust`. A refused name says so and runs nothing.
+
 The file must carry an `export const meta = { name, description }` declaration. Those are ordinary directories that may hold anything, so that declaration is what marks a file as a workflow — name something else and you are told it is not a workflow rather than getting a parse error from halfway through it. Nothing in the file is executed to decide that.
 
 Then invoke it by name: *"run the auth-audit workflow"*. The model passes `name: "auth-audit"` and the run reports that file back as its `Script:`, so the edit-and-re-run loop still works on it.
@@ -241,14 +243,16 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
-| `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
+| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent. The child's branch (and its worktree, when kept) is listed under `<worktrees>` in the run's completion notification, for schema'd and failed children too; a failed child's error names it as well |
+| `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error. With `isolation: "worktree"` it runs in the agent's worktree after its changes are committed, and what the command itself changes is discarded |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+A resumed child is bounded like a first run (its turn limit, grace turns and tool timeout). An isolated child resumes in its worktree, restored from its branch; if the branch is gone, `agent()` resolves to `null` with the reason. A child whose record was evicted (about ten minutes after it finished) is reopened from its saved session file under the same id.
 
 ### `pipeline()` and `parallel()`
 
@@ -284,7 +288,7 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 |---|---|
 | An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
-| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
+| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins (project locations only in a project trusted to run its code) |
 
 The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only the third is durable, and copying a script there is a manual step.
 
@@ -297,12 +301,15 @@ The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only
 | Items per `parallel`/`pipeline` **call** | 4096 |
 | Nested `workflow()` calls per run | 256 |
 | Script length | 512 KiB |
+| One `gate` command | 10 minutes, then SIGTERM to its whole process tree and SIGKILL 5 s later |
 
 These are three different things and are easy to conflate: 1000 is a budget for the whole run, the concurrency figure is how many run *simultaneously*, and 4096 is per call rather than per run. Excess items queue rather than melting the machine.
 
 Above 25 scheduled agents, or 1.5M tokens actual or projected, the card adds `⚠ Large workflow · /agents → Workflows to stop`.
 
 A run's concurrency limit is its own, independent of the session's `maxConcurrent` and `maxConcurrentForeground` pools — its agents do not enter either.
+
+A `gate` runs in its own process group (on Windows, as a process tree): a timeout or a stopped run ends everything the command started, and processes it leaves running when it exits (a dev server, a watcher) are ended too. The git calls behind worktree isolation are bounded the same way.
 
 ### Settings and the CLI flag
 
@@ -396,8 +403,8 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 
 ## What workflows can't do
 
-- **No filesystem, network or module access inside the script.** All real work happens in the agents it spawns, which have their normal tools.
-- **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`.
+- **No filesystem, network or module access *provided* to the script.** All real work happens in the agents it spawns, which have their normal tools. This is a convention, not an enforced limit: see the note below.
+- **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`. That keeps an accidental `eval` deterministic; it does not contain the script.
 - **No cross-session resume.** Journals are per session.
 - **No resume at all for `--subagents-workflow-file` runs** — that path never journals.
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
@@ -405,7 +412,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 - **Results are not persisted** beyond the journal and the transcript card.
 - **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
 
-The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.
+**Workflow scripts are not sandboxed.** The vm context is a determinism and accident boundary only. The injected globals (`agent`, `log`, ...) are host closures, so a script can reach the host's `Function` through them (`agent.constructor(...)`) and run any code with the same filesystem, network and process access as pi itself; disabled code generation does not prevent that. Treat a workflow script exactly like any other code you let pi run: only run scripts you trust.
 
 ## Coming from Claude Code
 

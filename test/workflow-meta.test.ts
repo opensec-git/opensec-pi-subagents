@@ -202,11 +202,12 @@ describe("extractMeta — isolation", () => {
   it("bounds evaluation so a non-terminating literal cannot hang the host", () => {
     // An IIFE resolves without any global, so the empty context does not stop
     // it. This runs on pi's own thread, before the worker exists — unbounded, it
-    // would wedge the whole process.
+    // would wedge the whole process. The static check now refuses the `(` before
+    // evaluation; the evaluation timeout stays as the backstop.
     const started = Date.now();
     expect(() => extractMeta(
       "export const meta = { name: (() => { while (true); })(), description: 'b' }\nreturn 1",
-    )).toThrow(/did not finish evaluating/);
+    )).toThrow(/must not contain|did not finish evaluating/);
     expect(Date.now() - started).toBeLessThan(2000);
   });
 

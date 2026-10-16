@@ -82,6 +82,19 @@ export function compileJsonSchema(schema: unknown): SchemaCompilation {
     };
   }
 
+  // `pattern` and `patternProperties` become RegExps run on pi's own thread
+  // against whatever the child answers, so a catastrophic-backtracking pattern
+  // written by the model would freeze pi on a crafted (or unlucky) answer.
+  const unsafe = findUnsafePattern(root);
+  if (unsafe !== undefined) {
+    return {
+      ok: false,
+      message:
+        `agent() opts.schema has a regular expression that could take exponential time: ${JSON.stringify(unsafe)}. `
+        + `Avoid quantified groups that contain quantifiers (like (a+)+), and keep patterns under ${MAX_PATTERN_LENGTH} characters.`,
+    };
+  }
+
   // Smoke-tested here so a schema the validator cannot walk fails at the call
   // that wrote it, with the schema in hand, rather than inside a child's tool
   // handler where the only symptom is an agent that never returns.
@@ -97,6 +110,72 @@ export function compileJsonSchema(schema: unknown): SchemaCompilation {
   }
 
   return { ok: true, compiled: { schema: root, check: value => checkAgainst(root, value) } };
+}
+
+/** Longest `pattern` accepted. */
+const MAX_PATTERN_LENGTH = 512;
+
+/** The first `pattern` / `patternProperties` key in `schema` that is unsafe to run, if any. */
+function findUnsafePattern(node: unknown, depth = 0): string | undefined {
+  if (depth > 64 || node === null || typeof node !== "object") return undefined;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findUnsafePattern(item, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const record = node as Record<string, unknown>;
+  if (typeof record.pattern === "string" && isUnsafePattern(record.pattern)) return record.pattern;
+  const patternProperties = record.patternProperties;
+  if (patternProperties !== null && typeof patternProperties === "object" && !Array.isArray(patternProperties)) {
+    for (const key of Object.keys(patternProperties)) {
+      if (isUnsafePattern(key)) return key;
+    }
+  }
+  for (const value of Object.values(record)) {
+    const found = findUnsafePattern(value, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Whether `source` is too long or has a nested quantifier: a quantified group
+ * whose body is itself quantified, the shape behind `(a+)+`, `(a*)*` and
+ * `(\w+\s?)*` blowing up. A heuristic, not a proof, so it errs on refusing.
+ */
+export function isUnsafePattern(source: string): boolean {
+  if (source.length > MAX_PATTERN_LENGTH) return true;
+  // One frame per open group: whether anything inside it repeats.
+  const groups: boolean[] = [];
+  let quantified = false; // the innermost open group contains a quantifier
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "[") {
+      // A class is one atom; skip to its closing bracket.
+      for (i++; i < source.length && source[i] !== "]"; i++) if (source[i] === "\\") i++;
+      continue;
+    }
+    if (c === "(") {
+      groups.push(quantified);
+      quantified = false;
+      continue;
+    }
+    if (c === ")") {
+      const inner = quantified;
+      quantified = groups.pop() ?? false;
+      const next = source[i + 1];
+      const repeated = next === "+" || next === "*" || next === "{" || next === "?";
+      if (repeated && inner && next !== "?") return true;
+      if (inner || repeated) quantified = true;
+      continue;
+    }
+    if (c === "+" || c === "*" || c === "{") quantified = true;
+    else if (c === "?" && source[i - 1] !== "(" && !/[+*?}]/.test(source[i - 1] ?? "")) quantified = true;
+  }
+  return false;
 }
 
 function checkAgainst(schema: Record<string, unknown>, value: unknown): true | string {

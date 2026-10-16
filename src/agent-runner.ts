@@ -24,6 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { isProjectCodeTrusted, isProjectTrustedBy } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -120,8 +121,15 @@ function extensionPackageName(extPath: string): string | undefined {
  */
 export function extensionCanonicalNames(extPath: string): string[] {
   const canonical = extensionCanonicalName(extPath);
+  // Inline extensions (`<inline:name>`) have no file, so no owning package.
+  if (extPath.startsWith("<inline:")) return [canonical];
   const pkg = extensionPackageName(extPath);
   return pkg && pkg !== canonical ? [canonical, pkg] : [canonical];
+}
+
+/** Whether an `extensions:` entry names a file to load rather than an extension by name. */
+function isExtensionPathEntry(entry: string): boolean {
+  return entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
 }
 
 /**
@@ -148,8 +156,7 @@ export function parseExtensionsSpec(
       wildcard = true;
       continue;
     }
-    const isPathEntry = entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
-    if (!isPathEntry) {
+    if (!isExtensionPathEntry(entry)) {
       names.add(entry.toLowerCase());
       continue;
     }
@@ -203,6 +210,47 @@ export function parseExtSelectors(entries: string[]): {
   return { extNames, narrowing };
 }
 
+/** Name of the inline extension that enforces a subagent's tool scope. */
+const TOOL_SCOPE_GUARD_NAME = "subagent-tool-scope";
+/** The loader path pi gives that inline extension. */
+export const TOOL_SCOPE_GUARD_PATH = `<inline:${TOOL_SCOPE_GUARD_NAME}>`;
+
+export interface ToolScopeGuard {
+  /** Passed to the child loader's `extensionFactories`. */
+  extension: { name: string; hidden: boolean; factory: (pi: ExtensionAPI) => void };
+  /** Bind the scope check once it can be derived (after the loader reloads). */
+  setScope(inScope: () => Set<string>): void;
+}
+
+/**
+ * A `tool_call` handler that blocks out-of-scope tools for every call path.
+ *
+ * Replacing `session.agent.beforeToolCall` only covers calls the model makes
+ * directly. Pi 1.0 also lets tools call tools (`ctx.executeTool()`, used by
+ * codemode and `deferred` tools), and those calls go straight to the session's
+ * `tool_call` handlers against every registered codemode/deferred tool, active
+ * or not — so an `ext:`-narrowed subagent could still reach a tool it was
+ * never given. Extension `tool_call` handlers run on both paths.
+ */
+export function createToolScopeGuard(): ToolScopeGuard {
+  let inScope: (() => Set<string>) | undefined;
+  return {
+    extension: {
+      name: TOOL_SCOPE_GUARD_NAME,
+      hidden: true,
+      factory: (pi) => {
+        pi.on("tool_call", (event) => {
+          if (!inScope || inScope().has(event.toolName)) return undefined;
+          return { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` };
+        });
+      },
+    },
+    setScope(fn) {
+      inScope = fn;
+    },
+  };
+}
+
 /**
  * Keep a subagent's tool scope correct as extensions register tools over time.
  *
@@ -245,9 +293,13 @@ export function installExtensionToolScope(
      * seeded from `toolNames`.
      */
     readmitToolNames: Set<string>;
+    /** The child's inline `tool_call` guard, bound to the same scope. */
+    guard?: ToolScopeGuard;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, guard } = ctx;
+  // A loaded extension's manifest is fixed for the session; read each once, not per tool call.
+  const canonsByPath = new Map<string, string[]>();
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -257,7 +309,9 @@ export function installExtensionToolScope(
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
-      const canons = extensionCanonicalNames(extension.path);
+      if (extension.path === TOOL_SCOPE_GUARD_PATH) continue;
+      const canons = canonsByPath.get(extension.path) ?? extensionCanonicalNames(extension.path);
+      canonsByPath.set(extension.path, canons);
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
@@ -295,6 +349,8 @@ export function installExtensionToolScope(
   session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") renarrow();
   });
+
+  guard?.setScope(inScope);
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
@@ -358,6 +414,147 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /**
+ * Longest a single tool call may run, in seconds. 0 = no limit.
+ *
+ * Turn limits only count finished turns, and a turn whose tool never returns
+ * never finishes: a `find /` or a server that never closes would hold the agent
+ * forever. So a subagent's `bash` calls get this as their timeout (pi kills the
+ * whole process tree and reports the timeout to the model, which carries on),
+ * and a watchdog stops any other tool that overruns it and tells the agent to
+ * continue another way.
+ */
+let toolTimeoutSeconds = 1200;
+export const TOOL_TIMEOUT_CEILING = 86_400;
+
+/** Get the per-tool-call time limit in seconds (0 = no limit). */
+export function getToolTimeoutSeconds(): number { return toolTimeoutSeconds; }
+/** Set the per-tool-call time limit in seconds (0 = no limit). */
+export function setToolTimeoutSeconds(n: number): void {
+  toolTimeoutSeconds = Math.min(TOOL_TIMEOUT_CEILING, Math.max(0, Math.floor(n)));
+}
+
+/**
+ * Watchdog timing. `slackMs`: how long past the limit it waits, so a timing-out
+ * `bash` reports its own timeout first. `escalateMs`: how long after its abort a
+ * run may stay stuck before the watchdog stops waiting for it — pi awaits a
+ * running tool unconditionally, so one that ignores its AbortSignal would
+ * otherwise hold the run forever.
+ */
+const watchdogTiming = { slackMs: 60_000, intervalMs: 5_000, escalateMs: 30_000 };
+
+/** Override the watchdog timing (tests only; production uses the defaults above). */
+export function setWatchdogTiming(timing: Partial<typeof watchdogTiming>): void {
+  Object.assign(watchdogTiming, timing);
+}
+/** Times one run is resumed after a stuck tool before it is left stopped. */
+export const MAX_TOOL_RECOVERIES = 3;
+const WATCHDOG_EXEMPT_TOOLS: ReadonlySet<string> = new Set(EXCLUDED_TOOL_NAMES);
+
+export interface HungTool {
+  toolName: string;
+  seconds: number;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 120) return `${seconds} seconds`;
+  return `${Math.round(seconds / 60)} minutes`;
+}
+
+/** The prompt that resumes an agent whose tool call the watchdog stopped. */
+export function hungToolPrompt(hung: HungTool): string {
+  return `Your ${hung.toolName} call ran for ${formatDuration(hung.seconds)} without finishing, so it was stopped and its `
+    + "output is lost. Continue the task without repeating that call: split the work into smaller, bounded steps "
+    + "(search specific folders rather than the whole filesystem, limit depth and output, add timeouts).";
+}
+
+/**
+ * Give a `bash` call's arguments the limit as their timeout when they set none —
+ * and, with `cap`, when they set a longer or invalid one. Pi mutates the same
+ * object it then executes with, so this changes the running call.
+ */
+export function boundBashTimeout(args: unknown, limitSeconds: number, cap: boolean): void {
+  if (limitSeconds <= 0 || !args || typeof args !== "object") return;
+  const call = args as { timeout?: unknown };
+  if (call.timeout == null) call.timeout = limitSeconds;
+  else if (cap && (typeof call.timeout !== "number" || !(call.timeout > 0) || call.timeout > limitSeconds)) {
+    call.timeout = limitSeconds;
+  }
+}
+
+/**
+ * Bound a subagent session's tool calls (see `toolTimeoutSeconds`).
+ *
+ * `bash` calls without a timeout, or with a longer one, get the limit. The
+ * watchdog covers every tool: past the limit (plus slack) it aborts the run,
+ * which kills a running command's process tree, and `takeHung()` then reports
+ * the call so the caller can resume the agent with `hungToolPrompt()`. When the
+ * abort does not end the run (the tool ignores its signal), it escalates:
+ * after `escalateMs` it resolves `stuck`, and the caller stops waiting.
+ */
+export function installToolTimeouts(session: AgentSession, limitSeconds = toolTimeoutSeconds): {
+  takeHung(): HungTool | undefined;
+  /** Resolves when an aborted run is still stuck after the escalation delay. */
+  stuck: Promise<void>;
+  dispose(): void;
+} {
+  if (limitSeconds <= 0) return { takeHung: () => undefined, stuck: new Promise<void>(() => {}), dispose: () => {} };
+  let resolveStuck!: () => void;
+  const stuck = new Promise<void>(resolve => { resolveStuck = resolve; });
+
+  const priorBeforeToolCall = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (context, signal) => {
+    if (context.toolCall.name === "bash") boundBashTimeout(context.args, limitSeconds, true);
+    return priorBeforeToolCall?.(context, signal);
+  };
+
+  const running = new Map<string, { toolName: string; started: number }>();
+  let hung: HungTool | undefined;
+  let hungAt = 0;
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    // Nested agents and workflows wait on child runs with their own limits.
+    if (event.type === "tool_execution_start" && !WATCHDOG_EXEMPT_TOOLS.has(event.toolName)) {
+      running.set(event.toolCallId, { toolName: event.toolName, started: Date.now() });
+    }
+    if (event.type === "tool_execution_end") running.delete(event.toolCallId);
+    if (event.type === "agent_end") running.clear();
+  });
+  const timer = setInterval(() => {
+    const now = Date.now();
+    if (hung) {
+      // Aborted and still not back: escalate rather than wait forever.
+      if (now - hungAt >= watchdogTiming.escalateMs) {
+        clearInterval(timer);
+        resolveStuck();
+      }
+      return;
+    }
+    for (const call of running.values()) {
+      if (now - call.started < limitSeconds * 1000 + watchdogTiming.slackMs) continue;
+      hung = { toolName: call.toolName, seconds: Math.round((now - call.started) / 1000) };
+      hungAt = now;
+      running.clear();
+      void session.abort().catch(() => {});
+      return;
+    }
+  }, watchdogTiming.intervalMs);
+  (timer as { unref?: () => void }).unref?.();
+
+  return {
+    takeHung() {
+      const out = hung;
+      hung = undefined;
+      return out;
+    },
+    stuck,
+    dispose() {
+      clearInterval(timer);
+      unsubscribe();
+      session.agent.beforeToolCall = priorBeforeToolCall;
+    },
+  };
+}
+
+/**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
  */
@@ -415,11 +612,9 @@ export interface RunOptions {
    */
   resumeSessionFile?: string;
   /**
-   * True when another agent spawned this one. Only top-level agents get a
-   * handle, so only they can be reopened by name — which is the whole reason
-   * `rememberAgents` persists a session at all. A nested run's transcript would
-   * be unreachable by anything, so it stays in memory unless its own
-   * frontmatter asks otherwise.
+   * True when another agent spawned this one. Its session is persisted under
+   * `rememberAgents` like a top-level one: the owning parent can resume it by
+   * id long after its record is evicted, which needs the session file.
    */
   nested?: boolean;
   /**
@@ -521,6 +716,8 @@ export interface RunResult {
   structuredJson?: string;
   /** Whether the extra structured-output prompt had to be sent. */
   structuredRetried?: boolean;
+  /** The turn limit this run enforced (undefined = unlimited), for later resumes. */
+  maxTurns?: number;
 }
 
 /**
@@ -595,6 +792,12 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
+  // An abort that landed before the session existed (a stop during startup,
+  // or a parent interrupt before a queued spawn started) fires no event now.
+  if (signal.aborted) {
+    session.abort();
+    return () => {};
+  }
   const onAbort = () => session.abort();
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
@@ -623,6 +826,7 @@ export async function runAgent(
   const configCwd = options.configCwd ?? effectiveCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
+  const projectTrusted = isProjectTrustedBy(ctx);
 
   // Get parent system prompt for append-mode agents
   const parentSystemPrompt = ctx.getSystemPrompt();
@@ -641,7 +845,7 @@ export async function runAgent(
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
-    const loaded = preloadSkills(skills, configCwd);
+    const loaded = preloadSkills(skills, configCwd, { project: projectTrusted });
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
@@ -651,6 +855,9 @@ export async function runAgent(
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
+  // Project and local memory live in the real project, not in a worktree copy:
+  // the copy is deleted when the agent finishes, and its memory with it.
+  const memoryCwd = options.configCwd ?? options.worktreeBase ?? configCwd;
   if (agentConfig?.memory) {
     const existingNames = new Set(toolNames);
     const denied = agentConfig.disallowedTools ? new Set(agentConfig.disallowedTools) : undefined;
@@ -661,12 +868,12 @@ export async function runAgent(
       // Read-write memory: add any missing memory tool names (read/write/edit)
       const extraNames = getMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
+      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, memoryCwd);
     } else {
       // Read-only memory: only add read tool name, use read-only prompt
       const extraNames = getReadOnlyMemoryToolNames(existingNames);
       if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
+      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, memoryCwd);
     }
   }
 
@@ -710,9 +917,24 @@ export async function runAgent(
   );
   const noExtensions = extensions === false;
 
-  const extensionsSpec = Array.isArray(extensions)
-    ? parseExtensionsSpec(extensions, configCwd)
-    : undefined;
+  // A path entry loads that file as code, even where Pi itself would load no
+  // project extension. From a project agent file it is therefore honoured only
+  // when the project is trusted to run its own code; otherwise it is dropped
+  // with a warning and the agent runs without it.
+  let extensionEntries = Array.isArray(extensions) ? extensions : undefined;
+  if (extensionEntries && agentConfig?.source === "project" && extensionEntries.some(isExtensionPathEntry)) {
+    const projectRoot = agentConfig.sourcePath ? dirname(dirname(dirname(agentConfig.sourcePath))) : configCwd;
+    if (!isProjectCodeTrusted(projectTrusted, projectRoot)) {
+      for (const entry of extensionEntries.filter(isExtensionPathEntry)) {
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:extension path "${entry}" in project agent "${type}" was not loaded — the project is not trusted to run its own code (trust it with /trust)`,
+        });
+      }
+      extensionEntries = extensionEntries.filter((entry) => !isExtensionPathEntry(entry));
+    }
+  }
+  const extensionsSpec = extensionEntries ? parseExtensionsSpec(extensionEntries, configCwd) : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
   // Plain canonical names only (case-insensitive). Note: excluded extensions'
@@ -733,10 +955,13 @@ export async function runAgent(
     noExtensions || (loadAll && !hasExcludes)
       ? undefined
       : (base) => {
-          discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
+          discoveredNames = new Set(
+            base.extensions.filter((e) => e.path !== TOOL_SCOPE_GUARD_PATH).flatMap((e) => extensionCanonicalNames(e.path)),
+          );
           return {
             ...base,
             extensions: base.extensions.filter((e) => {
+              if (e.path === TOOL_SCOPE_GUARD_PATH) return true; // ours, not a user extension
               const canons = extensionCanonicalNames(e.path);
               if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
               return loadAll || canons.some((n) => keepNames.has(n));
@@ -744,11 +969,21 @@ export async function runAgent(
           };
         };
 
+  // Only with extensions loaded: under `noExtensions` the static allowlist
+  // already gates the registry itself (see installExtensionToolScope).
+  const toolScopeGuard = noExtensions ? undefined : createToolScopeGuard();
+  // The parent's trust decision, not a fresh default of "trusted": a child must
+  // not load the project extensions, settings (`shellCommandPrefix`, packages)
+  // or skills its parent refused. One manager, shared by the loader and the
+  // session, so both read the project through the same decision.
+  const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
+    settingsManager,
     noExtensions,
     additionalExtensionPaths,
+    extensionFactories: toolScopeGuard ? [toolScopeGuard.extension] : undefined,
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -834,9 +1069,11 @@ export async function runAgent(
   );
 
   // Omitting this SDK option uses saved settings, not the live parent's effort.
-  // A reopened session keeps its saved effort unless explicitly overridden.
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking
-    ?? (options.resumeSessionFile ? undefined : ctx.thinkingLevel);
+  // A reopened session keeps the level it ran with — saved in its file —
+  // unless explicitly overridden: neither the parent's current level nor the
+  // type's frontmatter (which may have changed since) replaces it.
+  const thinkingLevel = options.thinkingLevel
+    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? ctx.thinkingLevel);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -863,6 +1100,7 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
+        projectTrusted,
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
@@ -954,13 +1192,12 @@ export async function runAgent(
     sessionExcludeTools = [...denyTools];
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
-  const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
+  const persistSession = agentConfig?.persistSession ?? rememberAgents;
   const sessionManager = options.resumeSessionFile
     // Reopening an existing conversation: the file already carries its own
     // header (cwd, parent) and history, so none of the create-time options
@@ -1041,14 +1278,100 @@ export async function runAgent(
       extNames,
       narrowing,
       readmitToolNames,
+      guard: toolScopeGuard,
     });
   }
 
   options.onSessionCreated?.(session);
 
-  // Track turns for graceful max_turns enforcement
-  let turnCount = 0;
+  // Build the effective prompt: optionally prepend parent context
+  let effectivePrompt = prompt;
+  if (options.inheritContext) {
+    const parentContext = buildParentContext(ctx);
+    if (parentContext) {
+      effectivePrompt = parentContext + prompt;
+    }
+  }
+
+  let structuredRetried = false;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  const run = await driveSession(session, effectivePrompt, {
+    maxTurns,
+    signal: options.signal,
+    onTurnEnd: options.onTurnEnd,
+    onTextDelta: options.onTextDelta,
+    onToolActivity: options.onToolActivity,
+    onAssistantUsage: options.onAssistantUsage,
+    onCompaction: options.onCompaction,
+    // One more prompt when a schema was asked for and nothing usable came back
+    // — the model answered in prose, or only ever called the tool invalidly.
+    // Sent inside driveSession, so the turn tracking, the text collector and
+    // above all the abort forwarding are still live: torn down first, a retry
+    // would be unkillable.
+    followUp: () => {
+      if (structuredCapture === undefined || structuredCapture.json !== undefined) return undefined;
+      structuredRetried = true;
+      return structuredRetryPrompt(structuredCapture);
+    },
+  });
+
+  // A child asked for structured output that never gave any has failed, however
+  // articulate its prose was. Reported through `failure` so it travels the same
+  // path as a provider error rather than arriving as a successful empty answer.
+  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
+    ? structuredCapture.lastError !== undefined
+      ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
+      : "The agent did not report its answer through StructuredOutput."
+    : undefined;
+  return {
+    responseText: run.responseText,
+    session,
+    aborted: run.aborted,
+    steered: run.steered,
+    failure: run.failure ?? structuredFailure,
+    maxTurns,
+    ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
+    ...(structuredRetried ? { structuredRetried } : {}),
+  };
+}
+
+/** Callbacks and limits for one run of prompts on a session (first run or resume). */
+export interface DriveOptions {
+  /** Turn limit for this run. undefined = unlimited. */
+  maxTurns?: number;
+  signal?: AbortSignal;
+  onTurnEnd?: (turnCount: number) => void;
+  onTextDelta?: (delta: string, fullText: string) => void;
+  onToolActivity?: (activity: ToolActivity) => void;
+  onAssistantUsage?: (usage: LifetimeUsage) => void;
+  onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /**
+   * An extra prompt to send once the main prompt (and any stuck-tool recovery)
+   * has finished, unless the run was aborted. Returns undefined for none.
+   */
+  followUp?: () => string | undefined;
+}
+
+export interface DriveResult {
+  responseText: string;
+  /** Hard-aborted: max_turns + grace turns exceeded, or stuck tools past the recovery limit. */
+  aborted: boolean;
+  /** Steered to wrap up at the soft turn limit. */
+  steered: boolean;
+  failure?: string;
+}
+
+/**
+ * Send a prompt to a session and enforce the run's limits: the soft turn limit
+ * (steer), the grace turns (hard abort), the per-tool timeout and its watchdog
+ * recovery. Shared by a first run and a resume, so a resumed agent is bounded
+ * exactly like a fresh one. The turn count starts at zero for every run.
+ */
+export async function driveSession(session: AgentSession, prompt: string, options: DriveOptions): Promise<DriveResult> {
+  const toolTimeouts = installToolTimeouts(session);
+
+  let turnCount = 0;
+  const maxTurns = options.maxTurns;
   let softLimitReached = false;
   let aborted = false;
 
@@ -1098,110 +1421,67 @@ export async function runAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  // Build the effective prompt: optionally prepend parent context
-  let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
-  }
-
   // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
+  // on counts as this run's output. A resumed session already holds prior
+  // turns, and a failed resume must not surface the previous answer (#144).
   const startLen = session.messages.length;
-  let structuredRetried = false;
+  // One prompt, raced against the watchdog's escalation. False when the run is
+  // stuck in a tool that ignored the abort: the prompt is left behind (its
+  // eventual settle is swallowed) and the run ends here as aborted.
+  const send = async (text: string): Promise<boolean> => {
+    const sent = session.prompt(text);
+    const outcome = await Promise.race([sent.then(() => "done" as const), toolTimeouts.stuck.then(() => "stuck" as const)]);
+    if (outcome === "done") return true;
+    sent.catch(() => {});
+    aborted = true;
+    return false;
+  };
   try {
-    await session.prompt(effectivePrompt);
-
-    // One more prompt when a schema was asked for and nothing usable came back
-    // — the model answered in prose, or only ever called the tool invalidly.
-    // Inside this `try`, so the turn tracking, the text collector and above all
-    // the abort forwarding are still live: torn down first, a retry would be
-    // unkillable.
-    if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
-      structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+    // Stopped before the session was ready: nothing was asked yet, so ask
+    // nothing — prompting now would run the whole task for nobody.
+    if (options.signal?.aborted) {
+      return { responseText: "", aborted: true, steered: false };
+    }
+    let live = await send(prompt);
+    for (let recoveries = 0; live; recoveries++) {
+      const hung = toolTimeouts.takeHung();
+      if (!hung) break;
+      if (aborted || options.signal?.aborted || recoveries >= MAX_TOOL_RECOVERIES) {
+        aborted = true;
+        break;
+      }
+      live = await send(hungToolPrompt(hung));
+    }
+    if (live && !aborted && options.signal?.aborted !== true) {
+      const followUp = options.followUp?.();
+      if (followUp !== undefined) await send(followUp);
     }
   } finally {
+    toolTimeouts.dispose();
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
   }
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  // A child asked for structured output that never gave any has failed, however
-  // articulate its prose was. Reported through `failure` so it travels the same
-  // path as a provider error rather than arriving as a successful empty answer.
-  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
-    ? structuredCapture.lastError !== undefined
-      ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
-      : "The agent did not report its answer through StructuredOutput."
-    : undefined;
   return {
-    responseText,
-    session,
+    responseText: collector.getText().trim() || getLastAssistantText(session, startLen),
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
-    ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
-    ...(structuredRetried ? { structuredRetried } : {}),
+    failure: finalTurnError(session, startLen),
   };
 }
 
 /**
- * Send a new prompt to an existing session (resume).
+ * Send a new prompt to an existing session (resume). Runs under the same turn
+ * limit, grace turns and tool watchdog as a first run (see `driveSession`).
  */
 export async function resumeAgent(
   session: AgentSession,
   prompt: string,
-  options: {
-    onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: LifetimeUsage) => void;
-    onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
-    signal?: AbortSignal;
-  } = {},
-): Promise<{ text: string; failure?: string }> {
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
-  const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
-
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
-        }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-        }
-      })
-    : () => {};
-
-  try {
-    await session.prompt(prompt);
-  } finally {
-    collector.unsubscribe();
-    unsubEvents();
-    cleanupAbort();
-  }
-
-  return {
-    text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
-  };
+  options: DriveOptions = {},
+): Promise<{ text: string; failure?: string; aborted?: boolean; steered?: boolean }> {
+  const run = await driveSession(session, prompt, options);
+  return { text: run.responseText, failure: run.failure, aborted: run.aborted, steered: run.steered };
 }
 
 /**
