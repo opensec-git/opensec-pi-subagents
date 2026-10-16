@@ -169,6 +169,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
   /**
+   * Runtime agent id → a stop for a child whose id the manager has not issued
+   * yet (it is still creating its worktree). Folded into the spawn's signal, so
+   * a skip or retry in that window stops the child instead of being lost.
+   */
+  const startupStops = new Map<string, AbortController>();
+  /**
    * scopeModels warnings already toasted, so a fan-out that pins one
    * out-of-scope agent file raises one notification rather than one per child.
    * Kept for the whole run: the same message is the same warning at agent 200
@@ -257,7 +263,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // The session's signal stops the child on a kill or shutdown; the run's
       // stops it when the run ends any other way, including while it is still
       // creating its worktree, before `abortAgent` can know its id.
-      const signal = eitherSignal(deps.signal, request.signal);
+      const startupStop = new AbortController();
+      startupStops.set(request.agentId, startupStop);
+      const signal = eitherSignal(eitherSignal(deps.signal, request.signal), startupStop.signal);
 
       /**
        * Hand the child's EFFECTIVE configuration back to the run.
@@ -363,14 +371,21 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         // never ran. That is this agent's failure, not the run's: the script
         // sees `null` and its siblings carry on.
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        if (startupStops.get(request.agentId) === startupStop) startupStops.delete(request.agentId);
       }
     },
 
     abortAgent(agentId) {
       const id = records.get(agentId);
-      // Nothing to abort before the manager has issued an id — the child is
-      // still in startup, and the run's own signal reaches it there.
-      if (id !== undefined) manager.abort(id);
+      if (id !== undefined) {
+        manager.abort(id);
+        return;
+      }
+      // No id yet — the child is still in startup (creating its worktree). Its
+      // spawn's signal reaches it there, and the manager settles it as stopped,
+      // which the script sees as skipped (and a retry re-runs).
+      startupStops.get(agentId)?.abort();
     },
 
     async resumeAgent(agentId, prompt, onResolved) {

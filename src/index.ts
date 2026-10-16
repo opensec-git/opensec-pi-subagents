@@ -877,7 +877,9 @@ export default function (pi: ExtensionAPI) {
             // to consume, and its notification is still the caller's only
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
+            // Includes a stopped agent still winding down: its partial result
+            // has not landed yet.
+            if (manager.isRunActive(record.id)) return false;
             record.resultConsumed = true;
             cancelNudge(record.id);
             return true;
@@ -2944,7 +2946,11 @@ Terse command-style prompts produce shallow, generic work.
       // them), so wait on the queue's start gate (resolved on every way out of
       // the queue) until they leave it, then await like a running one. Polling
       // is the fallback for a queued record without a gate.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
+      // A stopped agent still winding down (committing its worktree, or a tool
+      // ignoring the stop) is waited for too: its partial result lands when it
+      // settles, and reading "stopped" as "over" would report "No output." and
+      // consume the notification that would have carried it.
+      if (params.wait && manager.isRunActive(record.id)) {
         while (record.status === "queued") {
           await abortable(
             record.startGate ?? new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
@@ -2976,8 +2982,11 @@ Terse command-style prompts produce shallow, generic work.
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
 
+      const active = manager.isRunActive(record.id);
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
+      } else if (record.status === "stopped" && active) {
+        output += "Agent was stopped and is still winding down. Use wait: true or check back later.";
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -2985,9 +2994,9 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
+      if (!active) {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelNudge(record.id);
       }
 
       // Verbose: include full conversation

@@ -137,7 +137,11 @@ describe("createWorkflowHost — spawn mapping", () => {
 
     const options = stub.spawnAndWait.mock.calls[0][4];
     expect(options.isolation).toBe("worktree");
-    expect(options.signal).toBe(controller.signal);
+    // Composed with a per-child stop (for a skip during worktree creation), so
+    // not the same object — but it follows the run's signal.
+    expect(options.signal.aborted).toBe(false);
+    controller.abort();
+    expect(options.signal.aborted).toBe(true);
     expect(options.rootSessionId).toBe("root-1");
   });
 
