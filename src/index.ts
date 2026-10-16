@@ -1562,7 +1562,11 @@ export default function (pi: ExtensionAPI) {
     // the agents it owns. Foreground agents (Pi aborted their tool call before
     // this), workflows and agents of a session kept in memory stop as before.
     const { reason, targetSessionFile } = (event ?? {}) as { reason?: unknown; targetSessionFile?: string };
-    const kept = new Set(isSessionSwitch(reason)
+    // The next instance finds the parked manager by the session it starts, so
+    // a switch must name it (Pi 1.0 does; `/reload` keeps this one).
+    const switching = isSessionSwitch(reason)
+      && (reason === "reload" ? currentSession !== undefined : typeof targetSessionFile === "string");
+    const kept = new Set(switching
       ? live.filter(r => isTopLevelAgent(r) && r.isBackground !== false && isSessionOnDisk(r.ownerSession)).map(r => r.id)
       : []);
     const rootOf = (record: AgentRecord): string => {
@@ -1577,7 +1581,7 @@ export default function (pi: ExtensionAPI) {
     const interrupted = live.filter(r => !kept.has(rootOf(r)));
     // Also worth keeping: another session's agents that finished while this
     // one was open, so their session shows them in full when it is reopened.
-    const carried = isSessionSwitch(reason) && manager.listAllAgents().some(r =>
+    const carried = switching && manager.listAllAgents().some(r =>
       isTopLevelAgent(r) && !ownedHere(r) && !r.resultConsumed && !manager.isRunActive(r.id) && isSessionOnDisk(r.ownerSession));
     const parking = kept.size > 0 || carried;
     if (kept.size > 0) {

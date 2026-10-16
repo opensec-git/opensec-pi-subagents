@@ -170,6 +170,17 @@ describe("background agents at a session switch", () => {
     expect((globalThis as any)[HANDOFF_KEY]).toBeUndefined();
   });
 
+  it("stop, as before, when the switch does not name the session it goes to (Pi < 1.0)", async () => {
+    const file = sessionFile();
+    const first = await boot(file);
+    const id = await spawnBackground(first);
+
+    await shutDown(first, { reason: "new" });
+
+    expect(appended(first.pi, id).at(-1)?.[1]).toMatchObject({ id, status: "stopped" });
+    expect((globalThis as any)[HANDOFF_KEY]).toBeUndefined();
+  });
+
   it("are stopped by the parking version's own code when another version starts the session", async () => {
     const fileA = sessionFile();
     const fileB = sessionFile();
