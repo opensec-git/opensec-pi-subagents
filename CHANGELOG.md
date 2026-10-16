@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Subagents run on your model and thinking level.** By default every subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent` tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. Per-call choices are ignored, and the `Agent` and nested tools no longer offer `model` or `thinking`, so the main model cannot pick cheaper models or lower effort on its own. An agent file's `model:` or `thinking:` still applies, and a resumed agent keeps what it ran with. The new `allowModelOverride` setting (`subagents.json` or `/agents → Settings → Model override`) restores the per-call overrides and the tool parameters.
+
+### Added
+
+- **Background agents keep running across a session switch.** `/new`, `/resume`, `/fork` and `/reload` no longer stop them when their session is saved: the next session takes over the running agents. An agent belongs to the session that started it: other sessions do not list or address it, and a result that lands while another session is open is written into its own session and delivered as the usual notification when you return there. Quitting still stops every agent and saves worktrees.
+
+### Fixed
+
+- **Nested agents and workflow children stay resumable after a restart**, `/resume`, `/fork` or `/reload`: their resume state is recorded in the parent session (`subagents:resume` entries), so a nested agent can be resumed by its owner and a workflow child with `agent({ resume })`. `resumeFromRunId` finds a run of the same session after a restart, and a child replayed from the journal can still be continued: the journal records which agent produced each answer.
+
 ## [0.20.2] - 2026-10-16
 
 ### Changed
