@@ -11,6 +11,7 @@ import {
   pruneMergedAgentBranches,
   pruneWorktrees,
   recoverLeftoverWorktrees,
+  restoreWorktree,
   setWorktreeIsolationEnabled,
 } from "../src/worktree.js";
 
@@ -671,6 +672,19 @@ describe("leftover agent worktrees", () => {
     const result = await cleanupWorktree(pi, repoDir, wt, "keeps");
     expect(result.kept).toBe(true);
     expect(lockOf(wt.path)).toBeUndefined();
+    rmSync(wt.path, { recursive: true, force: true });
+  });
+
+  it("locks a kept worktree again when an agent resumes in it", async () => {
+    const wt = (await createWorktree(pi, repoDir, "lock-2"))!;
+    writeFileSync(join(wt.path, ".gitignore"), "*.log\n");
+    writeFileSync(join(wt.path, "kept.log"), "ignored output\n");
+    const prior = await cleanupWorktree(pi, repoDir, wt, "keeps");
+    expect(lockOf(wt.path)).toBeUndefined();
+
+    expect(await restoreWorktree(pi, repoDir, wt, prior)).toBeUndefined();
+    expect(lockOf(wt.path)).toBe(`locked pi-agent pid ${process.pid}`);
+    git(repoDir, "worktree", "unlock", wt.path);
     rmSync(wt.path, { recursive: true, force: true });
   });
 

@@ -406,6 +406,8 @@ export async function restoreWorktree(
   if (existsSync(worktree.path)) {
     try {
       await git(pi, worktree.path, ["rev-parse", "--is-inside-work-tree"], 5000);
+      // Kept by an earlier cleanup, so unlocked: in use again from here.
+      await lockWorktree(pi, worktree.path);
       return undefined;
     } catch {
       return `its worktree path \`${worktree.path}\` exists but is not a git work tree`;
