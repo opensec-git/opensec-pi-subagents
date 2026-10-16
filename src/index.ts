@@ -106,7 +106,7 @@ function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
  * Create an AgentActivity state and spawn callbacks for tracking tool usage.
  * Used by both foreground and background paths to avoid duplication.
  */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
+function createActivityTracker(maxTurns?: number) {
   const state: AgentActivity = {
     activeTools: new Map(),
     toolUses: 0,
@@ -126,24 +126,20 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
         }
         state.toolUses++;
       }
-      onStreamUpdate?.();
     },
     onTextDelta: (_delta: string, fullText: string) => {
       state.responseText = fullText;
-      onStreamUpdate?.();
     },
     onTurnEnd: (turnCount: number) => {
       state.turnCount = turnCount;
-      onStreamUpdate?.();
     },
     onSessionCreated: (session: any) => {
       state.session = session;
     },
     // Spend is accumulated on the AgentRecord (agent-manager), which is what
-    // every surface reads; this callback exists here only to repaint on it.
-    onAssistantUsage: (_usage: LifetimeUsage) => {
-      onStreamUpdate?.();
-    },
+    // every surface reads. Surfaces pick changes up on their next frame (the
+    // widget tick, the foreground spinner) rather than one push per event.
+    onAssistantUsage: (_usage: LifetimeUsage) => {},
   };
 
   return { state, callbacks };
@@ -2234,7 +2230,9 @@ Terse command-style prompts produce shallow, generic work.
         });
       };
 
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
+      // No per-event push: the spinner frame below sends the latest state, so
+      // a token-rate stream costs one update per frame, not one per token.
+      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
       // Wire session creation: register in widget + stream to output file.
       // The output file path is set synchronously after spawn (below),
@@ -2268,11 +2266,13 @@ Terse command-style prompts produce shallow, generic work.
         }
       };
 
-      // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
-      const spinnerInterval = setInterval(() => {
+      // Animate spinner at ~80ms (smooth rotation through 10 braille frames),
+      // on the clock the widget and fleet list share, so their redraws coincide.
+      const spinnerOwner = {};
+      refreshTicker.set(spinnerOwner, 80, () => {
         spinnerFrame++;
         streamUpdate();
-      }, 80);
+      });
 
       streamUpdate();
 
@@ -2306,7 +2306,7 @@ Terse command-style prompts produce shallow, generic work.
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
-        clearInterval(spinnerInterval);
+        refreshTicker.delete(spinnerOwner);
         if (fgId) {
           agentActivity.delete(fgId);
           widget.markFinished(fgId);

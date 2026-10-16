@@ -215,11 +215,37 @@ export function buildInvocationTags(
   };
 }
 
-/** Truncate text to a single line, max `len` chars. */
-function truncateLine(text: string, len = 60): string {
+/** The first non-blank line of `text`, trimmed, cut to `len` chars with "…". Reads the whole text. */
+function truncateLineSlow(text: string, len: number): string {
   const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
   if (line.length <= len) return line;
   return line.slice(0, len) + "…";
+}
+
+const FIRST_NON_SPACE = /\S/g;
+
+/**
+ * Truncate text to a single line, max `len` chars — {@link truncateLineSlow}'s
+ * result, reading only about `len` characters past the first non-blank one.
+ *
+ * It runs on the whole response streamed so far, every frame, so splitting
+ * the text made the total cost quadratic in the response length.
+ */
+export function truncateLine(text: string, len = 60): string {
+  // The first non-whitespace character starts the first non-blank line:
+  // everything before it, newlines included, is whitespace.
+  FIRST_NON_SPACE.lastIndex = 0;
+  const first = FIRST_NON_SPACE.exec(text);
+  if (!first) return "";
+  const window = text.slice(first.index, first.index + len + 1);
+  const newline = window.indexOf("\n");
+  if (newline >= 0) return window.slice(0, newline).trim(); // the line ends within len chars
+  if (window.length <= len) return window.trim(); // the text ends within len chars
+  // The line runs past len. If char len+1 is not whitespace the trimmed line
+  // is longer than len, so the cut is the first len chars. Otherwise trailing
+  // whitespace may follow: rare, so take the exact path.
+  if (/\S/.test(window[len])) return window.slice(0, len) + "…";
+  return truncateLineSlow(text, len);
 }
 
 /** Build a human-readable activity string from currently-running tools or response text. */
