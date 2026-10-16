@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-16
+
 ### Fixed
 
 - **Resume.** A finished, stopped or failed agent stays resumable by the model as long as its session file exists, not 10 minutes: the Agent tool, `@handle`, nested and workflow `agent({resume})` reopen it from the file under the same id, with its own model, thinking level, working directory, worktree and `isolated` setting. Agents are rebuilt after a restart, `/resume`, `/fork` or `/reload`. A worktree agent resumes in its worktree, recreated from its branch. `max_turns`, grace turns and the tool watchdog apply to resumed runs. Foreground results give the model the agent id. A resume waits for a stopped run to finish.
