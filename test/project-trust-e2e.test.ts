@@ -1,0 +1,98 @@
+/**
+ * Subagents follow the parent session's project trust.
+ *
+ * Pi keeps a folder's `.pi/extensions` and `.pi/settings.json` off until the
+ * user trusts it. A subagent builds its own resource loader and settings
+ * manager, so it has to be handed that decision; left to their defaults, both
+ * assume trust. Faux model, throwaway folders, no network.
+ */
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxToolCall } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it } from "vitest";
+import { agentCall, type FauxResponder, runPrintMode } from "./helpers/print-mode-runner.js";
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function project(): string {
+  const cwd = mkdtempSync(join(tmpdir(), "trust-e2e-"));
+  dirs.push(cwd);
+  return cwd;
+}
+
+/** A project extension that logs when it loads and registers `probe_tool`. */
+function addProjectExtension(cwd: string): string {
+  const marker = join(cwd, "EXT_LOADED.log");
+  mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".pi", "extensions", "probe.ts"),
+    `import { appendFileSync } from "node:fs";
+export default function (pi: any) {
+  appendFileSync(${JSON.stringify(marker)}, "loaded\\n");
+  pi.registerTool({ name: "probe_tool", label: "probe", description: "probe", parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "probe ran" }] }; } });
+}
+`,
+  );
+  return marker;
+}
+
+const isParent = (tools: Array<{ name: string }> | undefined) => (tools ?? []).some((t) => t.name === "Agent");
+const hasToolResult = (messages: Array<{ role: string }>) => messages.some((m) => m.role === "toolResult");
+
+describe("subagents and project trust", () => {
+  for (const trusted of [false, true]) {
+    it(`a child loads the project's .pi/extensions only when the parent trusts the project (trusted: ${trusted})`, async () => {
+      const cwd = project();
+      const marker = addProjectExtension(cwd);
+      let childTools: string[] | undefined;
+      const respond: FauxResponder = (context) => {
+        if (isParent(context.tools)) {
+          return hasToolResult(context.messages)
+            ? "parent done"
+            : agentCall({ prompt: "look around", description: "trust probe", run_in_background: false });
+        }
+        childTools ??= (context.tools ?? []).map((t) => t.name);
+        return "child done";
+      };
+
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      await run.dispose();
+
+      expect(childTools).toBeDefined();
+      if (trusted) {
+        expect(childTools).toContain("probe_tool");
+      } else {
+        expect(childTools).not.toContain("probe_tool");
+        // Neither the parent nor the child ran the extension's code.
+        expect(existsSync(marker)).toBe(false);
+      }
+    }, 60_000);
+
+    it(`an isolated child applies the project's shellCommandPrefix only when trusted (trusted: ${trusted})`, async () => {
+      const cwd = project();
+      const marker = join(cwd, "PREFIX_RAN");
+      mkdirSync(join(cwd, ".pi"), { recursive: true });
+      writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ shellCommandPrefix: `echo ran >> '${marker}'` }));
+      const respond: FauxResponder = (context) => {
+        if (isParent(context.tools)) {
+          return hasToolResult(context.messages)
+            ? "parent done"
+            : agentCall({ prompt: "run it", description: "prefix probe", isolated: true, run_in_background: false });
+        }
+        return hasToolResult(context.messages) ? "child done" : fauxToolCall("bash", { command: "echo child" });
+      };
+
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      await run.dispose();
+
+      const ran = existsSync(marker) ? readFileSync(marker, "utf-8").trim().split("\n").length : 0;
+      expect(ran).toBe(trusted ? 1 : 0);
+    }, 60_000);
+  }
+});

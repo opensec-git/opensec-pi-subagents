@@ -254,7 +254,7 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
-    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir", { projectTrusted: true });
     // Same claim as before `rememberAgents` flipped the default — the effective
     // cwd reaches the session manager — now via the persistent constructor.
     expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp/worktree", undefined, expect.anything());
@@ -262,6 +262,18 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
+  });
+
+  it("hands the parent's project trust to the child's settings, loader and session", async () => {
+    const { session } = createSession("UNTRUSTED");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, isProjectTrusted: () => false }, "Explore", "Say UNTRUSTED", { pi });
+
+    expect(settingsManagerCreate).toHaveBeenCalledWith(expect.any(String), "/mock/agent-dir", { projectTrusted: false });
+    const settingsManager = settingsManagerCreate.mock.results[0].value;
+    expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
   });
 
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {

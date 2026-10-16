@@ -24,6 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { isProjectTrustedBy } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -922,9 +923,15 @@ export async function runAgent(
   // Only with extensions loaded: under `noExtensions` the static allowlist
   // already gates the registry itself (see installExtensionToolScope).
   const toolScopeGuard = noExtensions ? undefined : createToolScopeGuard();
+  // The parent's trust decision, not a fresh default of "trusted": a child must
+  // not load the project extensions, settings (`shellCommandPrefix`, packages)
+  // or skills its parent refused. One manager, shared by the loader and the
+  // session, so both read the project through the same decision.
+  const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted: isProjectTrustedBy(ctx) });
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
+    settingsManager,
     noExtensions,
     additionalExtensionPaths,
     extensionFactories: toolScopeGuard ? [toolScopeGuard.extension] : undefined,
@@ -1135,7 +1142,6 @@ export async function runAgent(
     sessionExcludeTools = [...denyTools];
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,

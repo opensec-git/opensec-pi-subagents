@@ -150,6 +150,13 @@ export interface RunPrintModeOptions {
    * which is worse than not running them: it hides a real regression in noise.
    */
   live?: { provider: string; model: string } | false;
+  /**
+   * The parent session's project trust, as Pi would have decided it. Set, the
+   * parent's loader and session share one settings manager carrying it, so
+   * `ctx.isProjectTrusted()` answers this. Omitted keeps the old setup, where
+   * the loader builds its own (trusted) manager.
+   */
+  projectTrusted?: boolean;
 }
 
 export interface PrintModeRun {
@@ -357,9 +364,17 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   // --- build the parent host session with the extension loaded ---
   // Resolved after globals are isolated, so it honors the hermetic dir.
   const agentDir = getAgentDir();
+  // Live: real settings so an omitted model resolves to your local default
+  // (settingsManager.getDefaultModel) and retries/compaction match your config.
+  // Faux: in-memory, deterministic, no disk.
+  const trust = options.projectTrusted === undefined ? undefined : { projectTrusted: options.projectTrusted };
+  const settingsManager = live
+    ? SettingsManager.create(cwd, agentDir, trust)
+    : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }, trust);
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
+    ...(trust ? { settingsManager } : {}),
     additionalExtensionPaths: [EXTENSION_PATH],
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
@@ -382,12 +397,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(cwd),
-    // Live: real settings so an omitted model resolves to your local default
-    // (settingsManager.getDefaultModel) and retries/compaction match your config.
-    // Faux: in-memory, deterministic, no disk.
-    settingsManager: live
-      ? SettingsManager.create(cwd, agentDir)
-      : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+    settingsManager,
   });
   session.setSessionName("print-mode-host");
 
