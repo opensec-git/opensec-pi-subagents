@@ -259,6 +259,16 @@ export class AgentWidget {
   private finishedTurnAge = new Map<string, number>();
   /** How many extra turns errors/aborted agents linger (completed agents clear after 1 turn). */
   private static readonly ERROR_LINGER_TURNS = 2;
+  /**
+   * How long a finished row lingers when the parent makes no tool call. Turns
+   * only advance on the parent's tool calls, so without this a completion the
+   * model answers in plain text stays on screen until some later tool call.
+   * Errors linger twice as long, mirroring the turn rule.
+   */
+  private static readonly FINISHED_LINGER_MS = 30_000;
+  private static readonly ERROR_LINGER_MS = 60_000;
+  /** One-shot timer that re-runs update() when the next finished row expires. */
+  private expiryTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Whether the widget callback is currently registered with the TUI. */
   private widgetRegistered = false;
@@ -344,11 +354,20 @@ export class AgentWidget {
     }
   }
 
+  /** When a finished agent's row expires by time. */
+  private static finishedExpiry(status: string, completedAt: number): number {
+    return completedAt + (ERROR_STATUSES.has(status) ? AgentWidget.ERROR_LINGER_MS : AgentWidget.FINISHED_LINGER_MS);
+  }
+
   /** Check if a finished agent should still be shown in the widget. */
-  private shouldShowFinished(agentId: string, status: string): boolean {
+  private shouldShowFinished(agentId: string, status: string, completedAt: number): boolean {
     const age = this.finishedTurnAge.get(agentId) ?? 0;
     const maxAge = ERROR_STATUSES.has(status) ? AgentWidget.ERROR_LINGER_TURNS : 1;
-    return age < maxAge;
+    return age < maxAge && Date.now() < AgentWidget.finishedExpiry(status, completedAt);
+  }
+
+  private clearExpiryTimer(): void {
+    if (this.expiryTimer) { clearTimeout(this.expiryTimer); this.expiryTimer = undefined; }
   }
 
   /** Record an agent as finished (call when agent completes). */
@@ -420,7 +439,7 @@ export class AgentWidget {
     const queued = allAgents.filter(a => a.status === "queued");
     const finished = allAgents.filter(a =>
       a.status !== "running" && a.status !== "queued" && a.completedAt
-      && this.shouldShowFinished(a.id, a.status),
+      && this.shouldShowFinished(a.id, a.status, a.completedAt),
     );
 
     const hasActive = running.length > 0 || queued.length > 0;
@@ -580,12 +599,30 @@ export class AgentWidget {
     let runningCount = 0;
     let queuedCount = 0;
     let hasFinished = false;
+    let nextExpiry = Infinity;
     for (const a of allAgents) {
       if (a.status === "running") { runningCount++; }
       else if (a.status === "queued") { queuedCount++; }
-      else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
+      else if (a.completedAt && this.shouldShowFinished(a.id, a.status, a.completedAt)) {
+        hasFinished = true;
+        nextExpiry = Math.min(nextExpiry, AgentWidget.finishedExpiry(a.status, a.completedAt));
+      }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+
+    // The 80 ms tick exists for the spinner and the running clocks. Finished
+    // rows are static, so with nothing running or queued the timer stops and
+    // the only scheduled work is dropping the next row when it expires.
+    this.clearExpiryTimer();
+    if (hasActive) {
+      this.ensureTimer();
+    } else {
+      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
+      if (hasFinished) {
+        this.expiryTimer = setTimeout(() => { this.expiryTimer = undefined; this.update(); }, Math.max(0, nextExpiry - Date.now()));
+        this.expiryTimer.unref?.();
+      }
+    }
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {
@@ -598,7 +635,6 @@ export class AgentWidget {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
       }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
       // Clean up stale entries
       for (const [id] of this.finishedTurnAge) {
         if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
@@ -648,6 +684,7 @@ export class AgentWidget {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
+    this.clearExpiryTimer();
     if (this.uiCtx) {
       this.uiCtx.setWidget("agents", undefined);
       this.uiCtx.setStatus("subagents", undefined);
