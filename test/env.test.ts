@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { detectEnv } from "../src/env.js";
 
 /** Minimal mock of pi.exec() that shells out via child_process. */
@@ -56,6 +56,44 @@ describe("detectEnv", () => {
       expect(env.platform).toBe(process.platform);
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("detectEnv cache", () => {
+  function countingPi() {
+    const calls: string[] = [];
+    const pi = {
+      exec: async (_cmd: string, args: string[]) => {
+        calls.push(args.join(" "));
+        return args[0] === "rev-parse"
+          ? { stdout: "true\n", stderr: "", code: 0, killed: false }
+          : { stdout: "main\n", stderr: "", code: 0, killed: false };
+      },
+    } as unknown as ExtensionAPI;
+    return { pi, calls };
+  }
+
+  it("runs git once for concurrent and back-to-back spawns in one cwd", async () => {
+    const { pi, calls } = countingPi();
+    const envs = await Promise.all(Array.from({ length: 8 }, () => detectEnv(pi, "/repo")));
+    await detectEnv(pi, "/repo");
+    expect(calls).toEqual(["rev-parse --is-inside-work-tree", "branch --show-current"]);
+    for (const env of envs) expect(env).toEqual({ isGitRepo: true, branch: "main", platform: process.platform });
+  });
+
+  it("detects separately per cwd, and again once the entry is stale", async () => {
+    vi.useFakeTimers();
+    try {
+      const { pi, calls } = countingPi();
+      await detectEnv(pi, "/repo");
+      await detectEnv(pi, "/repo/worktree");
+      expect(calls).toHaveLength(4);
+      vi.advanceTimersByTime(10_000);
+      await detectEnv(pi, "/repo");
+      expect(calls).toHaveLength(6);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });
