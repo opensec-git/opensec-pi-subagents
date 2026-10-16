@@ -118,17 +118,20 @@ const DEFAULT_MAX_CONCURRENT = 10;
 const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 
 /**
- * How many evicted agents stay addressable by name. Only a bound on memory —
- * a session that spawns hundreds of agents shouldn't retain every one — and
- * far above the handful anyone keeps in their head.
+ * How many evicted agents stay addressable — by name, by resume, and by
+ * get_subagent_result, which reads a released agent's result from its saved
+ * session. Only a bound on memory: an entry is a few hundred bytes of ids and
+ * paths (about 450 B, 700 B with a worktree), never the conversation, so 2000
+ * cost about 1 MB. High because a session that spawns hundreds of agents
+ * should still be able to read the result of any of them.
  */
-const MAX_TOMBSTONES = 100;
+const MAX_TOMBSTONES = 2000;
 
 /**
  * The same bound for owned children — nested agents and workflow children —
  * counted apart, so a large workflow cannot push the session's own agents out.
  */
-const MAX_OWNED_TOMBSTONES = 200;
+const MAX_OWNED_TOMBSTONES = 4000;
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -659,6 +662,7 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
     description: record.description,
     sessionFile: record.sessionFile,
     completedAt: record.completedAt ?? Date.now(),
+    status: record.status,
     handle: record.handle,
     alias: record.alias,
     parentAgentId: record.parentAgentId,
@@ -2427,17 +2431,24 @@ export class AgentManager {
 
   private keepTombstone(state: AgentResumeState): void {
     this.tombstones.set(state.id, state);
-    // Bound the memory a long session can accumulate, per kind (top-level or
-    // owned). Oldest first, since the agent someone still wants to reach is the
-    // one they used most recently.
-    const topLevel = isTopLevelAgent(state);
-    const sameKind = [...this.tombstones.values()].filter(entry => isTopLevelAgent(entry) === topLevel);
-    let excess = sameKind.length - (topLevel ? MAX_TOMBSTONES : MAX_OWNED_TOMBSTONES);
-    if (excess <= 0) return;
-    sameKind.sort((a, b) => a.completedAt - b.completedAt);
-    for (const entry of sameKind) {
-      if (excess-- <= 0) break;
-      this.tombstones.delete(entry.id);
+    this.trimTombstones();
+  }
+
+  /**
+   * Bound the memory a long session can accumulate, per kind (top-level or
+   * owned). Oldest first, since the agent someone still wants to reach is the
+   * one they used most recently. One counting pass; the sort runs only for a
+   * kind that is over its cap.
+   */
+  private trimTombstones(): void {
+    let topLevel = 0;
+    for (const entry of this.tombstones.values()) if (isTopLevelAgent(entry)) topLevel++;
+    const owned = this.tombstones.size - topLevel;
+    for (const [kindIsTopLevel, excessCount] of [[true, topLevel - MAX_TOMBSTONES], [false, owned - MAX_OWNED_TOMBSTONES]] as const) {
+      if (excessCount <= 0) continue;
+      const sameKind = [...this.tombstones.values()].filter(entry => isTopLevelAgent(entry) === kindIsTopLevel);
+      sameKind.sort((a, b) => a.completedAt - b.completedAt);
+      for (const entry of sameKind.slice(0, excessCount)) this.tombstones.delete(entry.id);
     }
   }
 
@@ -2445,7 +2456,9 @@ export class AgentManager {
    * Make agents of an earlier activation (before a restart, `/resume`,
    * `/fork` or `/reload`) resumable again, from what was persisted in the
    * parent session. Later entries for the same id win. A live record keeps
-   * precedence: it is the newer state of the same agent.
+   * precedence: it is the newer state of the same agent. Trimmed once at the
+   * end rather than per entry, so a session with thousands of entries restores
+   * in one pass.
    */
   restoreTombstones(states: readonly AgentResumeState[]): void {
     for (const state of states) {
@@ -2453,8 +2466,9 @@ export class AgentManager {
       // In entry order, so a later entry for the same id (a later run) wins.
       const current = this.tombstones.get(state.id);
       if (current && current.completedAt > state.completedAt) continue;
-      this.keepTombstone(state);
+      this.tombstones.set(state.id, state);
     }
+    this.trimTombstones();
   }
 
   private cleanup() {

@@ -38,11 +38,12 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { readSavedResult } from "./session-file.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, runModelText, sessionFileLine } from "./status-note.js";
 import { AGENT_ARG_SHAPE, argumentRepair, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentResumeState, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -3701,6 +3702,45 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- get_subagent_result tool ----
 
+  /** A finished top-level agent of this session whose record was released, by id or handle. */
+  function evictedTopLevelAgent(ref: string): AgentResumeState | undefined {
+    const byId = manager.findTombstone(ref);
+    if (byId) return isTopLevelAgent(byId) ? byId : undefined;
+    const resolved = manager.resolveMention(ref);
+    return resolved?.kind === "tombstone" ? resolved.entry : undefined;
+  }
+
+  /**
+   * get_subagent_result for an agent whose record the 10-minute cleanup has
+   * released: status and model from its kept resume state, the result from
+   * its saved session file. Read on demand, so nothing is held in memory
+   * longer for it.
+   */
+  function savedAgentResult(entry: AgentResumeState) {
+    const saved = readSavedResult(entry.sessionFile);
+    if (typeof saved === "string") {
+      return errorResult(`Agent ${entry.id} finished and was released from memory, and its result cannot be read: ${saved}.`);
+    }
+    const status = entry.status ?? "unknown";
+    const model = entry.model ?? saved.model;
+    const thinking = entry.thinking ?? saved.thinking;
+    let output =
+      `Agent: ${entry.id}\n` +
+      `Type: ${getDisplayName(entry.type)} | Status: ${status}${getStatusNote(status)}\n` +
+      (model ? `Model: ${thinking ? `${model}, thinking: ${thinking}` : model}\n` : "") +
+      `Description: ${entry.description}\n` +
+      `(Read from the agent's saved session file, ${entry.sessionFile}: its in-memory record was released after it finished.)\n\n`;
+    if (status === "error") {
+      output += `Error: ${saved.error ?? "not recorded in the saved session"}`;
+      if (saved.text) output += `\n\nPartial output before the failure:\n${saved.text}`;
+    } else {
+      output += saved.text || "No output.";
+    }
+    // Its notification, if one is still pending, is answered by this read.
+    outbox.cancel(entry.id);
+    return textResult(output, undefined, isFailedStatus(status));
+  }
+
   registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
@@ -3729,6 +3769,12 @@ Terse command-style prompts produce shallow, generic work.
     prepareArguments: argumentRepair(RESULT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
+      if (!record) {
+        // Released from memory after it finished: its resume state is kept,
+        // and its saved session still holds the final result.
+        const evicted = evictedTopLevelAgent(params.agent_id);
+        if (evicted) return savedAgentResult(evicted);
+      }
       if (!record || !isTopLevelAgent(record)) {
         return errorResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }

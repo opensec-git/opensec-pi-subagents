@@ -143,6 +143,11 @@ export interface AgentResumeState {
   /** The agent's pi session file. A record without one is never kept. */
   sessionFile: string;
   completedAt: number;
+  /**
+   * How its last run ended, for get_subagent_result once the record is gone.
+   * Absent in entries written before it was kept.
+   */
+  status?: AgentRecord["status"];
   /** Top-level agents only. */
   handle?: string;
   alias?: string;

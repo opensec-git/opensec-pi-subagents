@@ -200,17 +200,17 @@ describe("owned children's resume state (nested agents, workflow children)", () 
   });
 
   it("keeps owned children and top-level agents under separate caps", () => {
-    const topLevel = Array.from({ length: 100 }, (_, i) => state({ id: `top-${i}`, handle: `explore-${i}`, completedAt: i }));
-    const owned = Array.from({ length: 250 }, (_, i) =>
-      state({ id: `wf-${i}`, handle: undefined, workflowId: "wf_1", completedAt: 1000 + i }));
+    const topLevel = Array.from({ length: 2000 }, (_, i) => state({ id: `top-${i}`, handle: `explore-${i}`, completedAt: i }));
+    const owned = Array.from({ length: 4050 }, (_, i) =>
+      state({ id: `wf-${i}`, handle: undefined, workflowId: "wf_1", completedAt: 10_000 + i }));
     manager.restoreTombstones([...topLevel, ...owned]);
     // A big workflow does not push the session's own agents out...
     expect(manager.findTombstone("top-0")).toBeDefined();
-    expect(manager.listTombstones()).toHaveLength(100);
+    expect(manager.listTombstones()).toHaveLength(2000);
     // ...and its own oldest children go first.
     expect(manager.findTombstone("wf-49")).toBeUndefined();
     expect(manager.findTombstone("wf-50")).toBeDefined();
-    expect(manager.findTombstone("wf-249")).toBeDefined();
+    expect(manager.findTombstone("wf-4049")).toBeDefined();
   });
 
   it("carries the thinking level the agent ran at", () => {
