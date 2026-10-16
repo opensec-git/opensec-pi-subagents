@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-10-16
+
+### Changed
+
+- **Every project is trusted again by default**, as before 0.20.1: subagents load a project's `.pi` extensions and settings, and the extension uses its agents, skills, workflows and `subagents.json`, whatever Pi decided for the folder. To follow Pi's project trust decision instead (0.20.1's behaviour), set `"projectTrust": "pi"` in the global `~/.pi/agent/subagents.json`.
+
 ## [0.20.1] - 2026-10-16
 
 ### Fixed

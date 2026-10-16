@@ -20,6 +20,13 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// These tests pin `projectTrust: "pi"` (follow Pi's trust decision); the default, "full", trusts every project.
+vi.mock("../src/settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/settings.js")>()),
+  globalProjectTrustMode: () => "pi",
+}));
+
 import type { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";

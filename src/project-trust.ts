@@ -4,8 +4,9 @@
  * Pi 1.x does not load a folder's `.pi` settings, extensions, skills or prompts
  * until the user trusts the folder. Subagents run in sessions this extension
  * builds itself, and this extension reads project files of its own (agents,
- * workflows, skills, `subagents.json`), so both have to follow the decision the
- * parent session made rather than assume trust.
+ * workflows, skills, `subagents.json`). By default (`projectTrust: "full"`) both
+ * trust every project, as before 0.20.1; with `projectTrust: "pi"` in the global
+ * subagents.json they follow the decision the parent session made.
  */
 
 import {
@@ -14,6 +15,16 @@ import {
   ProjectTrustStore,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { globalProjectTrustMode } from "./settings.js";
+
+/** Whether Pi's trust decision applies (`projectTrust: "pi"`); otherwise every project is trusted. */
+function followsPiTrust(): boolean {
+  try {
+    return globalProjectTrustMode() === "pi";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Whether the session behind `ctx` trusts its project.
@@ -23,6 +34,7 @@ import {
  * context that throws (a session already torn down) is treated as untrusted.
  */
 export function isProjectTrustedBy(ctx: { isProjectTrusted?: () => boolean } | undefined): boolean {
+  if (!followsPiTrust()) return true;
   if (typeof ctx?.isProjectTrusted !== "function") return true;
   try {
     return ctx.isProjectTrusted() === true;
@@ -49,6 +61,7 @@ function defaultTrustIsAlways(cwd: string): boolean {
  * reports otherwise.
  */
 export function predictProjectTrust(cwd: string): boolean {
+  if (!followsPiTrust()) return true;
   try {
     if (!hasTrustRequiringProjectResources(cwd)) return true;
     const saved = savedDecision(cwd);
@@ -71,6 +84,7 @@ export function predictProjectTrust(cwd: string): boolean {
  * folder as trusted (`/trust`).
  */
 export function isProjectCodeTrusted(trusted: boolean, cwd: string): boolean {
+  if (!followsPiTrust()) return true;
   if (!trusted) return false;
   try {
     return hasTrustRequiringProjectResources(cwd) || savedDecision(cwd) === true || defaultTrustIsAlways(cwd);
