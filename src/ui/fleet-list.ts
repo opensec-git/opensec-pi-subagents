@@ -162,6 +162,12 @@ export class FleetList {
   }
 
   /** Capture the UI context and (re)register the global input handler. */
+  /** Read agents from this manager from now on: one adopted across a session switch (session-handoff.ts). */
+  setManager(manager: AgentManager): void {
+    this.manager = manager;
+    this.update();
+  }
+
   setUICtx(ui: FleetUICtx): void {
     if (ui === this.ui) return;
     this.inputUnsub?.();

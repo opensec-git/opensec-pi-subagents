@@ -819,17 +819,32 @@ export async function runAgent(
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
+  // Everything this run needs from the parent's context, read before the first
+  // await: a background agent keeps running across a session switch, and Pi
+  // invalidates the old session's ctx then (every read throws). The values are
+  // the parent's as of the spawn — its current model and thinking level.
+  const parent = {
+    cwd: ctx.cwd,
+    projectTrusted: isProjectTrustedBy(ctx),
+    systemPrompt: ctx.getSystemPrompt(),
+    model: ctx.model,
+    modelRegistry: ctx.modelRegistry,
+    thinkingLevel: ctx.thinkingLevel,
+    sessionFile: ctx.sessionManager?.getSessionFile?.(),
+    conversation: options.inheritContext ? buildParentContext(ctx) : "",
+  };
+
   // Resolve working directory: worktree override > parent cwd
-  const effectiveCwd = options.cwd ?? ctx.cwd;
+  const effectiveCwd = options.cwd ?? parent.cwd;
   // Filesystem work happens in effectiveCwd; config discovery in configCwd.
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
-  const projectTrusted = isProjectTrustedBy(ctx);
+  const projectTrusted = parent.projectTrusted;
 
   // Get parent system prompt for append-mode agents
-  const parentSystemPrompt = ctx.getSystemPrompt();
+  const parentSystemPrompt = parent.systemPrompt;
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
@@ -1065,7 +1080,7 @@ export async function runAgent(
 
   // Resolve model: explicit option > config.model > parent model
   const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
+    parent.model, parent.modelRegistry, agentConfig?.model,
   );
 
   // Omitting this SDK option uses saved settings, not the live parent's effort.
@@ -1073,7 +1088,7 @@ export async function runAgent(
   // unless explicitly overridden: neither the parent's current level nor the
   // type's frontmatter (which may have changed since) replaces it.
   const thinkingLevel = options.thinkingLevel
-    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? ctx.thinkingLevel);
+    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? parent.thinkingLevel);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -1210,14 +1225,14 @@ export async function runAgent(
           // `persist_session: true` agent; now it runs for every spawn, so a
           // context without a session manager (a bare programmatic ctx) must
           // still persist rather than take the whole spawn down.
-          parentSession: ctx.sessionManager?.getSessionFile?.(),
+          parentSession: parent.sessionFile,
         })
       : SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
-  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
+  const parentModelRuntime = (parent.modelRegistry as unknown as { runtime?: unknown }).runtime;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
     modelRuntime?: unknown;
@@ -1226,7 +1241,7 @@ export async function runAgent(
     agentDir,
     sessionManager,
     settingsManager,
-    modelRegistry: ctx.modelRegistry,
+    modelRegistry: parent.modelRegistry,
     // `as never` is what keeps this assignable across the supported Pi range:
     // pre-0.80.8 the field exists only via the `modelRuntime?: unknown` shim
     // above, while newer Pi types it as `ModelRuntime` — a shape an opaque
@@ -1286,11 +1301,8 @@ export async function runAgent(
 
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
+  if (options.inheritContext && parent.conversation) {
+    effectivePrompt = parent.conversation + prompt;
   }
 
   let structuredRetried = false;

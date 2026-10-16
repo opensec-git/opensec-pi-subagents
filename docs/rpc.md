@@ -135,10 +135,10 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 
 | Member | Signature | Notes |
 |---|---|---|
-| `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
-| `hasRunning()` | `() => boolean` | |
+| `waitForAll()` | `() => Promise<void>` | Resolves when nothing of the open session is running. **All** of its agents, including ones you did not spawn — a shutdown barrier, not a join. Agents another session started, still running after a session switch, are not waited for |
+| `hasRunning()` | `() => boolean` | The open session's agents only, like `waitForAll()` |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
-| `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
+| `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking; an agent of another session (see [Switching sessions](../README.md#switching-sessions)) comes back `undefined` too |
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
 

@@ -23,6 +23,7 @@ import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { sessionFileProblem } from "./session-file.js";
+import { sessionFileOf, snapshotContext } from "./session-handoff.js";
 import type { AgentInvocation, AgentRecord, AgentResumeState, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -42,6 +43,50 @@ export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void
  */
 export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
+
+/** What the extension instance observes of the manager's agents. */
+export interface ManagerObservers {
+  onComplete?: OnAgentComplete;
+  onStart?: OnAgentStart;
+  onCompact?: OnAgentCompact;
+  onUsage?: OnAgentUsage;
+}
+
+/**
+ * The module functions the manager runs agents and worktrees with. Pi loads a
+ * fresh copy of this extension's modules for every session, and a manager kept
+ * across a session switch (session-handoff.ts) was built by an older copy: the
+ * adopting instance hands it its own, so new spawns see the current session's
+ * agent registry and settings. Runs already going keep the ones they started
+ * with. Unset, the manager uses its own module's imports.
+ */
+export interface ManagerServices {
+  runAgent: typeof runAgent;
+  resumeAgent: typeof resumeAgent;
+  createWorktree: typeof createWorktree;
+  cleanupWorktree: typeof cleanupWorktree;
+  restoreWorktree: typeof restoreWorktree;
+  isWorktreeIsolationEnabled: typeof isWorktreeIsolationEnabled;
+  pruneWorktrees: typeof pruneWorktrees;
+  sessionFileProblem: typeof sessionFileProblem;
+}
+
+/**
+ * This module's {@link ManagerServices}, for an instance adopting a manager
+ * built by another copy. Getters, so each import is read only when used.
+ */
+export function managerServices(): ManagerServices {
+  return {
+    get runAgent() { return runAgent; },
+    get resumeAgent() { return resumeAgent; },
+    get createWorktree() { return createWorktree; },
+    get cleanupWorktree() { return cleanupWorktree; },
+    get restoreWorktree() { return restoreWorktree; },
+    get isWorktreeIsolationEnabled() { return isWorktreeIsolationEnabled; },
+    get pruneWorktrees() { return pruneWorktrees; },
+    get sessionFileProblem() { return sessionFileProblem; },
+  };
+}
 
 /**
  * Default max concurrent background agents.
@@ -595,6 +640,9 @@ export function resumeStatesFromEntries(entries: readonly unknown[]): AgentResum
   return out;
 }
 
+/** The manager's own module functions, read lazily (see {@link managerServices}). */
+const DEFAULT_SERVICES = managerServices();
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -657,6 +705,20 @@ export class AgentManager {
   /** Pending releases, by record. */
   private releaseTimers = new Map<AgentRecord, ReturnType<typeof setTimeout>>();
   private sessionReleaseMs = DEFAULT_SESSION_RELEASE_MS;
+  /** Set by an instance that adopted this manager; see {@link ManagerServices}. */
+  private services?: ManagerServices;
+  /**
+   * The session whose agents the top-level surfaces show (`listAgents`,
+   * `resolveMention`, `hasRunning`, `waitForAll`). `null`: every agent — the
+   * default, and the only mode before a session has started.
+   */
+  private visibleOwner: string | undefined | null = null;
+  /**
+   * Arguments of spawns that have not reached `runAgent` yet (queued, or still
+   * creating their worktree), so a session switch can swap their context for a
+   * frozen copy before Pi invalidates it.
+   */
+  private pendingArgs = new Map<string, SpawnArgs>();
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -673,6 +735,47 @@ export class AgentManager {
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
+  }
+
+  /** Replace what the extension observes of this manager's agents (an adopting instance, or parking). */
+  setObservers(observers: ManagerObservers): void {
+    this.onComplete = observers.onComplete;
+    this.onStart = observers.onStart;
+    this.onCompact = observers.onCompact;
+    this.onUsage = observers.onUsage;
+  }
+
+  /** Run new work with these module functions; see {@link ManagerServices}. */
+  useServices(services: ManagerServices): void {
+    this.services = services;
+  }
+
+  private svc(): ManagerServices {
+    return this.services ?? DEFAULT_SERVICES;
+  }
+
+  /**
+   * Show only the agents of this session (its file; undefined for one in
+   * memory) on the top-level surfaces, or every agent with `null`. Agents of
+   * other sessions keep running and are reachable by id internally — their
+   * nested tools, the workflow host — just not listed or addressable here.
+   */
+  setVisibleOwner(owner: string | undefined | null): void {
+    this.visibleOwner = owner;
+  }
+
+  /** Whether the record belongs to the session the surfaces show. */
+  isVisible(record: Pick<AgentRecord, "ownerSession">): boolean {
+    return this.visibleOwner === null || record.ownerSession === this.visibleOwner;
+  }
+
+  /**
+   * Before a session switch: give every spawn that has not started its run yet
+   * a frozen copy of its context, since Pi invalidates the live one (every read
+   * throws) and the spawn reads it when it starts.
+   */
+  detachPendingContexts(): void {
+    for (const args of this.pendingArgs.values()) args.ctx = snapshotContext(args.ctx);
   }
 
   /** Update the max concurrent background agents limit. */
@@ -964,6 +1067,11 @@ export class AgentManager {
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
       isolated: options.isolated,
+      // An owned child belongs where its root does: its ctx is its parent
+      // agent's own session, not the user's.
+      ownerSession: options.parentAgentId !== undefined
+        ? this.agents.get(options.parentAgentId)?.ownerSession
+        : sessionFileOf(ctx),
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -974,6 +1082,7 @@ export class AgentManager {
     }
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    this.pendingArgs.set(id, args);
 
     const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
@@ -1041,9 +1150,10 @@ export class AgentManager {
    */
   private launch(id: string, record: AgentRecord, args: SpawnArgs, queuedPool: Pool | undefined): Promise<void> {
     const startup = this.startAgent(id, record, args).then(
-      () => { this.startups.delete(id); },
+      () => { this.startups.delete(id); this.dropPendingArgs(id, args); },
       (err) => {
         this.startups.delete(id);
+        this.dropPendingArgs(id, args);
         if (queuedPool !== undefined) {
           // Mirrors endRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
@@ -1069,6 +1179,10 @@ export class AgentManager {
     return startup.catch(() => {});
   }
 
+  private dropPendingArgs(id: string, args: SpawnArgs): void {
+    if (this.pendingArgs.get(id) === args) this.pendingArgs.delete(id);
+  }
+
   /**
    * Resolves once the agent is actually running, and rejects with the startup
    * failure (strict worktree isolation) that `spawn()` used to throw before the
@@ -1086,8 +1200,14 @@ export class AgentManager {
   private async startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options }: SpawnArgs,
+    args: SpawnArgs,
   ) {
+    // `args.ctx` is read again where the run starts, not destructured here: a
+    // session switch during the worktree copy swaps it for a frozen copy.
+    const { pi, type, prompt, options } = args;
+    const ctx = args.ctx;
+    // The functions this run starts and settles with, fixed for its lifetime.
+    const svc = this.svc();
     // Re-validate a caller-supplied cwd: queued spawns can start minutes after
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
@@ -1095,7 +1215,8 @@ export class AgentManager {
     // Single resolution point for the caller-supplied cwd — the worktree base
     // repo and both cleanup calls below MUST agree on this value forever.
     const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
-    const baseCwd = customCwd ?? ctx.cwd;
+    const sessionCwd = ctx.cwd;
+    const baseCwd = customCwd ?? sessionCwd;
 
     // Take the running state — and with it the concurrency slot — BEFORE the
     // first await. Creating a worktree is an awaited git call, and drainQueue
@@ -1133,7 +1254,7 @@ export class AgentManager {
       this.releaseRunSlot(run);
       this.drainQueue();
       try {
-        record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        record.worktreeResult = await svc.cleanupWorktree(pi, baseCwd, wt, options.description);
       } catch { /* best effort */ }
       this.endRun(run);
     };
@@ -1149,12 +1270,12 @@ export class AgentManager {
     // run that changes nothing keeps reporting that, not "no changes".
     const priorWorktreeResult = options.restoreWorktree?.prior;
     if (options.restoreWorktree) {
-      if (!isWorktreeIsolationEnabled()) {
+      if (!svc.isWorktreeIsolationEnabled()) {
         this.discardRun(run);
         throw new Error(`Cannot resume agent ${id}: it ran in a git worktree, and worktree isolation is turned off in this project.`);
       }
       const wt = { ...options.restoreWorktree.worktree };
-      const error = await restoreWorktree(pi, baseCwd, wt, priorWorktreeResult);
+      const error = await svc.restoreWorktree(pi, baseCwd, wt, priorWorktreeResult);
       if (error) {
         this.discardRun(run);
         throw new Error(`Cannot resume agent ${id} in its git worktree: ${error}. Nothing was run.`);
@@ -1167,8 +1288,8 @@ export class AgentManager {
         await stopDuringStartup(wt);
         return;
       }
-    } else if (options.isolation === "worktree" && isWorktreeIsolationEnabled()) {
-      const wt = await createWorktree(pi, baseCwd, id);
+    } else if (options.isolation === "worktree" && svc.isWorktreeIsolationEnabled()) {
+      const wt = await svc.createWorktree(pi, baseCwd, id);
       if (!wt) {
         this.discardRun(run);
         throw new Error(
@@ -1215,7 +1336,7 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
-    const promise = runAgent(ctx, type, prompt, {
+    const promise = svc.runAgent(args.ctx, type, prompt, {
       pi,
       agentId: id,
       model: options.model,
@@ -1236,7 +1357,7 @@ export class AgentManager {
       // Set iff a worktree was created (see above) — names the directory the
       // copy came from, so the prompt can tell the agent not to work there.
       worktreeBase: worktreeCwd ? baseCwd : undefined,
-      configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+      configCwd: options.configCwd ?? (customCwd !== undefined ? sessionCwd : undefined),
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -1306,7 +1427,9 @@ export class AgentManager {
           }
           record.pendingSteers = undefined;
         }
-        options.onSessionCreated?.(session);
+        // A caller's wiring must not fail the run (it may read a ctx a session
+        // switch has since invalidated).
+        try { options.onSessionCreated?.(session); } catch { /* ignore caller wiring errors */ }
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns }) => {
@@ -1350,7 +1473,7 @@ export class AgentManager {
           // The hook runs inside cleanup: after the child's changes are
           // committed and while its tree still exists; what it changes is
           // discarded, so a gate's output never lands on the branch.
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description, options.onBeforeWorktreeCleanup);
+          const wtResult = await svc.cleanupWorktree(pi, baseCwd, record.worktree, options.description, options.onBeforeWorktreeCleanup);
           record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
           // Appended to the prose only. A structured child's caller parses
           // `structuredJson`, which stays untouched — but `result` is also
@@ -1385,7 +1508,7 @@ export class AgentManager {
         // Best-effort worktree cleanup on error
         if (record.worktree) {
           try {
-            const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+            const wtResult = await svc.cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
             // A failed run can still have changed files: say where they went,
             // on the error every failure surface shows.
@@ -1411,7 +1534,7 @@ export class AgentManager {
       }
       if (record.worktree) {
         try {
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
+          const wtResult = await svc.cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult.hasChanges || !priorWorktreeResult ? wtResult : priorWorktreeResult;
           const note = worktreeNote(record.worktreeResult, baseCwd, customCwd !== undefined);
           if (note) record.result = (record.result ?? "") + note;
@@ -1700,7 +1823,7 @@ export class AgentManager {
         try { this.onStart?.(record); } catch { /* a start observer must not fail the run */ }
         if (signal?.aborted) this.abort(id);
         else signal?.addEventListener("abort", onParentAbort, { once: true });
-        const { text, failure, aborted, steered } = abortController.signal.aborted ? { text: "" } : await resumeAgent(session, prompt, {
+        const { text, failure, aborted, steered } = abortController.signal.aborted ? { text: "" } : await this.svc().resumeAgent(session, prompt, {
           maxTurns: options?.maxTurns ?? record.maxTurns,
           onTurnEnd: options?.onTurnEnd,
           onToolActivity: (activity) => {
@@ -1773,7 +1896,7 @@ export class AgentManager {
     if (!pi || !ctx) {
       throw new Error(`Agent ${entry.id} has finished and is no longer in memory, and it cannot be reopened from here.`);
     }
-    const problem = sessionFileProblem(entry.sessionFile);
+    const problem = this.svc().sessionFileProblem(entry.sessionFile);
     if (problem) {
       // Gone for good: a row that can only ever fail is worse than none.
       if (!existsSync(entry.sessionFile)) this.tombstones.delete(entry.id);
@@ -1850,7 +1973,7 @@ export class AgentManager {
   private async prepareResume(record: AgentRecord, options: ResumeOptions | undefined): Promise<void> {
     const worktree = record.worktree;
     if (worktree?.path && !existsSync(worktree.path)) {
-      if (!isWorktreeIsolationEnabled()) {
+      if (!this.svc().isWorktreeIsolationEnabled()) {
         throw new Error(
           `Cannot resume agent ${record.id}: it ran in a git worktree, and worktree isolation is turned off in this project.`,
         );
@@ -1858,7 +1981,7 @@ export class AgentManager {
       const pi = options?.pi ?? this.pi;
       const repo = record.baseCwd;
       const error = pi && repo
-        ? await restoreWorktree(pi, repo, worktree, record.worktreeResult)
+        ? await this.svc().restoreWorktree(pi, repo, worktree, record.worktreeResult)
         : "the repository it ran in is unknown";
       if (error) {
         throw new Error(`Cannot resume agent ${record.id} in its git worktree: ${error}. Nothing was run.`);
@@ -1879,7 +2002,7 @@ export class AgentManager {
     if (!record.worktree?.path || !pi || !repo || !existsSync(record.worktree.path)) return;
     const prior = record.worktreeResult;
     try {
-      const wtResult = await cleanupWorktree(pi, repo, record.worktree, record.description);
+      const wtResult = await this.svc().cleanupWorktree(pi, repo, record.worktree, record.description);
       record.worktreeResult = wtResult.hasChanges || !prior ? wtResult : prior;
       const note = worktreeNote(record.worktreeResult, repo, record.cwd !== undefined);
       if (!note) return;
@@ -1954,7 +2077,7 @@ export class AgentManager {
       this.endRun(run);
     };
 
-    const promise = resumeAgent(record.session, prompt, {
+    const promise = this.svc().resumeAgent(record.session, prompt, {
       maxTurns: options.maxTurns ?? record.maxTurns,
       onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
@@ -2047,7 +2170,7 @@ export class AgentManager {
     const wanted = name.toLowerCase();
     let fallback: AgentRecord | undefined;
     for (const record of this.agents.values()) {
-      if (record.parentAgentId !== undefined) continue;
+      if (record.parentAgentId !== undefined || !this.isVisible(record)) continue;
       // Handle and alias share one namespace, so at most one agent answers a
       // name and it makes no difference which of the two matched.
       if (record.handle?.toLowerCase() !== wanted && record.alias?.toLowerCase() !== wanted) continue;
@@ -2056,7 +2179,7 @@ export class AgentManager {
     }
     if (fallback) return { kind: "live", record: fallback };
     const byId = this.agents.get(name);
-    if (byId?.parentAgentId === undefined && byId !== undefined) return { kind: "live", record: byId };
+    if (byId?.parentAgentId === undefined && byId !== undefined && this.isVisible(byId)) return { kind: "live", record: byId };
     // Only once nothing live answers: a tombstone is a conversation to reopen,
     // and reopening one while its record still exists would fork the session.
     for (const entry of this.tombstones.values()) {
@@ -2094,7 +2217,13 @@ export class AgentManager {
     return [...this.tombstones.values()].filter(isTopLevelTombstone).sort((a, b) => b.completedAt - a.completedAt);
   }
 
+  /** The agents of the session the surfaces show (see {@link setVisibleOwner}), newest first. */
   listAgents(): AgentRecord[] {
+    return this.listAllAgents().filter(record => this.isVisible(record));
+  }
+
+  /** Every agent this manager holds, whichever session it belongs to, newest first. */
+  listAllAgents(): AgentRecord[] {
     return [...this.agents.values()].sort(
       (a, b) => b.startedAt - a.startedAt,
     );
@@ -2128,6 +2257,7 @@ export class AgentManager {
    * off it. A blocking caller learns of the stop from its own tool result.
    */
   private stopQueued(record: AgentRecord): void {
+    this.pendingArgs.delete(record.id);
     record.status = "stopped";
     record.completedAt = Date.now();
     if (record.isBackground === false) record.resultConsumed = true;
@@ -2214,6 +2344,8 @@ export class AgentManager {
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
       if (this.isRunActive(id)) continue;
+      // Kept too: another session's agent that finished while that session was
+      // closed, until it is opened again and told (or the cleanup evicts it).
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -2231,7 +2363,8 @@ export class AgentManager {
    * whose run has not settled yet, which still holds its slot.
    */
   hasRunning(): boolean {
-    return this.runs.size > 0 || [...this.agents.values()].some(isBusy);
+    for (const run of this.runs.values()) if (this.isVisible(run.record)) return true;
+    return [...this.agents.values()].some(record => isBusy(record) && this.isVisible(record));
   }
 
   /** Abort all running and queued agents immediately. */
@@ -2265,9 +2398,10 @@ export class AgentManager {
    * commit and branch that preserve the agent's changes — finishes before the
    * process exits instead of racing it.
    */
-  async awaitWorktreeCleanup(timeoutMs: number): Promise<void> {
+  async awaitWorktreeCleanup(timeoutMs: number, ids?: ReadonlySet<string>): Promise<void> {
     const pending: Promise<unknown>[] = [];
     for (const record of this.agents.values()) {
+      if (ids !== undefined && !ids.has(record.id)) continue;
       const startup = this.startups.get(record.id);
       if (!record.worktree && !startup) continue;
       // Re-checked after startup: only a run that ended up with a worktree has
@@ -2292,6 +2426,8 @@ export class AgentManager {
       const pending: Promise<unknown>[] = [];
       for (const record of this.agents.values()) {
         if (record.status !== "running" && record.status !== "queued") continue;
+        // Another session's agents keep running; this session does not wait on them.
+        if (!this.isVisible(record)) continue;
         // An agent whose worktree is still being created is "running" with no
         // `promise` yet — without its startup the wait would return too early.
         const startup = this.startups.get(record.id);
@@ -2300,7 +2436,7 @@ export class AgentManager {
       }
       // A stopped run still winding down holds its slot, and whatever is queued
       // behind it starts only once it settles (or is abandoned).
-      for (const run of this.runs.values()) pending.push(run.done);
+      for (const run of this.runs.values()) if (this.isVisible(run.record)) pending.push(run.done);
       if (pending.length === 0) break;
       await Promise.allSettled(pending);
     }
@@ -2329,12 +2465,13 @@ export class AgentManager {
     const sessions = [...this.agents.values()].filter(record => !this.released.has(record)).map(record => record.session);
     this.agents.clear();
     this.startups.clear();
+    this.pendingArgs.clear();
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited
       // shutdown below rather than after it, so the git calls have that window to
       // finish in instead of racing the process exit that follows.
-      const prune = (repo: string) => { pruneWorktrees(pi, repo).catch(() => {}); };
+      const prune = (repo: string) => { this.svc().pruneWorktrees(pi, repo).catch(() => {}); };
       prune(process.cwd());
       // Also prune repos that caller-supplied cwds created worktrees in — a clean
       // exit with in-flight agents would otherwise leave stale registrations there.

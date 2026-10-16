@@ -332,6 +332,13 @@ export interface AgentRecord {
    * directory as their ancestors' instead of the child session's own id.
    */
   rootSessionId?: string;
+  /**
+   * The session this agent belongs to: the parent session's file when it was
+   * spawned (undefined for a session kept only in memory). Owned children
+   * inherit their root's. A background agent keeps running when the user
+   * switches sessions, and its results go to this session, not the open one.
+   */
+  ownerSession?: string;
 }
 
 /**

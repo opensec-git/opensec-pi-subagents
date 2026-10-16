@@ -100,6 +100,25 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
   it replays from the journal can still be continued with `agent({ resume })`: the journal records which agent
   produced each answer.
 
+### Switching sessions
+
+Background agents keep running when you switch sessions with `/new`, `/resume`, `/fork` or `/reload`, as long as the
+session that started them is saved (it has a session file).
+
+- An agent belongs to the session that started it. While another session is open it does not show in that session's
+  widget, FleetView, `/agents` lists or `@` suggestions, and `get_subagent_result`, `steer_subagent` and `resume` there
+  do not find it. It still counts toward the background concurrency limit.
+- If it finishes while another session is open, its result is written into its own session (a `subagents:record`
+  entry marked `pending`) and nothing is sent to the open session. When you return to its session the result arrives as
+  the usual completion notification, and the main agent takes a turn on it. The same happens after a restart if the
+  result was recorded but not yet delivered.
+- Its nested agents keep running with it. Foreground agents (Pi interrupts their tool call), workflows, `@mention`
+  prompts in flight and agents of a session kept only in memory stop at a switch, as before, and are recorded as stopped.
+- Quitting (`/quit`, Ctrl+D, SIGTERM, SIGHUP) stops every agent and saves worktrees, as before. If Pi exits while a
+  switch is still in progress, the agents are recorded as stopped; their worktrees are recovered at the next start.
+- After updating this package, the first `/reload` (or switch) loads the new version, which cannot take over the old
+  version's running agents: they are stopped and recorded as stopped and resumable.
+
 ### Model and thinking level
 
 A subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent`
