@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -612,6 +612,24 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Background completion: route through group join or send individual nudge
+  /**
+   * Write a top-level agent's final record into the parent session. `resume`
+   * carries what reopening it needs (session file, handle, model, directory,
+   * worktree, isolation, turn limit); `session_start` reads it back, so the
+   * agent stays resumable after a restart, `/resume`, `/fork` or `/reload`.
+   * Guarded: it also runs while the session is shutting down.
+   */
+  function appendRecordEntry(record: AgentRecord): void {
+    try {
+      pi.appendEntry("subagents:record", {
+        id: record.id, type: record.type, description: record.description,
+        status: record.status, result: record.result, error: record.error,
+        startedAt: record.startedAt, completedAt: record.completedAt,
+        resume: resumeStateOf(record),
+      });
+    } catch { /* a session already torn down cannot record anything */ }
+  }
+
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
@@ -628,12 +646,9 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Persist final record for cross-extension history reconstruction, and the
+    // state needed to resume the agent after a restart or session switch.
+    appendRecordEntry(record);
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -840,6 +855,10 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted(true);
+    // Agents of this session from before a restart, `/resume`, `/fork` or
+    // `/reload`: resumable again, by the model and by `@handle`. The branch,
+    // not every entry: a fork keeps only the agents on its own path.
+    manager.restoreTombstones(resumeStatesFromEntries(ctx.sessionManager?.getBranch?.() ?? []));
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1141,10 +1160,15 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
+    // Pi tears this extension instance down with the session, so agents still
+    // running cannot be kept alive across the switch. Stop them, and record
+    // each as stopped and resumable in the session it belongs to.
+    const interrupted = manager.listAgents().filter(r => isTopLevelAgent(r) && (r.status === "running" || r.status === "queued"));
     manager.abortAll();
     // A stopped worktree agent still commits its changes to a branch while it
     // settles; dispose() does not wait for that, and the process exits next.
     await manager.awaitWorktreeCleanup(15_000);
+    for (const record of interrupted) appendRecordEntry(record);
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();

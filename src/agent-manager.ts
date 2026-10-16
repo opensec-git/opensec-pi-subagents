@@ -486,6 +486,26 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
   };
 }
 
+/**
+ * The resume states a session's `subagents:record` entries carry, oldest
+ * first. Entries written before they carried one, or malformed ones, are
+ * skipped: there is nothing to reopen them from.
+ */
+export function resumeStatesFromEntries(entries: readonly unknown[]): AgentResumeState[] {
+  const out: AgentResumeState[] = [];
+  for (const entry of entries) {
+    const e = entry as { type?: unknown; customType?: unknown; data?: { resume?: unknown } } | null;
+    if (e?.type !== "custom" || e.customType !== "subagents:record") continue;
+    const state = e.data?.resume as Partial<AgentResumeState> | undefined;
+    if (
+      typeof state?.id !== "string" || typeof state.type !== "string"
+      || typeof state.sessionFile !== "string" || typeof state.description !== "string"
+    ) continue;
+    out.push({ ...state, completedAt: typeof state.completedAt === "number" ? state.completedAt : 0 } as AgentResumeState);
+  }
+  return out;
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -1836,6 +1856,7 @@ export class AgentManager {
   restoreTombstones(states: readonly AgentResumeState[]): void {
     for (const state of states) {
       if (this.agents.has(state.id)) continue;
+      // In entry order, so a later entry for the same id (a later run) wins.
       const current = this.tombstones.get(state.id);
       if (current && current.completedAt > state.completedAt) continue;
       this.keepTombstone(state);
