@@ -64,6 +64,22 @@ function initGitRepo(): string {
   return dir;
 }
 
+// createWorktree puts each worktree in a private `pi-agent-<id>-XXXX` parent in
+// tmpdir(), and a test's own `git worktree remove` leaves that parent behind —
+// ten per run, forever. Point tmpdir() at a sandbox per test and remove it.
+let sandbox: string;
+let previousTmpdir: string | undefined;
+beforeEach(() => {
+  previousTmpdir = process.env.TMPDIR;
+  sandbox = mkdtempSync(join(tmpdir(), "pi-wt-sandbox-"));
+  process.env.TMPDIR = sandbox;
+});
+afterEach(() => {
+  if (previousTmpdir === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = previousTmpdir;
+  rmSync(sandbox, { recursive: true, force: true });
+});
+
 describe("worktree", () => {
   let repoDir: string;
   let pi: ExtensionAPI;
