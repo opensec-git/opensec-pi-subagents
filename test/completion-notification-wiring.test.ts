@@ -116,7 +116,7 @@ describe("background completion notification wiring", () => {
     subagentsExtension(pi);
 
     await spawnBackground(tools.get("Agent")!, "individual-call", "individual child");
-    await vi.advanceTimersByTimeAsync(300); // 100ms smart-batch debounce + 200ms hold
+    await vi.advanceTimersByTimeAsync(200); // result-consumption hold
 
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage).toHaveBeenCalledWith(
@@ -130,7 +130,7 @@ describe("background completion notification wiring", () => {
     await handlers.get("session_shutdown")?.();
   });
 
-  it("requests steering for a grouped completion after the result-consumption hold", async () => {
+  it("sends completions that land together as one steering message, not a message each", async () => {
     vi.useFakeTimers();
     // Both runs settle after their spawns return, as real runs do.
     let settleRuns!: () => void;
@@ -145,26 +145,45 @@ describe("background completion notification wiring", () => {
     const agentTool = tools.get("Agent")!;
 
     await Promise.all([
-      spawnBackground(agentTool, "group-call-1", "first grouped child"),
-      spawnBackground(agentTool, "group-call-2", "second grouped child"),
+      spawnBackground(agentTool, "batch-call-1", "first batched child"),
+      spawnBackground(agentTool, "batch-call-2", "second batched child"),
     ]);
     settleRuns();
-    await vi.advanceTimersByTimeAsync(300); // 100ms smart-batch debounce + 200ms group hold
+    await vi.advanceTimersByTimeAsync(200); // result-consumption hold
 
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         customType: "subagent-notification",
-        content: expect.stringContaining("Background agent group completed"),
+        content: expect.stringContaining("2 background tasks finished"),
         details: expect.objectContaining({
-          description: expect.stringMatching(/grouped child/),
-          others: expect.arrayContaining([
-            expect.objectContaining({ description: expect.stringMatching(/grouped child/) }),
-          ]),
+          description: "first batched child",
+          others: [expect.objectContaining({ description: "second batched child" })],
         }),
       }),
       { deliverAs: "steer", triggerTurn: true },
     );
+
+    await handlers.get("session_shutdown")?.();
+  });
+
+  it("delivers runs that settle while their Agent calls start up exactly once", async () => {
+    vi.useFakeTimers();
+    // Settled before the tool's awaitStartup continues — the spawn-time batch
+    // used to notify each alone, then again in their group.
+    vi.mocked(runAgent).mockResolvedValue(completedRun());
+
+    const { pi, tools, handlers } = makePi();
+    subagentsExtension(pi);
+    const agentTool = tools.get("Agent")!;
+
+    await Promise.all([
+      spawnBackground(agentTool, "instant-call-1", "first instant child"),
+      spawnBackground(agentTool, "instant-call-2", "second instant child"),
+    ]);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
 
     await handlers.get("session_shutdown")?.();
   });

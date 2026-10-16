@@ -120,8 +120,8 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 | When you consume | What happens |
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
+| After an `await`, before the notification is sent | Still suppressed. The notification waits in the outbox (`src/completion-outbox.ts`), and consuming the result cancels it there. It is sent about 200 ms after the completion when the parent is idle (`NOTIFICATION_HOLD_MS`), and at the end of the parent's current tool batch when it is busy |
+| After it was sent | Too late. Pi has queued it as a steering message with `triggerTurn: true`, and it costs the parent a model call |
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 

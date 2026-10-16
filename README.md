@@ -72,6 +72,24 @@ Agent({ subagent_type: "Explore", prompt: "Find authentication code", descriptio
 | `/agents` | Inspect and manage agents: live conversations, settings, workflows, and scheduled jobs (`/agents → Scheduled jobs`). |
 | `@<agent> <message>` | With agent mentions enabled, sends a message to that agent, e.g. `@explore check the RPC path`. A finished agent is resumed (see [Resuming agents](#resuming-agents)). |
 
+### Background completions
+
+When a background agent (or workflow) finishes, the main session is notified, as in Claude Code:
+
+- A busy parent gets the notification after its current batch of tool calls, before its next model call; running tools
+  are not interrupted. Everything that finished during that batch arrives as one message.
+- An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window.
+- If you interrupt the parent (`Esc`), what was waiting is kept and delivered once the interrupted turn has stopped,
+  starting a turn.
+- Reading a result with `get_subagent_result` (or the RPC `consume`) before the notification is sent suppresses it.
+
+The join mode (`/agents → Settings → Join mode`, `defaultJoinMode`) decides whether a result waits for its siblings:
+
+| Mode | Behaviour |
+|---|---|
+| `smart` (default) | No waiting: each result is delivered at the parent's next boundary. `async` is accepted as an older name for it. |
+| `group` | The background agents spawned in one parent turn report together, in one notification once all of them have finished (a lone spawn reports alone). A 30 s timeout after the first completion sends a partial notification; stragglers follow within 15 s. |
+
 ### Sending a foreground agent to the background
 
 While a foreground `Agent` call runs (`run_in_background: false`), press `ctrl+b` at the prompt to hand it to the
