@@ -330,6 +330,36 @@ describe("child-safe nested Agent tools", () => {
     expect(result.content[0].text).toBe("queued done");
   });
 
+  it("waits on a queued child's start gate instead of polling", async () => {
+    vi.useFakeTimers(); // a poll would never fire
+    try {
+      const [, getResult] = tools();
+      let open: () => void = () => {};
+      const record = {
+        id: "gated-child",
+        status: "queued",
+        parentAgentId: "parent-1",
+        startGate: new Promise<void>(resolve => { open = resolve; }),
+        promise: undefined as Promise<unknown> | undefined,
+        result: undefined as string | undefined,
+      };
+      records.set(record.id, record);
+      const pending = execute(getResult, { agent_id: record.id, wait: true });
+
+      record.status = "running";
+      record.promise = Promise.resolve().then(() => {
+        record.status = "completed";
+        record.result = "gated done";
+      });
+      open();
+
+      expect((await pending).content[0].text).toBe("gated done");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("aborts a nested result wait without aborting the owned child", async () => {
     const [, getResult] = tools();
     let settleChild: (() => void) | undefined;

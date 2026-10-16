@@ -2835,11 +2835,13 @@ Terse command-style prompts produce shallow, generic work.
       // call; the background agent keeps running and remains unconsumed so its
       // completion notification can still be delivered.
       // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
+      // them), so wait on the queue's start gate (resolved on every way out of
+      // the queue) until they leave it, then await like a running one. Polling
+      // is the fallback for a queued record without a gate.
       if (params.wait && (record.status === "running" || record.status === "queued")) {
         while (record.status === "queued") {
           await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
+            record.startGate ?? new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
             signal,
           );
         }

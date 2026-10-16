@@ -129,6 +129,38 @@ describe("get_subagent_result wait:true on a queued agent", () => {
     await lifecycle.get("session_shutdown")?.();
   }, 20_000);
 
+  it("leaves the queue on the start gate, without a poll interval", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    const resolvers = deferredRuns();
+    let queuedId: string | undefined;
+    for (let i = 0; i < 20 && !queuedId; i++) {
+      const { id, queued } = await spawnBackground(tools);
+      if (queued) queuedId = id;
+    }
+    expect(queuedId).toBeDefined();
+
+    let settled = false;
+    const waitPromise = tools
+      .get("get_subagent_result")
+      .execute("tc-wait", { agent_id: queuedId, wait: true }, undefined, undefined, ctx());
+    void waitPromise.then(() => { settled = true; });
+
+    // Only microtask/immediate flushes, never long enough for a poll tick: a
+    // wait that polled would still be parked when this loop gives up.
+    const started = Date.now();
+    for (let i = 0; i < 40 && !settled; i++) {
+      while (resolvers.length > 0) resolvers.shift()!();
+      await flush();
+    }
+    expect(settled).toBe(true);
+    expect(Date.now() - started).toBeLessThan(50);
+    expect(textOf(await waitPromise)).toContain("THE-RESULT-PAYLOAD");
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
