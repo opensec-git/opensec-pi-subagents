@@ -413,9 +413,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
       let record: AgentRecord | undefined;
-      // Taken before the run: the record's counters are lifetime figures. A
-      // reopened (evicted) child starts a fresh record, so there is nothing to
-      // subtract.
+      // Taken before the run: the record's counters are lifetime figures, and
+      // they carry over when a loaded child is reopened from its file. An
+      // evicted child starts a fresh record, so there is nothing to subtract.
       const before = manager.getRecord(id);
       const baseline = spendOf(before);
       try {
@@ -441,7 +441,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       onResolved?.({ recordId: id });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record, record === before ? baseline : undefined);
+      return toSpawnResult(record, before !== undefined && record.id === before.id ? baseline : undefined);
     },
 
     /**

@@ -202,6 +202,11 @@ interface SpawnOptions {
    */
   reuseId?: string;
   /**
+   * Lifetime figures to continue from — a loaded agent reopened from its file
+   * keeps counting where its record left off. Internal, like `reuseId`.
+   */
+  carry?: Pick<AgentRecord, "lifetimeUsage" | "toolUses" | "compactionCount">;
+  /**
    * Restore this worktree (at its path, from its branch) instead of creating a
    * fresh one — the reopen of an evicted worktree agent. Internal.
    */
@@ -394,6 +399,19 @@ const DEFAULT_STOP_GRACE_MS = 20_000;
  * will not end.
  */
 const INLINE_STOP_WAIT_MS = 3_000;
+
+/**
+ * How long a finished agent keeps its live session before it is released.
+ *
+ * A finished child's session still holds everything its extensions armed in
+ * `session_start` (MCP clients, watchers, timers) until the record is evicted
+ * ten minutes later — per agent, so a fan-out multiplies it. Past this delay a
+ * saved session is shut down and disposed; its messages and stats stay
+ * readable for the viewer and the result tools, and a resume reopens the
+ * conversation from the session file instead. A resume within the delay
+ * reuses the live session, which is faster.
+ */
+const DEFAULT_SESSION_RELEASE_MS = 60_000;
 
 /**
  * A run the manager is still responsible for: from the moment it takes its
@@ -611,6 +629,11 @@ export class AgentManager {
   /** Runs that have not settled yet, by agent id — including stopped ones still winding down. */
   private runs = new Map<string, LiveRun>();
   private stopGraceMs = DEFAULT_STOP_GRACE_MS;
+  /** Records whose finished session was released (shut down and disposed). */
+  private released = new WeakSet<AgentRecord>();
+  /** Pending releases, by record. */
+  private releaseTimers = new Map<AgentRecord, ReturnType<typeof setTimeout>>();
+  private sessionReleaseMs = DEFAULT_SESSION_RELEASE_MS;
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -656,6 +679,48 @@ export class AgentManager {
   /** How long a stopped run may take to end before it is abandoned (see DEFAULT_STOP_GRACE_MS). */
   setStopGraceMs(ms: number) {
     this.stopGraceMs = Math.max(0, ms);
+  }
+
+  /** How long a finished agent keeps its live session (see DEFAULT_SESSION_RELEASE_MS). */
+  setSessionReleaseMs(ms: number) {
+    this.sessionReleaseMs = Math.max(0, ms);
+  }
+
+  /**
+   * After a run settles, schedule the release of its session. Only a saved
+   * session (it has a file to reopen from) that is idle: an in-memory one is
+   * the only copy of the conversation, and a stuck one is handled by resume.
+   */
+  private scheduleRelease(record: AgentRecord): void {
+    this.cancelRelease(record);
+    if (!record.session || !record.sessionFile) return;
+    const timer = setTimeout(() => {
+      this.releaseTimers.delete(record);
+      this.releaseSession(record);
+    }, this.sessionReleaseMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.releaseTimers.set(record, timer);
+  }
+
+  private cancelRelease(record: AgentRecord): void {
+    const timer = this.releaseTimers.get(record);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.releaseTimers.delete(record);
+  }
+
+  /** Shut down and dispose a finished agent's session, keeping it readable. */
+  private releaseSession(record: AgentRecord): void {
+    const session = record.session;
+    if (!session || this.released.has(record)) return;
+    if (this.agents.get(record.id) !== record || this.isRunActive(record.id) || session.isStreaming === true) return;
+    this.released.add(record);
+    void shutdownChildSession(session);
+  }
+
+  /** Whether resuming must reopen the conversation from its file: the live session is gone or stuck. */
+  private needsReopen(record: AgentRecord): boolean {
+    return this.released.has(record) || record.session?.isStreaming === true;
   }
 
   /**
@@ -715,6 +780,7 @@ export class AgentManager {
     this.notifyComplete(run.record);
     this.drainQueue();
     run.resolveDone();
+    if (!run.abandoned) this.scheduleRelease(run.record);
   }
 
   /** Fire onComplete. Never throws: a completion side effect must not take a run (or pi) down. */
@@ -853,11 +919,11 @@ export class AgentManager {
       // that queues flips to "queued" there rather than being guessed at here,
       // since the pool decision needs the finished record.
       status: options.isBackground ? "queued" : "running",
-      toolUses: 0,
+      toolUses: options.carry?.toolUses ?? 0,
       startedAt: Date.now(),
       abortController,
-      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
-      compactionCount: 0,
+      lifetimeUsage: options.carry ? { ...options.carry.lifetimeUsage } : { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+      compactionCount: options.carry?.compactionCount ?? 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
       // declared it (e.g. a cross-extension RPC spawn). The widget's background-
@@ -1502,7 +1568,8 @@ export class AgentManager {
     // conversation from its session file instead, as for an evicted agent.
     // Removing the record disposes the stuck session first, which also stops
     // it from writing to the file the reopened run continues.
-    if (record.session.isStreaming === true) {
+    // The same when its finished session was released to free its resources.
+    if (this.needsReopen(record)) {
       const state = resumeStateOf(record);
       if (!state) {
         throw new Error(
@@ -1511,8 +1578,14 @@ export class AgentManager {
         );
       }
       this.removeRecord(id, record);
-      return this.reopen(state, prompt, signal, options);
+      // The agent's lifetime figures continue on the reopened record.
+      return this.reopen(state, prompt, signal, options, {
+        lifetimeUsage: { ...record.lifetimeUsage },
+        toolUses: record.toolUses,
+        compactionCount: record.compactionCount,
+      });
     }
+    this.cancelRelease(record);
 
     // Claimed before the awaited preparation, so a concurrent resume is refused
     // rather than preparing (and running) the same agent twice. A failed
@@ -1675,6 +1748,7 @@ export class AgentManager {
     prompt: string,
     signal: AbortSignal | undefined,
     options: ResumeOptions | undefined,
+    carry?: Pick<AgentRecord, "lifetimeUsage" | "toolUses" | "compactionCount">,
   ): Promise<AgentRecord> {
     const pi = options?.pi ?? this.pi;
     const ctx = options?.ctx;
@@ -1703,6 +1777,7 @@ export class AgentManager {
     const spawnOptions: SpawnOptions = {
       description: entry.description,
       reuseId: entry.id,
+      carry,
       reclaim: entry.handle !== undefined ? { handle: entry.handle, alias: entry.alias } : undefined,
       resumeSessionFile: entry.sessionFile,
       model,
@@ -2043,7 +2118,9 @@ export class AgentManager {
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
-    const session = record.session;
+    this.cancelRelease(record);
+    // Already shut down and disposed: once is all a session's extensions get.
+    const session = this.released.has(record) ? undefined : record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
     record.session = undefined;
@@ -2222,7 +2299,9 @@ export class AgentManager {
       run.resolveDone();
     }
     this.runs.clear();
-    const sessions = [...this.agents.values()].map(record => record.session);
+    for (const timer of this.releaseTimers.values()) clearTimeout(timer);
+    this.releaseTimers.clear();
+    const sessions = [...this.agents.values()].filter(record => !this.released.has(record)).map(record => record.session);
     this.agents.clear();
     this.startups.clear();
     if (pi) {
