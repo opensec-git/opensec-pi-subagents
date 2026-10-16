@@ -13,6 +13,7 @@ import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -321,7 +322,7 @@ export class ConversationViewer implements Component {
     if (cost) headerParts.push(cost);
 
     lines.push(row(
-      `${statusIcon} ${renderAgentName(this.record.type, th, { bold: true })}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
+      `${statusIcon} ${renderAgentName(this.record.type, th, { bold: true })}${modeTag}  ${th.fg("muted", sanitizeTerminalText(this.record.description))} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
     ));
     const invocationLine = this.invocationLine();
     if (invocationLine) lines.push(row(invocationLine));
@@ -399,12 +400,13 @@ export class ConversationViewer implements Component {
 
   /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
   private rawLines(text: string, width: number, dim: boolean): string[] {
-    const lines = wrapTextWithAnsi(text, width);
+    const lines = wrapTextWithAnsi(sanitizeTerminalText(text), width);
     return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
+  private markdownLines(msg: AgentSession["messages"][number], raw: string, width: number, dim: boolean): string[] {
+    const text = sanitizeTerminalText(raw);
     let entry = this.markdownCache.get(msg);
     if (!entry) {
       entry = {
@@ -528,7 +530,7 @@ export class ConversationViewer implements Component {
         if (!text.trim()) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        for (const line of wrapTextWithAnsi(sanitizeTerminalText(text.trim()), width)) {
           lines.push(line);
         }
       } else if (msg.role === "assistant") {
@@ -549,7 +551,7 @@ export class ConversationViewer implements Component {
             : this.markdownLines(msg, text, width, false)));
         }
         for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
+          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${sanitizeTerminalText(name)}]`), width));
         }
       } else if (msg.role === "toolResult") {
         const { text, elided } = capResult(extractText(msg.content).trim());
@@ -563,7 +565,7 @@ export class ConversationViewer implements Component {
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
+        lines.push(truncateToWidth(th.fg("muted", `  $ ${sanitizeTerminalText(String(bash.command))}`), width));
         if (bash.output?.trim()) {
           // Same cap as a tool result, never Markdown: command output is the one
           // thing here that is definitionally not authored as Markdown.
@@ -581,7 +583,7 @@ export class ConversationViewer implements Component {
     if (this.record.status === "running" && this.activity) {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       lines.push("");
-      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", sanitizeTerminalText(act)), width));
     }
 
     return lines.map(l => truncateToWidth(l, width));

@@ -47,6 +47,12 @@ export interface WorkflowPhaseEntry {
 export interface WorkflowLogEntry {
   type: "workflow_log";
   message: string;
+  /**
+   * Set on the marker line that stands in for log lines dropped to keep the
+   * log bounded: how many it replaces. Compaction folds earlier markers into
+   * the next one, so a run carries at most one.
+   */
+  dropped?: number;
 }
 
 export interface WorkflowAgentEntry {
@@ -140,6 +146,83 @@ export interface WorkflowStats {
   total: number;
   started: number;
   complete: boolean;
+}
+
+/**
+ * Log lines a run keeps. A script can call `log()` in a loop; without a bound
+ * the progress log, every re-collapse of it and the persisted session entry
+ * grew with it until spreading one batch into an array threw a RangeError.
+ */
+export const MAX_WORKFLOW_LOG_LINES = 2000;
+/** Longest error text (a failed gate's output, an agent's error) an entry keeps: its tail. */
+export const MAX_WORKFLOW_ERROR_TEXT = 16 * 1024;
+/** Below this many entries a progress log is never compacted. */
+const COMPACT_MIN_ENTRIES = 2 * MAX_WORKFLOW_LOG_LINES;
+
+/** The last `max` characters of `text`, marked as cut when anything was dropped. */
+export function tailText(text: string, max = MAX_WORKFLOW_ERROR_TEXT): string {
+  if (text.length <= max) return text;
+  return `… (${text.length - max} earlier characters dropped)\n${text.slice(text.length - max)}`;
+}
+
+function droppedMarker(count: number): WorkflowLogEntry {
+  return { type: "workflow_log", message: `… ${count} earlier log line${count === 1 ? "" : "s"} dropped`, dropped: count };
+}
+
+/**
+ * Rewrite `progress` in place to the entries that still matter: the last entry
+ * per agent and per phase index (what {@link collapse} reads anyway) and the
+ * last {@link MAX_WORKFLOW_LOG_LINES} log lines, with one marker counting the
+ * rest. Relative order is kept, so collapsing the result is unchanged except
+ * for the dropped log lines.
+ */
+export function compactProgress(progress: WorkflowEntry[]): void {
+  const seenAgents = new Set<number>();
+  const seenPhases = new Set<number>();
+  const kept: WorkflowEntry[] = [];
+  let logs = 0;
+  let dropped = 0;
+  for (let i = progress.length - 1; i >= 0; i--) {
+    const entry = progress[i];
+    if (entry.type === "workflow_agent") {
+      if (seenAgents.has(entry.index)) continue;
+      seenAgents.add(entry.index);
+    } else if (entry.type === "workflow_phase") {
+      if (seenPhases.has(entry.index)) continue;
+      seenPhases.add(entry.index);
+    } else if (entry.dropped !== undefined) {
+      dropped += entry.dropped;
+      continue;
+    } else if (logs >= MAX_WORKFLOW_LOG_LINES) {
+      dropped++;
+      continue;
+    } else {
+      logs++;
+    }
+    kept.push(entry);
+  }
+  if (dropped > 0) kept.push(droppedMarker(dropped));
+  kept.reverse();
+  progress.length = 0;
+  for (const entry of kept) progress.push(entry);
+}
+
+/** Size of each progress log right after its last compaction. */
+const compactedSize = new WeakMap<WorkflowEntry[], number>();
+
+/**
+ * Append a batch to a progress log and keep the log bounded.
+ *
+ * A loop, not `push(...entries)`: spreading a large batch overflows the call
+ * stack. Compaction runs only once the log has doubled since the last one, so
+ * appending stays amortized O(1) per entry.
+ */
+export function appendProgress(progress: WorkflowEntry[], entries: readonly WorkflowEntry[]): void {
+  for (const entry of entries) progress.push(entry);
+  const floor = Math.max(COMPACT_MIN_ENTRIES, 2 * (compactedSize.get(progress) ?? 0));
+  if (progress.length <= floor) return;
+  compactProgress(progress);
+  compactedSize.set(progress, progress.length);
 }
 
 /**

@@ -18,7 +18,14 @@ import { randomUUID } from "node:crypto";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
-import { collapse, elapsedMs, stats, type WorkflowEntry, type WorkflowRunStatus } from "./progress.js";
+import {
+  appendProgress,
+  collapse,
+  elapsedMs,
+  stats,
+  type WorkflowEntry,
+  type WorkflowRunStatus,
+} from "./progress.js";
 import type { WorkflowControl, WorkflowRunResult } from "./runtime.js";
 
 /** `wf_` + hex, matching Claude Code's `^wf_[a-z0-9-]{6,}$` run ids. */
@@ -140,7 +147,7 @@ export function updateWorkflowProgressBatch(
   entries: readonly WorkflowEntry[],
 ): void {
   if (entries.length === 0) return;
-  task.workflowProgress.push(...entries);
+  appendProgress(task.workflowProgress, entries);
   task.progressVersion++;
 
   const { agents, logs } = collapse(task.workflowProgress);
@@ -259,10 +266,12 @@ export function resolveResumeTarget(
           : "Nothing has run yet — call this without `resumeFromRunId`."),
     };
   }
-  if (prior.status === "running") {
+  // A paused run is alive too: its worker, its journal and any running
+  // children still exist, and a second run on the same journal would race it.
+  if (prior.status === "running" || prior.status === "paused") {
     return {
       ok: false,
-      message: `Workflow "${id}" is still running. Stop it from /agents → Workflows before resuming it.`,
+      message: `Workflow "${id}" is still ${prior.status}. Stop it from /agents → Workflows before resuming it.`,
     };
   }
   if (prior.journalPath === undefined) {

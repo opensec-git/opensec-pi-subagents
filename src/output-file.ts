@@ -109,12 +109,28 @@ export function streamToOutputFile(
   // in the session's length as of just before the run: the session already
   // holds every prior turn, and re-emitting those would duplicate history that
   // is already in the file.
-  let writtenCount = startIndex ?? 1;
+  //
+  // Pi 1.0 puts the system prompt and tool loadout changes in the transcript as
+  // `role: "system"` messages, so on a spawn messages[0] is the system prompt
+  // and the prompt already written by writeInitialEntry sits after it. The
+  // spawn anchor is therefore the first user message, found on first flush
+  // (`undefined` until then), and system messages are never written: they are
+  // not conversation, and would otherwise land in the file as `toolResult`.
+  let writtenCount: number | undefined = startIndex;
 
   const flush = () => {
     const messages = session.messages;
+    if (writtenCount === undefined) {
+      const firstUser = messages.findIndex((m) => m.role === "user");
+      if (firstUser < 0) return;
+      writtenCount = firstUser + 1;
+    }
     while (writtenCount < messages.length) {
       const msg = messages[writtenCount];
+      if ((msg.role as string) === "system") {
+        writtenCount++;
+        continue;
+      }
       const entry = {
         isSidechain: true,
         agentId,

@@ -396,8 +396,8 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 
 ## What workflows can't do
 
-- **No filesystem, network or module access inside the script.** All real work happens in the agents it spawns, which have their normal tools.
-- **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`.
+- **No filesystem, network or module access *provided* to the script.** All real work happens in the agents it spawns, which have their normal tools. This is a convention, not an enforced limit: see the note below.
+- **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`. That keeps an accidental `eval` deterministic; it does not contain the script.
 - **No cross-session resume.** Journals are per session.
 - **No resume at all for `--subagents-workflow-file` runs** — that path never journals.
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
@@ -405,7 +405,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 - **Results are not persisted** beyond the journal and the transcript card.
 - **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
 
-The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.
+**Workflow scripts are not sandboxed.** The vm context is a determinism and accident boundary only. The injected globals (`agent`, `log`, ...) are host closures, so a script can reach the host's `Function` through them (`agent.constructor(...)`) and run any code with the same filesystem, network and process access as pi itself; disabled code generation does not prevent that. Treat a workflow script exactly like any other code you let pi run: only run scripts you trust.
 
 ## Coming from Claude Code
 

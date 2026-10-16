@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.11] - 2026-10-07
+
+### Fixed
+
+- **The main agent's commands had no time limit either.** Pi's `bash` has no default timeout, so an unbounded `grep -r … /` or a server started in the foreground held the main agent's turn until someone noticed. A main-agent `bash` call that sets no timeout now gets `toolTimeoutSeconds` (default 1200 s, `0` = off) and is killed at it, with the timeout reported to the model. A timeout the main agent supplies, even a longer one, is kept; subagents stay capped at the limit.
+
+## [0.19.10] - 2026-10-07
+
+### Fixed
+
+- **A hung tool call held a subagent forever.** Turn limits only count finished turns, and a turn whose tool never returns (a `find /`, a server that never exits) never finishes, so `max_turns` and the grace turns could not stop it. Subagent `bash` calls now get a timeout (the new `toolTimeoutSeconds` setting, default 1200 s, `0` = off): Pi kills the command's whole process tree and the agent sees the timeout and carries on. Any other tool still running a minute past the limit is stopped by a watchdog and the agent is resumed with a note to split the work into bounded steps, up to 3 times per run (nested `Agent` / workflow calls are exempt). Resumed agents get the same protection.
+
+## [0.19.9] - 2026-10-03
+
+### Fixed
+
+- **No load warning on Pi 1.0.** `@sinclair/typebox` and `typebox` were listed in `dependencies`, which Pi 1.0 reports as host-provided packages that can bypass its extension loader. They are now optional `"*"` peer dependencies (Pi supplies both on 0.87.1 and 1.0) and stay devDependencies for tests and typecheck.
+
+### Changed
+
+- The development pins of `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` move from 0.84.2 to 1.0.0, so `npm test` and `prepublishOnly` run the e2e tests that need Pi 1.0 APIs.
+
+## [0.19.8] - 2026-10-03
+
+The Node build now carries the same fixes as the Bun build (0.19.5-bun.x).
+
+### Fixed
+- **Workflows:** an async expression in `meta` could freeze Pi for good (also while the call was still streaming); the call-line name cache grew with every streamed prefix (~1 GB for a 95 KB script); a `log()` flood crashed progress handling; children of a finished run kept running; a paused run could be resumed while still alive; script paths that are not regular files (FIFO, `/dev/zero`) blocked or exhausted memory; schema `pattern`s with nested quantifiers are refused; top-level script errors name the script line.
+- **Terminal escapes** (OSC 52 clipboard writes, screen clears, CR) in child output, gate output and logs are stripped before rendering.
+- **`ext:` tool narrowing** is enforced on Pi 1.0 deferred/codemode tool-to-tool calls too.
+- `get_subagent_result` with `wait: true` no longer reports "still running" while the worktree is being created.
+- A corrupt schedule file is kept as `.corrupt` instead of overwritten, and waiting for the schedule lock no longer spins a core.
+- A canceled session switch no longer stops the scheduler; a foreground resume can be stopped.
+- The agents widget timer stops on session shutdown.
+- Refuses to load next to `opensec-pi-swarm` (same tools and events); the first one loaded stays active and the other warns once.
+
+### Changed
+- Workflow scripts are documented as running with full host access: the vm is not a sandbox.
+- README: pi-bolt users install with `pi-bolt install npm:@kushalkhemka/opensec-pi-subagents@bun`; note on the `~/.pi/agent` directory shared by pi-bolt and Node Pi.
+
+## [0.19.7] - 2026-10-03
+
+### Changed
+- Docs: corrected README facts (Pi compatibility verified on Pi 0.87.1 and 1.0.0). No code changes.
+- License: the package is now proprietary (`UNLICENSED`); LICENSE keeps the upstream MIT notice for the included `@tintinweb/pi-subagents` code.
+
+## [0.19.6] - 2026-10-03
+
+### Changed
+- Docs: README restyle (logo, install for Node and Bun). No code changes.
+
+## [0.19.5] - 2026-10-03
+
+### Fixed
+- **Long schedules no longer fire every millisecond.** Timer delays above 2^31-1 ms (about 24.8 days) are clamped to 1 ms, so a `30d` interval spawned an agent every millisecond (each outside the concurrency queue) and a `+30d` or far ISO one-shot fired at once. Schedules now chain timers of at most 24 days. Intervals must be at least `1m` (stored shorter intervals are raised to one minute), intervals and relative delays are capped at `3650d`, and a fire is skipped (`subagents:scheduled` event `skipped`) while the job's previous agent is still running.
+- **Validating a cron schedule no longer leaves a timer running.** Every validation armed a croner job that was never stopped, so `pi -p` never exited once a cron job had been scheduled.
+- **Worktree agents no longer lose their work on a failed cleanup.** With no git identity the preservation commit failed and the worktree was force-removed while reporting no changes; a `git status` or `rev-parse` timeout did the same. The commit now retries with a placeholder author and runs with `commit.gpgsign=false`, and the worktree is removed only when it provably holds nothing; otherwise it is kept and its path reported, also when the agent itself failed. Worktrees are created inside a private (0700) temporary directory.
+- **Quitting waits up to 15 s for stopped worktree agents to save their changes** to a branch, instead of racing the process exit.
+- **A stop that lands before a subagent's session exists is honored.** An abort during startup (or a parent interrupt before a queued agent started) was lost and the agent ran its whole task.
+- **Pi 1.0: `@agent` mentions start the conversation clone again.** Assigning the clone's system prompt threw on Pi 1.0, so every mention fell back to a direct start.
+- **Pi 1.0: subagent transcripts no longer repeat the system prompt or record system messages as tool results.**
+
 ## [0.19.2] - 2026-09-26
 
 ### Changed

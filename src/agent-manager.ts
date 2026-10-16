@@ -360,6 +360,28 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
   try { session?.dispose?.(); } catch { /* ignore */ }
 }
 
+/**
+ * The note telling the caller where an isolated agent's changes went: a branch
+ * to merge, or a worktree kept on disk because they could not be committed (or
+ * its state could not be read). Empty when the worktree held nothing.
+ */
+function worktreeNote(
+  wtResult: { hasChanges: boolean; branch?: string; path?: string },
+  baseCwd: string,
+  customCwd: boolean,
+): string {
+  if (wtResult.hasChanges && wtResult.branch) {
+    // With a caller-supplied cwd the branch lives in THAT repo, not the
+    // parent session's — say so, or the orchestrator merges in the wrong repo.
+    const repoNote = customCwd ? ` in \`${baseCwd}\`` : "";
+    return `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd ? ` (run in \`${baseCwd}\`)` : ""}`;
+  }
+  if (wtResult.hasChanges && wtResult.path) {
+    return `\n\n---\nChanges could not be saved to a branch; the worktree was kept at \`${wtResult.path}\`.`;
+  }
+  return "";
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -890,16 +912,11 @@ export class AgentManager {
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            // Appended to the prose only. A structured child's caller parses
-            // `structuredJson`, which stays untouched — but `result` is also
-            // what a human reads, so the note still belongs on it.
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
-          }
+          // Appended to the prose only. A structured child's caller parses
+          // `structuredJson`, which stays untouched — but `result` is also
+          // what a human reads, so the note still belongs on it.
+          const note = worktreeNote(wtResult, baseCwd, customCwd !== undefined);
+          if (note) record.result = (record.result ?? "") + note;
         }
 
         this.abortOwnedChildren(id);
@@ -928,6 +945,10 @@ export class AgentManager {
           try {
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
+            // A failed run can still have changed files: say where they went,
+            // on the error every failure surface shows.
+            const note = worktreeNote(wtResult, baseCwd, customCwd !== undefined);
+            if (note) record.error = (record.error ?? "") + note;
           } catch { /* ignore cleanup errors */ }
         }
 
@@ -1166,47 +1187,66 @@ export class AgentManager {
       return record;
     }
 
-    // Foreground resume: run inline and return the settled record.
+    // Foreground resume returns its result inline, but still participates in
+    // lifecycle observers (widget, fleet list) like every other run.
+    if (record.status === "running" || record.status === "queued") return undefined;
+    record.isBackground = false;
+    record.resultConsumed = true;
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
 
-    try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-          this.onUsage?.(record, usage);
-          options?.onAssistantUsage?.(usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
-        },
-        signal,
-      });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
-      record.completedAt = Date.now();
-    } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
-    }
-
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
-    this.abortOwnedChildren(id);
-
+    const session = record.session;
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    const onParentAbort = () => this.abort(id);
+    // Keep the promise on the record as well as awaiting it inline: result
+    // tools and waitForAll must join this run, not the already settled spawn.
+    const promise = (async () => {
+      try {
+        this.onStart?.(record);
+        if (signal?.aborted) this.abort(id);
+        else signal?.addEventListener("abort", onParentAbort, { once: true });
+        const { text, failure } = abortController.signal.aborted ? { text: "" } : await resumeAgent(session, prompt, {
+          onToolActivity: (activity) => {
+            if (activity.type === "end") record.toolUses++;
+            options?.onToolActivity?.(activity);
+          },
+          onAssistantUsage: (usage) => {
+            addUsage(record.lifetimeUsage, usage);
+            this.onUsage?.(record, usage);
+            options?.onAssistantUsage?.(usage);
+          },
+          onCompaction: (info) => {
+            record.compactionCount++;
+            this.onCompact?.(record, info);
+            options?.onCompaction?.(info);
+          },
+          signal: abortController.signal,
+        });
+        if (record.status !== "stopped") {
+          record.status = failure ? "error" : "completed";
+          if (failure) record.error = failure;
+        }
+        record.result = text;
+        record.completedAt ??= Date.now();
+      } catch (err) {
+        if (record.status !== "stopped") {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+        }
+        record.completedAt ??= Date.now();
+      } finally {
+        signal?.removeEventListener("abort", onParentAbort);
+        this.abortOwnedChildren(id);
+        try { this.onComplete?.(record); } catch { /* completion observers do not replace the inline result */ }
+      }
+      return record.result ?? "";
+    })();
+    record.promise = promise;
+    await promise;
     return record;
   }
 
@@ -1527,6 +1567,30 @@ export class AgentManager {
       }
     }
     return count;
+  }
+
+  /**
+   * After abortAll() on quit: wait, at most `timeoutMs`, for runs that own a
+   * worktree (or may still be creating one) to settle, so their cleanup — the
+   * commit and branch that preserve the agent's changes — finishes before the
+   * process exits instead of racing it.
+   */
+  async awaitWorktreeCleanup(timeoutMs: number): Promise<void> {
+    const pending: Promise<unknown>[] = [];
+    for (const record of this.agents.values()) {
+      const startup = this.startups.get(record.id);
+      if (!record.worktree && !startup) continue;
+      // Re-checked after startup: only a run that ended up with a worktree has
+      // cleanup worth waiting for.
+      pending.push((startup ?? Promise.resolve()).catch(() => {}).then(() => record.worktree ? record.promise : undefined));
+    }
+    if (pending.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+    clearTimeout(timer);
   }
 
   /** Wait for all running and queued agents to complete (including queued ones). */

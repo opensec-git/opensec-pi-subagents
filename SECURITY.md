@@ -1,7 +1,6 @@
 # Security Policy
 
-This document explains the security model behind `opensec-pi-subagents` (a fork of
-`@tintinweb/pi-subagents`) and
+This document explains the security model behind `@kushalkhemka/opensec-pi-subagents` and
 where the boundaries are.
 
 `pi-subagents` is a [pi](https://pi.dev) extension. It spawns and orchestrates
@@ -31,9 +30,9 @@ coding agent and its sub-agents trivially, and this cannot be protected against.
 ## Reporting a Vulnerability
 
 If you believe you found a security vulnerability in `pi-subagents`, please
-report it privately by opening a draft advisory through
-[GitHub Security Advisories](https://github.com/opensec-git/Pi-Bolt/security/advisories/new)
-(Pi-Bolt's repository, which covers this extension). Issues that also affect the upstream project may be reported to it as well.
+contact the maintainer of `@kushalkhemka/opensec-pi-subagents` privately through
+your existing OpenSec support channel. Do not send fork-specific reports to
+the upstream project or include sensitive details in public issues.
 
 Please include:
 

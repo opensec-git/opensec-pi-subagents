@@ -153,6 +153,13 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   return { ...common, ok: false, error: record.error ?? `Agent ${record.status}.` };
 }
 
+/** A signal that fires when either does, or whichever one exists. */
+function eitherSignal(a: AbortSignal | undefined, b: AbortSignal | undefined): AbortSignal | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return AbortSignal.any([a, b]);
+}
+
 /** Shell used to run a `gate` command, mirroring how a user would type it. */
 const GATE_SHELL: readonly [string, string] =
   process.platform === "win32" ? ["cmd", "/c"] : ["sh", "-c"];
@@ -174,11 +181,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    * and the pre-cleanup hook both come through here — so "gate passed" is
    * decided from one behaviour, whichever route the command took.
    */
-  async function executeGate(command: string, cwd: string): Promise<WorkflowGateResult> {
+  async function executeGate(command: string, cwd: string, runSignal?: AbortSignal): Promise<WorkflowGateResult> {
+    const signal = eitherSignal(deps.signal, runSignal);
     const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
       cwd,
       timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
-      ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+      ...(signal !== undefined ? { signal } : {}),
     });
     const output = [result.stdout, result.stderr]
       .map(stream => stream.trim())
@@ -246,6 +254,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
        */
       let gate: WorkflowGateResult | undefined;
       let spawnedId: string | undefined;
+      // The session's signal stops the child on a kill or shutdown; the run's
+      // stops it when the run ends any other way, including while it is still
+      // creating its worktree, before `abortAgent` can know its id.
+      const signal = eitherSignal(deps.signal, request.signal);
 
       /**
        * Hand the child's EFFECTIVE configuration back to the run.
@@ -284,7 +296,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
               // the child's own failure — so running it would be pure cost.
               if (spawnedId === undefined || !succeeded(manager.getRecord(spawnedId))) return;
               try {
-                gate = await executeGate(command, worktreePath);
+                gate = await executeGate(command, worktreePath, request.signal);
               } catch (error) {
                 gate = { ok: false, output: error instanceof Error ? error.message : String(error) };
               }
@@ -329,7 +341,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             onSessionCreated: () => { sessionReady = true; reportResolved(); },
             ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
-            ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+            ...(signal !== undefined ? { signal } : {}),
             ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
             ...(onBeforeWorktreeCleanup !== undefined ? { onBeforeWorktreeCleanup } : {}),
           },
@@ -397,7 +409,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
     async runGate(command, gate) {
       // The child's worktree when it had one and it survived; otherwise the
       // session's own directory, which is where a non-isolated child worked.
-      return await executeGate(command, gate.cwd ?? ctx.cwd);
+      return await executeGate(command, gate.cwd ?? ctx.cwd, gate.signal);
     },
   };
 }

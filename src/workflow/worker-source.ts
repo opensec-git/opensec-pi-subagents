@@ -14,7 +14,8 @@
  * The worker/host split exists for *killability*: `worker.terminate()` stops a
  * runaway script mid-loop, which an in-process `vm` timeout cannot do once the
  * script is inside an `await`. The vm context exists for *determinism and
- * accident-avoidance*, not security — see the note on `codeGeneration` below.
+ * accident-avoidance*, not security: a script runs with the same access as pi
+ * itself (see below).
  *
  * ## Why the context gets no host built-ins
  *
@@ -25,11 +26,14 @@
  * arbitrary host-realm code.
  *
  * That said: our injected globals are themselves host closures, so
- * `agent.constructor` is still the host `Function`. The hygiene shrinks the
- * surface; it does not close the hole. **`codeGeneration: { strings: false }` is
- * the load-bearing defense** — it makes `Function("…")` and `eval("…")` throw
- * `EvalError`, so a captured host `Function` cannot compile anything. Treat this
- * as a determinism boundary, not a security boundary against a hostile script.
+ * `agent.constructor` is still the worker's own `Function`, and
+ * `agent.constructor("return process")()` compiles and runs code in the worker
+ * with full host access. `codeGeneration: { strings: false }` does NOT stop it:
+ * that flag only governs the vm realm's own `eval`/`Function`, not a constructor
+ * borrowed from another realm. It keeps a script's *accidental* `eval("…")`
+ * deterministic (it throws `EvalError`); it is not a defense. **This is not a
+ * sandbox.** A workflow script has the same filesystem, network and process
+ * access as pi itself, so only run scripts you would run as code.
  *
  * ## Why determinism is a prelude and not a stub
  *
@@ -135,12 +139,49 @@ function isFatal(error) {
 
 let progressQueue = [];
 let flushTimer = null;
+/**
+ * Log lines queued for the next flush, and lines dropped since the last one.
+ * A script that logs in a tight loop never yields to the flush timer, so the
+ * queue itself has to stay bounded: only the newest lines survive, and one
+ * marker line says how many did not. The host keeps its own bound on top.
+ */
+let queuedLogs = 0;
+let droppedLogs = 0;
+const MAX_QUEUED_LOGS = 2000;
+const MAX_LOG_LINE = 4096;
 
 function emit(entry) {
+  if (entry.type === "workflow_log") {
+    if (entry.message.length > MAX_LOG_LINE) {
+      entry.message = entry.message.slice(0, MAX_LOG_LINE) +
+        "… (" + (entry.message.length - MAX_LOG_LINE) + " more characters)";
+    }
+    // Compacted once the queue holds twice the cap, so a flood costs O(1) per
+    // line rather than a shift per line.
+    if (queuedLogs >= 2 * MAX_QUEUED_LOGS) trimQueuedLogs(MAX_QUEUED_LOGS - 1);
+    queuedLogs++;
+  }
   progressQueue.push(entry);
   // Batched on a macrotask: a fan-out emits a burst of phase/log entries in one
   // turn, and the host renders once per batch rather than once per entry.
   if (flushTimer === null) flushTimer = setTimeout(flushProgress, 0);
+}
+
+/** Drop all but the newest \`keep\` queued log lines, counting the rest. */
+function trimQueuedLogs(keep) {
+  const kept = [];
+  let room = keep;
+  for (let i = progressQueue.length - 1; i >= 0; i--) {
+    const queued = progressQueue[i];
+    if (queued.type === "workflow_log") {
+      if (room <= 0) { droppedLogs++; continue; }
+      room--;
+    }
+    kept.push(queued);
+  }
+  kept.reverse();
+  progressQueue = kept;
+  queuedLogs = keep - room;
 }
 
 function flushProgress() {
@@ -149,8 +190,18 @@ function flushProgress() {
     flushTimer = null;
   }
   if (progressQueue.length === 0) return;
+  if (queuedLogs > MAX_QUEUED_LOGS) trimQueuedLogs(MAX_QUEUED_LOGS);
   const batch = progressQueue;
   progressQueue = [];
+  queuedLogs = 0;
+  if (droppedLogs > 0) {
+    batch.unshift({
+      type: "workflow_log",
+      message: "… " + droppedLogs + " earlier log line" + (droppedLogs === 1 ? "" : "s") + " dropped",
+      dropped: droppedLogs,
+    });
+    droppedLogs = 0;
+  }
   port.postMessage({ type: "progress", entries: batch });
 }
 

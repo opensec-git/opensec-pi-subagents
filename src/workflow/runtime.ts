@@ -18,11 +18,12 @@ import { Worker } from "node:worker_threads";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
-import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
+import { appendProgress, tailText, type WorkflowAgentEntry, type WorkflowEntry } from "./progress.js";
+import { MAX_SCRIPT_LENGTH } from "./script-file.js";
 import { WORKER_SOURCE } from "./worker-source.js";
 
 /** Matches the `script` field's `maxLength` in the tool schema. */
-export const MAX_SCRIPT_LENGTH = 524_288;
+export { MAX_SCRIPT_LENGTH } from "./script-file.js";
 
 /** Agents one run may schedule, in total. */
 export const WORKFLOW_AGENT_CAP = 1000;
@@ -118,6 +119,17 @@ export interface WorkflowSpawnRequest {
    * itself — so exactly one execution either way.
    */
   gate?: string;
+  /**
+   * Aborted when the run ends, however it ends.
+   *
+   * {@link WorkflowHost.abortAgent} reaches only a child the host already has
+   * an id for, which may be well after the spawn began (an isolated child is
+   * still creating its worktree). A host must stop a child whose spawn is
+   * still in flight when this fires, or a run that ends without a kill (an
+   * unawaited launch, a script that throws while siblings start) leaves
+   * children running with nobody supervising them.
+   */
+  signal?: AbortSignal;
 }
 
 export interface WorkflowSpawnResult {
@@ -214,7 +226,10 @@ export interface WorkflowHost {
    * would mark unverified work as verified, so the runtime fails the call
    * instead of skipping it.
    */
-  runGate?(command: string, options: { agentId: string; cwd?: string }): Promise<WorkflowGateResult>;
+  runGate?(
+    command: string,
+    options: { agentId: string; cwd?: string; signal?: AbortSignal },
+  ): Promise<WorkflowGateResult>;
   /**
    * Resolve a nested `workflow()` reference to source.
    *
@@ -522,16 +537,33 @@ function applySchema(result: WorkflowSpawnResult, compiled: CompiledSchema): Wor
   };
 }
 
+/**
+ * `message`, plus where in the script it was thrown when the stack says.
+ *
+ * The model only sees the message, and "boom" alone sends it hunting through
+ * a script it cannot see line numbers for. The first frame in the script's own
+ * file (or a nested workflow's) names the line it wrote.
+ */
+export function withScriptLocation(message: string, stack: string | undefined): string {
+  if (stack === undefined) return message;
+  const frame = /(workflow(?::[^\s():]+)?\.js):(\d+):(\d+)/.exec(stack);
+  if (frame === null) return message;
+  const location = `${frame[1]}:${frame[2]}:${frame[3]}`;
+  return message.includes(location) ? message : `${message} (at ${location})`;
+}
+
 async function applyGate(
   result: WorkflowSpawnResult,
   command: string,
   agentId: string,
   runGate: NonNullable<WorkflowHost["runGate"]>,
+  signal: AbortSignal,
 ): Promise<WorkflowSpawnResult> {
   const outcome =
     result.gate ??
     (await runGate(command, {
       agentId,
+      signal,
       // Where the child worked, when it had a worktree of its own. Gating the
       // main tree instead would verify code the child never touched.
       ...(result.cwd !== undefined ? { cwd: result.cwd } : {}),
@@ -540,7 +572,10 @@ async function applyGate(
   if (outcome.ok) return kept;
   const { text: _discarded, ...rest } = kept;
   const output = outcome.output.trim();
-  return { ...rest, ok: false, error: output === "" ? `Gate command failed: ${command}` : output };
+  // The tail: a test runner prints its verdict last, and the whole of a
+  // chatty gate's output would otherwise ride in every progress entry and the
+  // persisted session entry.
+  return { ...rest, ok: false, error: output === "" ? `Gate command failed: ${command}` : tailText(output) };
 }
 
 /**
@@ -609,6 +644,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   let agentCount = 0;
   let aborted = false;
   let settled = false;
+  /**
+   * Aborted in `finish()`, so every spawn and gate still in flight stops when
+   * the run ends for any reason, not only on a kill (see
+   * {@link WorkflowSpawnRequest.signal}).
+   */
+  const runAbort = new AbortController();
 
   /* --- resume state ---------------------------------------------------- */
 
@@ -730,7 +771,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   return await new Promise<WorkflowRunResult>(resolve => {
     const emit = (entries: WorkflowEntry[]) => {
       if (entries.length === 0) return;
-      progress.push(...entries);
+      appendProgress(progress, entries);
       options.onProgress?.(entries);
     };
 
@@ -755,6 +796,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       releasePause();
       for (const agentId of inflight) host.abortAgent(agentId);
       inflight.clear();
+      runAbort.abort();
       semaphore.drain();
       // Resolve only once the thread is actually down, so a caller that awaits
       // runWorkflow() is guaranteed not to be leaking one.
@@ -1033,6 +1075,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     // child's worktree does, and hands back `result.gate`.
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
                     onResolved,
+                    signal: runAbort.signal,
                   });
             if (result.ok) {
               // Recorded before the gate runs: the child itself finished, so it is
@@ -1056,7 +1099,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                 result = applySchema(result, compiledSchema);
               }
               if (result.ok && payload.gate !== undefined && runGate !== undefined) {
-                result = await applyGate(result, payload.gate, agentId, runGate);
+                result = await applyGate(result, payload.gate, agentId, runGate, runAbort.signal);
               }
             }
           } catch (error) {
@@ -1117,7 +1160,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
               // already reports as skipped — the flag is taken from the result
               // rather than from the intent so an abort mid-skip still reads
               // as whatever actually happened to the child.
-              error: result.error ?? "Agent failed.",
+              error: tailText(result.error ?? "Agent failed."),
               ...(result.skipped ? { skipped: true } : {}),
             },
           ]);
@@ -1201,7 +1244,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           break;
         }
         case "error":
-          finish({ status: "failed", error: message.message });
+          finish({ status: "failed", error: withScriptLocation(message.message, message.stack) });
           break;
       }
     });

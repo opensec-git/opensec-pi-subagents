@@ -46,6 +46,7 @@ import {
   type WorkflowRunStatus,
 } from "../workflow/progress.js";
 import type { Theme } from "./agent-widget.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 /**
  * Header re-render cadence. Claude Code ticks the workflow clock once a second,
@@ -272,7 +273,13 @@ function rowGlyph(entry: WorkflowAgentEntry, glyphs: WorkflowGlyphs): WorkflowCa
 export function clampLine(line: WorkflowCardLine, width: number): WorkflowCardLine {
   const clamped: WorkflowCardLine = [];
   let used = 0;
-  for (const segment of line) {
+  for (const raw of line) {
+    // Every card and dialog row passes through here, and most of what they
+    // show (labels, log lines, errors, previews) is text a script or an agent
+    // wrote: strip its escape sequences and control characters before they
+    // reach the terminal. Measuring after stripping keeps the widths honest.
+    const text = sanitizeTerminalText(raw.text);
+    const segment = text === raw.text ? raw : { ...raw, text };
     const segmentWidth = visibleWidth(segment.text);
     if (used + segmentWidth <= width) {
       clamped.push(segment);
@@ -291,6 +298,9 @@ export function clampLine(line: WorkflowCardLine, width: number): WorkflowCardLi
 }
 
 const lineWidth = (line: WorkflowCardLine) => line.reduce((sum, s) => sum + visibleWidth(s.text), 0);
+
+/** Log messages the card shows, newest last. */
+export const CARD_LOG_LINES = 20;
 
 /**
  * Build the card.
@@ -388,7 +398,13 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   });
 
   // ---- log() output, below the tree ----
-  for (const message of logs) {
+  // The newest lines only: the card is re-laid out on every progress batch,
+  // and a script that logs in a loop would otherwise push the tree off screen.
+  const hiddenLogs = Math.max(0, logs.length - CARD_LOG_LINES);
+  if (hiddenLogs > 0) {
+    lines.push(clampLine([{ text: `  ${glyphs.log}  … ${hiddenLogs} earlier log line${hiddenLogs === 1 ? "" : "s"}`, color: "dim" }], width));
+  }
+  for (const message of hiddenLogs > 0 ? logs.slice(hiddenLogs) : logs) {
     const [first, ...rest] = message.split("\n");
     lines.push(clampLine([{ text: `  ${glyphs.log}  ${first}`, color: "dim" }], width));
     for (const continuation of rest) {

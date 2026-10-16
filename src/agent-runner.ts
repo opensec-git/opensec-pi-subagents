@@ -120,6 +120,8 @@ function extensionPackageName(extPath: string): string | undefined {
  */
 export function extensionCanonicalNames(extPath: string): string[] {
   const canonical = extensionCanonicalName(extPath);
+  // Inline extensions (`<inline:name>`) have no file, so no owning package.
+  if (extPath.startsWith("<inline:")) return [canonical];
   const pkg = extensionPackageName(extPath);
   return pkg && pkg !== canonical ? [canonical, pkg] : [canonical];
 }
@@ -203,6 +205,47 @@ export function parseExtSelectors(entries: string[]): {
   return { extNames, narrowing };
 }
 
+/** Name of the inline extension that enforces a subagent's tool scope. */
+const TOOL_SCOPE_GUARD_NAME = "subagent-tool-scope";
+/** The loader path pi gives that inline extension. */
+export const TOOL_SCOPE_GUARD_PATH = `<inline:${TOOL_SCOPE_GUARD_NAME}>`;
+
+export interface ToolScopeGuard {
+  /** Passed to the child loader's `extensionFactories`. */
+  extension: { name: string; hidden: boolean; factory: (pi: ExtensionAPI) => void };
+  /** Bind the scope check once it can be derived (after the loader reloads). */
+  setScope(inScope: () => Set<string>): void;
+}
+
+/**
+ * A `tool_call` handler that blocks out-of-scope tools for every call path.
+ *
+ * Replacing `session.agent.beforeToolCall` only covers calls the model makes
+ * directly. Pi 1.0 also lets tools call tools (`ctx.executeTool()`, used by
+ * codemode and `deferred` tools), and those calls go straight to the session's
+ * `tool_call` handlers against every registered codemode/deferred tool, active
+ * or not — so an `ext:`-narrowed subagent could still reach a tool it was
+ * never given. Extension `tool_call` handlers run on both paths.
+ */
+export function createToolScopeGuard(): ToolScopeGuard {
+  let inScope: (() => Set<string>) | undefined;
+  return {
+    extension: {
+      name: TOOL_SCOPE_GUARD_NAME,
+      hidden: true,
+      factory: (pi) => {
+        pi.on("tool_call", (event) => {
+          if (!inScope || inScope().has(event.toolName)) return undefined;
+          return { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` };
+        });
+      },
+    },
+    setScope(fn) {
+      inScope = fn;
+    },
+  };
+}
+
 /**
  * Keep a subagent's tool scope correct as extensions register tools over time.
  *
@@ -245,9 +288,11 @@ export function installExtensionToolScope(
      * seeded from `toolNames`.
      */
     readmitToolNames: Set<string>;
+    /** The child's inline `tool_call` guard, bound to the same scope. */
+    guard?: ToolScopeGuard;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, guard } = ctx;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -257,6 +302,7 @@ export function installExtensionToolScope(
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
+      if (extension.path === TOOL_SCOPE_GUARD_PATH) continue;
       const canons = extensionCanonicalNames(extension.path);
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
@@ -295,6 +341,8 @@ export function installExtensionToolScope(
   session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") renarrow();
   });
+
+  guard?.setScope(inScope);
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
@@ -356,6 +404,121 @@ let graceTurns = 5;
 export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
+
+/**
+ * Longest a single tool call may run, in seconds. 0 = no limit.
+ *
+ * Turn limits only count finished turns, and a turn whose tool never returns
+ * never finishes: a `find /` or a server that never closes would hold the agent
+ * forever. So a subagent's `bash` calls get this as their timeout (pi kills the
+ * whole process tree and reports the timeout to the model, which carries on),
+ * and a watchdog stops any other tool that overruns it and tells the agent to
+ * continue another way.
+ */
+let toolTimeoutSeconds = 1200;
+export const TOOL_TIMEOUT_CEILING = 86_400;
+
+/** Get the per-tool-call time limit in seconds (0 = no limit). */
+export function getToolTimeoutSeconds(): number { return toolTimeoutSeconds; }
+/** Set the per-tool-call time limit in seconds (0 = no limit). */
+export function setToolTimeoutSeconds(n: number): void {
+  toolTimeoutSeconds = Math.min(TOOL_TIMEOUT_CEILING, Math.max(0, Math.floor(n)));
+}
+
+/** How long past the limit the watchdog waits, so a timing-out `bash` reports its own timeout first. */
+const WATCHDOG_SLACK_MS = 60_000;
+const WATCHDOG_INTERVAL_MS = 5_000;
+/** Times one run is resumed after a stuck tool before it is left stopped. */
+export const MAX_TOOL_RECOVERIES = 3;
+const WATCHDOG_EXEMPT_TOOLS: ReadonlySet<string> = new Set(EXCLUDED_TOOL_NAMES);
+
+export interface HungTool {
+  toolName: string;
+  seconds: number;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 120) return `${seconds} seconds`;
+  return `${Math.round(seconds / 60)} minutes`;
+}
+
+/** The prompt that resumes an agent whose tool call the watchdog stopped. */
+export function hungToolPrompt(hung: HungTool): string {
+  return `Your ${hung.toolName} call ran for ${formatDuration(hung.seconds)} without finishing, so it was stopped and its `
+    + "output is lost. Continue the task without repeating that call: split the work into smaller, bounded steps "
+    + "(search specific folders rather than the whole filesystem, limit depth and output, add timeouts).";
+}
+
+/**
+ * Give a `bash` call's arguments the limit as their timeout when they set none —
+ * and, with `cap`, when they set a longer or invalid one. Pi mutates the same
+ * object it then executes with, so this changes the running call.
+ */
+export function boundBashTimeout(args: unknown, limitSeconds: number, cap: boolean): void {
+  if (limitSeconds <= 0 || !args || typeof args !== "object") return;
+  const call = args as { timeout?: unknown };
+  if (call.timeout == null) call.timeout = limitSeconds;
+  else if (cap && (typeof call.timeout !== "number" || !(call.timeout > 0) || call.timeout > limitSeconds)) {
+    call.timeout = limitSeconds;
+  }
+}
+
+/**
+ * Bound a subagent session's tool calls (see `toolTimeoutSeconds`).
+ *
+ * `bash` calls without a timeout, or with a longer one, get the limit. The
+ * watchdog covers every tool: past the limit (plus slack) it aborts the run,
+ * which kills a running command's process tree, and `takeHung()` then reports
+ * the call so the caller can resume the agent with `hungToolPrompt()`.
+ */
+export function installToolTimeouts(session: AgentSession, limitSeconds = toolTimeoutSeconds): {
+  takeHung(): HungTool | undefined;
+  dispose(): void;
+} {
+  if (limitSeconds <= 0) return { takeHung: () => undefined, dispose: () => {} };
+
+  const priorBeforeToolCall = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (context, signal) => {
+    if (context.toolCall.name === "bash") boundBashTimeout(context.args, limitSeconds, true);
+    return priorBeforeToolCall?.(context, signal);
+  };
+
+  const running = new Map<string, { toolName: string; started: number }>();
+  let hung: HungTool | undefined;
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    // Nested agents and workflows wait on child runs with their own limits.
+    if (event.type === "tool_execution_start" && !WATCHDOG_EXEMPT_TOOLS.has(event.toolName)) {
+      running.set(event.toolCallId, { toolName: event.toolName, started: Date.now() });
+    }
+    if (event.type === "tool_execution_end") running.delete(event.toolCallId);
+    if (event.type === "agent_end") running.clear();
+  });
+  const timer = setInterval(() => {
+    if (hung) return;
+    const now = Date.now();
+    for (const call of running.values()) {
+      if (now - call.started < limitSeconds * 1000 + WATCHDOG_SLACK_MS) continue;
+      hung = { toolName: call.toolName, seconds: Math.round((now - call.started) / 1000) };
+      running.clear();
+      void session.abort();
+      return;
+    }
+  }, WATCHDOG_INTERVAL_MS);
+  (timer as { unref?: () => void }).unref?.();
+
+  return {
+    takeHung() {
+      const out = hung;
+      hung = undefined;
+      return out;
+    },
+    dispose() {
+      clearInterval(timer);
+      unsubscribe();
+      session.agent.beforeToolCall = priorBeforeToolCall;
+    },
+  };
+}
 
 /**
  * Try to find the right model for an agent type.
@@ -595,6 +758,12 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
+  // An abort that landed before the session existed (a stop during startup,
+  // or a parent interrupt before a queued spawn started) fires no event now.
+  if (signal.aborted) {
+    session.abort();
+    return () => {};
+  }
   const onAbort = () => session.abort();
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
@@ -733,10 +902,13 @@ export async function runAgent(
     noExtensions || (loadAll && !hasExcludes)
       ? undefined
       : (base) => {
-          discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
+          discoveredNames = new Set(
+            base.extensions.filter((e) => e.path !== TOOL_SCOPE_GUARD_PATH).flatMap((e) => extensionCanonicalNames(e.path)),
+          );
           return {
             ...base,
             extensions: base.extensions.filter((e) => {
+              if (e.path === TOOL_SCOPE_GUARD_PATH) return true; // ours, not a user extension
               const canons = extensionCanonicalNames(e.path);
               if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
               return loadAll || canons.some((n) => keepNames.has(n));
@@ -744,11 +916,15 @@ export async function runAgent(
           };
         };
 
+  // Only with extensions loaded: under `noExtensions` the static allowlist
+  // already gates the registry itself (see installExtensionToolScope).
+  const toolScopeGuard = noExtensions ? undefined : createToolScopeGuard();
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
     noExtensions,
     additionalExtensionPaths,
+    extensionFactories: toolScopeGuard ? [toolScopeGuard.extension] : undefined,
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -1041,10 +1217,13 @@ export async function runAgent(
       extNames,
       narrowing,
       readmitToolNames,
+      guard: toolScopeGuard,
     });
   }
 
   options.onSessionCreated?.(session);
+
+  const toolTimeouts = installToolTimeouts(session);
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
@@ -1112,7 +1291,21 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    // Stopped before the session was ready: nothing was asked yet, so ask
+    // nothing — prompting now would run the whole task for nobody.
+    if (options.signal?.aborted) {
+      return { responseText: "", session, aborted: true, steered: false };
+    }
     await session.prompt(effectivePrompt);
+    for (let recoveries = 0; ; recoveries++) {
+      const hung = toolTimeouts.takeHung();
+      if (!hung) break;
+      if (aborted || options.signal?.aborted || recoveries >= MAX_TOOL_RECOVERIES) {
+        aborted = true;
+        break;
+      }
+      await session.prompt(hungToolPrompt(hung));
+    }
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1125,6 +1318,7 @@ export async function runAgent(
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
+    toolTimeouts.dispose();
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
@@ -1190,9 +1384,17 @@ export async function resumeAgent(
       })
     : () => {};
 
+  const toolTimeouts = installToolTimeouts(session);
   try {
+    if (options.signal?.aborted) return { text: "" };
     await session.prompt(prompt);
+    for (let recoveries = 0; recoveries < MAX_TOOL_RECOVERIES && !options.signal?.aborted; recoveries++) {
+      const hung = toolTimeouts.takeHung();
+      if (!hung) break;
+      await session.prompt(hungToolPrompt(hung));
+    }
   } finally {
+    toolTimeouts.dispose();
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();

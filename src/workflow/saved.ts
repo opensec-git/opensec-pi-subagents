@@ -37,12 +37,12 @@
  * author never intended to write.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isSymlink, isUnsafeName, safeReadFile } from "../memory.js";
 import { hasMetaDeclaration } from "./meta.js";
-import { MAX_SCRIPT_LENGTH } from "./runtime.js";
+import { MAX_SCRIPT_LENGTH, readWorkflowScriptFile } from "./script-file.js";
 
 /** Extension a saved workflow file carries. */
 const WORKFLOW_EXTENSION = ".js";
@@ -82,6 +82,7 @@ export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
   for (const root of roots) {
     if (isSymlink(root)) continue; // reject a symlinked root entirely, as skill-loader does
     const path = join(root, `${trimmed}${WORKFLOW_EXTENSION}`);
+    if (!isReadableScript(path)) continue;
     const script = safeReadFile(path);
     if (script === undefined) continue;
     // Found the file, so stop looking — a shadowing name that turns out not to
@@ -123,7 +124,7 @@ export function resolveWorkflowSource(
   if (path !== undefined && path !== "") {
     const resolved = isAbsolute(path) ? path : join(cwd, path);
     try {
-      return { ok: true, script: readFileSync(resolved, "utf-8"), path: resolved };
+      return { ok: true, script: readWorkflowScriptFile(resolved), path: resolved };
     } catch (err) {
       return {
         ok: false,
@@ -157,6 +158,16 @@ export function listSavedWorkflows(cwd: string): string[] {
   return [...names].sort();
 }
 
+/** A regular file no larger than a script may be; false for anything unreadable. */
+function isReadableScript(path: string): boolean {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() && stat.size <= MAX_SCRIPT_LENGTH;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether the file at `path` is a workflow rather than some other script.
  *
@@ -165,11 +176,7 @@ export function listSavedWorkflows(cwd: string): string[] {
  * to check its first line.
  */
 function isWorkflowFile(path: string): boolean {
-  try {
-    if (statSync(path).size > MAX_SCRIPT_LENGTH) return false;
-  } catch {
-    return false;
-  }
+  if (!isReadableScript(path)) return false;
   const source = safeReadFile(path);
   return source !== undefined && hasMetaDeclaration(source);
 }

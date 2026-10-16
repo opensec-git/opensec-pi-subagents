@@ -17,6 +17,11 @@ import type { ScheduledSubagent, ScheduleStoreData } from "./types.js";
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
 
+/** Block this thread for `ms` without spinning (synchronous, like the lock). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
@@ -35,8 +40,9 @@ function acquireLock(lockPath: string): void {
             continue;
           }
         } catch { /* ignore — try again */ }
-        const start = Date.now();
-        while (Date.now() - start < LOCK_RETRY_MS) { /* busy wait */ }
+        // Sleep instead of spinning: the holder is another Pi process, and a
+        // busy loop would burn a core for every retry it waits.
+        sleepSync(LOCK_RETRY_MS);
         continue;
       }
       throw e;
@@ -70,14 +76,30 @@ export class ScheduleStore {
     mkdirSync(dirname(this.filePath), { recursive: true });
   }
 
-  /** Load from disk into the in-memory cache. Silent on parse errors. */
+  /**
+   * Load from disk into the in-memory cache. A file that does not parse is
+   * moved aside to `<file>.corrupt` (with a warning) before the next save
+   * replaces it, so a hand-edit gone wrong can be recovered.
+   */
   private load(): void {
     if (!existsSync(this.filePath)) return;
+    let data: ScheduleStoreData;
     try {
-      const data: ScheduleStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
-      this.jobs.clear();
-      for (const j of data.jobs ?? []) this.jobs.set(j.id, j);
-    } catch { /* corrupt — start fresh, next save rewrites */ }
+      data = JSON.parse(readFileSync(this.filePath, "utf-8"));
+    } catch (err) {
+      const backup = `${this.filePath}.corrupt`;
+      try {
+        renameSync(this.filePath, backup);
+        console.warn(
+          `[pi-subagents] Schedule file ${this.filePath} is not valid JSON (${err instanceof Error ? err.message : String(err)}); moved it to ${backup}.`,
+        );
+      } catch (moveErr) {
+        console.warn(`[pi-subagents] Schedule file ${this.filePath} is not valid JSON and could not be moved aside:`, moveErr);
+      }
+      return;
+    }
+    this.jobs.clear();
+    for (const j of Array.isArray(data?.jobs) ? data.jobs : []) this.jobs.set(j.id, j);
   }
 
   /** Atomic write via temp file + rename (POSIX-atomic). */

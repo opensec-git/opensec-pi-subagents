@@ -40,6 +40,11 @@ export interface SubagentsSettings {
    */
   defaultMaxTurns?: number;
   graceTurns?: number;
+  /**
+   * Longest one tool call of a subagent may run, in seconds (0 = no limit,
+   * default 1200). See `toolTimeoutSeconds` in agent-runner.ts.
+   */
+  toolTimeoutSeconds?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -313,6 +318,7 @@ export interface SettingsAppliers {
   setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
+  setToolTimeoutSeconds: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -350,6 +356,7 @@ const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>
 const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
+const TOOL_TIMEOUT_CEILING = 86_400;
 const SUBAGENT_DEPTH_CEILING = 16;
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
@@ -386,6 +393,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.graceTurns as number) <= GRACE_TURNS_CEILING
   ) {
     out.graceTurns = r.graceTurns as number;
+  }
+  if (
+    Number.isInteger(r.toolTimeoutSeconds) &&
+    (r.toolTimeoutSeconds as number) >= 0 &&
+    (r.toolTimeoutSeconds as number) <= TOOL_TIMEOUT_CEILING
+  ) {
+    out.toolTimeoutSeconds = r.toolTimeoutSeconds as number;
   }
   if (
     Number.isInteger(r.maxSubagentDepth) &&
@@ -523,6 +537,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   }
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
+  if (typeof s.toolTimeoutSeconds === "number") appliers.setToolTimeoutSeconds(s.toolTimeoutSeconds);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);

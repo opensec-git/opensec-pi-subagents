@@ -62,6 +62,7 @@ import {
   type WorkflowEntry,
 } from "../workflow/progress.js";
 import { SPINNER, type Theme } from "./agent-widget.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 import {
   ASCII_GLYPHS,
   clampLine,
@@ -833,7 +834,7 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
     detailRows.push(detailHeading("Outcome", [], rightWidth));
     // Wrapped, not clamped: the outcome is the thing the reader came for, and
     // cutting it at the pane edge would hide the half that matters.
-    for (const text of wrapTextWithAnsi(outcomeBody(entry, display), Math.max(1, rightWidth - 4))) {
+    for (const text of wrapTextWithAnsi(sanitizeTerminalText(outcomeBody(entry, display)), Math.max(1, rightWidth - 4))) {
       detailRows.push(detailBody(text, rightWidth));
     }
   }

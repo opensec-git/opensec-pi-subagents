@@ -19,7 +19,7 @@ import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
+import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -70,6 +70,7 @@ import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/met
 import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
+import { readWorkflowScriptFile } from "./workflow/script-file.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
@@ -298,11 +299,57 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
  */
 export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
 
+const PACKAGE_NAME = "@kushalkhemka/opensec-pi-subagents";
+/** Shared with opensec-pi-swarm: which of the two packages is active in this process. */
+const OWNER_KEY = Symbol.for("pi-subagents:owner");
+const CONFLICT_WARNED_KEY = Symbol.for("pi-subagents:owner-conflict-warned");
+
+interface OwnerClaim { package: string; activations: number }
+
+/**
+ * Claim the process for this package, or report that the other fork holds it
+ * and return undefined. A claim by this same package (another activation) is
+ * shared, counted, and released by the last of them. Returns the release.
+ */
+function claimSubagentsOwner(pi: ExtensionAPI, packageName: string): (() => void) | undefined {
+  const global = globalThis as Record<symbol, unknown>;
+  const owner = global[OWNER_KEY] as OwnerClaim | undefined;
+  if (owner && owner.package !== packageName) {
+    const message = `${packageName} is disabled: ${owner.package} is already loaded and registers the same tools. ` +
+      "They cannot run together; uninstall one of them.";
+    pi.on("session_start", (_event, ctx) => {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else if (!global[CONFLICT_WARNED_KEY]) {
+        global[CONFLICT_WARNED_KEY] = true;
+        console.warn(`[pi-subagents] ${message}`);
+      }
+    });
+    return undefined;
+  }
+  const claim = owner ?? { package: packageName, activations: 0 };
+  claim.activations++;
+  global[OWNER_KEY] = claim;
+  let released = false;
+  // Called on shutdown, so the next activation (/reload, /new) can claim.
+  return () => {
+    if (released) return;
+    released = true;
+    if (global[OWNER_KEY] === claim && --claim.activations <= 0) delete global[OWNER_KEY];
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
+
+  // opensec-pi-subagents and opensec-pi-swarm (a fork of it) register the same
+  // tool names, `subagents:*` RPC events and process-global manager registry,
+  // so only one of them can be active in a process: the first to load claims
+  // it, and the other disables itself with a warning.
+  const releaseOwner = claimSubagentsOwner(pi, PACKAGE_NAME);
+  if (!releaseOwner) return;
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -1088,8 +1135,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
-    scheduler.stop();
+    // This event can be canceled, or target-session validation can fail after
+    // it returns. Pi confirms replacement by emitting session_shutdown; keep
+    // the current schedules and agent records intact until then.
   });
 
   // On shutdown, abort all agents immediately and clean up.
@@ -1106,15 +1154,23 @@ export default function (pi: ExtensionAPI) {
     if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
       delete (globalThis as any)[MANAGER_KEY];
     }
+    releaseOwner();
     scheduler.stop();
     // Before abortAll, and not folded into it: a workflow owns a worker thread
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
+    // A stopped worktree agent still commits its changes to a branch while it
+    // settles; dispose() does not wait for that, and the process exits next.
+    await manager.awaitWorktreeCleanup(15_000);
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
+    // Its 80 ms refresh interval otherwise outlives the session across /reload.
+    // The interval is cleared first; the UI calls after it may meet a context
+    // that is already gone.
+    try { widget.dispose(); } catch { /* stale UI context at shutdown */ }
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
@@ -1357,6 +1413,16 @@ export default function (pi: ExtensionAPI) {
     return record;
   }
 
+  // The main agent's `bash` calls get the tool timeout too, but only when they
+  // set none: the user is there to ask for a longer one. Pi's bash has no default,
+  // so an unbounded `grep -r … /` or a server started in the foreground would
+  // otherwise hold the turn until someone notices. (Subagents are also capped —
+  // see installToolTimeouts in agent-runner.ts.)
+  pi.on("tool_call", (event) => {
+    if (event.toolName === "bash") boundBashTimeout(event.input, getToolTimeoutSeconds(), false);
+    return undefined;
+  });
+
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
     widget.setUICtx(ctx.ui as UICtx);
@@ -1406,6 +1472,7 @@ export default function (pi: ExtensionAPI) {
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
       setDefaultMaxTurns,
       setGraceTurns,
+      setToolTimeoutSeconds,
       setDefaultJoinMode,
       setBackgroundByDefault,
       setSchedulingEnabled,
@@ -1442,7 +1509,7 @@ export default function (pi: ExtensionAPI) {
       Type.String({
         description:
           'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
-          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
+          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h", at least 1m), one-shot ("+10m" or ISO). ' +
           'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
       }),
     ),
@@ -2458,9 +2525,12 @@ Terse command-style prompts produce shallow, generic work.
       ),
     }),
 
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
+      // Parse `meta` only once the arguments stop streaming (or on a replayed
+      // call, which arrives with its result): every delta is a new prefix.
+      const parse = !context || context.argsComplete || context.executionStarted || !context.isPartial;
       return new Text(
-        `${theme.fg("toolTitle", "▸ ")}${theme.bold(theme.fg("toolTitle", "SubagentWorkflow"))}  ${theme.fg("muted", workflowCallName(args))}`,
+        `${theme.fg("toolTitle", "▸ ")}${theme.bold(theme.fg("toolTitle", "SubagentWorkflow"))}  ${theme.fg("muted", workflowCallName(args, { parse }))}`,
         0,
         0,
       );
@@ -2690,7 +2760,7 @@ Terse command-style prompts produce shallow, generic work.
     const path = isAbsolute(flag.trim()) ? flag.trim() : join(ctx.cwd, flag.trim());
     let script: string;
     try {
-      script = readFileSync(path, "utf-8");
+      script = readWorkflowScriptFile(path);
     } catch (err) {
       report(`Could not read ${path}: ${err instanceof Error ? err.message : String(err)}`, "warning");
       return;
@@ -2768,6 +2838,9 @@ Terse command-style prompts produce shallow, generic work.
             signal,
           );
         }
+        // A worktree agent has no promise until its copy is made; a failed
+        // start lands on the record as an error, so the rejection is dropped.
+        await abortable(manager.awaitStartup(record.id).catch(() => {}), signal);
         if (record.promise) await abortable(record.promise, signal);
       }
 
@@ -3444,6 +3517,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
+      toolTimeoutSeconds: getToolTimeoutSeconds(),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
@@ -3490,7 +3564,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "toolTimeoutSeconds", "maxSubagentDepth",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3499,6 +3573,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       const mcf = manager.getMaxConcurrentForeground();
       const dmt = getDefaultMaxTurns() ?? 0;
       const gt = getGraceTurns();
+      const tts = getToolTimeoutSeconds();
       const msd = getMaxSubagentDepth();
       // Label what unset actually does — it targets general-purpose even when
       // that is unregistered (the permissive hardcoded tier), so showing "none"
@@ -3536,6 +3611,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Grace turns after wrap-up steer (Enter to type)",
           currentValue: String(gt),
           values: [String(gt)],
+        },
+        {
+          id: "toolTimeoutSeconds",
+          label: "Tool timeout",
+          description: "Seconds one subagent tool call may run before it is stopped and the agent continues (0 = no limit, Enter to type)",
+          currentValue: String(tts),
+          values: [String(tts)],
         },
         {
           id: "maxSubagentDepth",
@@ -3717,6 +3799,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
         if (n >= 1) {
           setGraceTurns(n);
           notifyApplied(ctx, `Grace turns set to ${n}`);
+        }
+      } else if (id === "toolTimeoutSeconds") {
+        const n = parseInt(value, 10);
+        if (n >= 0) {
+          setToolTimeoutSeconds(n);
+          notifyApplied(ctx, n === 0 ? "Tool timeout off" : `Tool timeout set to ${getToolTimeoutSeconds()} s`);
         }
       } else if (id === "maxSubagentDepth") {
         const n = parseInt(value, 10);
@@ -3902,7 +3990,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+              : result === "toolTimeoutSeconds"
+                ? String(getToolTimeoutSeconds())
+                : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
@@ -3912,7 +4002,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : result === "toolTimeoutSeconds"
+                ? "Tool timeout in seconds (0 = no limit)"
+                : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.

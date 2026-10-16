@@ -10,10 +10,9 @@
  * agents at once would otherwise serialize them all on the TUI's event loop.
  */
 
-import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export interface WorktreeInfo {
@@ -57,9 +56,16 @@ export interface WorktreeCleanupResult {
   hasChanges: boolean;
   /** Branch name if changes were committed. */
   branch?: string;
-  /** Worktree path if it was kept. */
+  /**
+   * The worktree path. With a branch, where the work was (the worktree itself
+   * is removed); without one, a worktree that was KEPT because its state could
+   * not be read or its changes could not be committed to a branch.
+   */
   path?: string;
 }
+
+/** Author used only when the repository has no git identity configured. */
+const FALLBACK_IDENTITY = ["-c", "user.name=pi-agent", "-c", "user.email=pi-agent@localhost"];
 
 /**
  * Run git and return its trimmed stdout, throwing on failure so callers keep
@@ -104,8 +110,15 @@ export async function createWorktree(
   }
 
   const branch = `pi-agent-${agentId}`;
-  const suffix = randomUUID().slice(0, 8);
-  const worktreePath = join(tmpdir(), `pi-agent-${agentId}-${suffix}`);
+  // A private (0700, mkdtemp) parent, so other local users cannot read the
+  // copied repository the way they could a worktree made directly in $TMPDIR.
+  let parent: string;
+  try {
+    parent = mkdtempSync(join(tmpdir(), `pi-agent-${agentId}-`));
+  } catch {
+    return undefined;
+  }
+  const worktreePath = join(parent, branch);
 
   try {
     // Create detached worktree at HEAD
@@ -113,6 +126,7 @@ export async function createWorktree(
     return { path: worktreePath, branch, baseSha, workPath: subdir ? join(worktreePath, subdir) : worktreePath };
   } catch {
     // If worktree creation fails, return undefined (agent runs in normal cwd)
+    removeParentDir(worktreePath);
     return undefined;
   }
 }
@@ -129,9 +143,16 @@ export async function cleanupWorktree(
   agentDescription: string,
 ): Promise<WorktreeCleanupResult> {
   if (!existsSync(worktree.path)) {
+    removeParentDir(worktree.path);
     return { hasChanges: false };
   }
 
+  // The worktree is removed only when it provably holds nothing: status read
+  // and empty, and HEAD read and still at the base commit. Any failure along
+  // the way (a timeout, a commit or branch error) keeps it and reports where
+  // it is, since removing it with --force would discard the agent's work while
+  // reporting that it made none.
+  const kept: WorktreeCleanupResult = { hasChanges: true, path: worktree.path };
   try {
     // Check for uncommitted changes in the worktree
     const status = await git(pi, worktree.path, ["status", "--porcelain"], 10000);
@@ -141,8 +162,16 @@ export async function cleanupWorktree(
       await git(pi, worktree.path, ["add", "-A"], 10000);
       // Truncate description for commit message (no shell sanitization needed — pi.exec uses argv)
       const safeDesc = agentDescription.slice(0, 200);
-      const commitMsg = `pi-agent: ${safeDesc}`;
-      await git(pi, worktree.path, ["commit", "--no-verify", "-m", commitMsg], 10000);
+      // No signing: a gpg/ssh signing setup that needs a passphrase or agent
+      // would fail (or hang) this unattended commit.
+      const commitArgs = ["-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", `pi-agent: ${safeDesc}`];
+      try {
+        await git(pi, worktree.path, commitArgs, 10000);
+      } catch {
+        // Most often "Please tell me who you are": no user.name/user.email on
+        // this machine. Commit as a placeholder author rather than lose the work.
+        await git(pi, worktree.path, [...FALLBACK_IDENTITY, ...commitArgs], 10000);
+      }
     } else {
       const currentSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
 
@@ -151,6 +180,7 @@ export async function cleanupWorktree(
         await removeWorktree(pi, cwd, worktree.path);
         return { hasChanges: false };
       }
+      // The agent committed on its own; those commits live only here.
     }
 
     // Create a branch pointing to the worktree's HEAD.
@@ -165,20 +195,23 @@ export async function cleanupWorktree(
     }
     // Update branch name in worktree info for the caller
     worktree.branch = branchName;
-
-    // Remove the worktree (branch persists in main repo)
-    await removeWorktree(pi, cwd, worktree.path);
-
-    return {
-      hasChanges: true,
-      branch: worktree.branch,
-      path: worktree.path,
-    };
   } catch {
-    // Best effort cleanup on error
-    try { await removeWorktree(pi, cwd, worktree.path); } catch { /* ignore */ }
-    return { hasChanges: false };
+    return kept;
   }
+
+  // Remove the worktree (branch persists in main repo)
+  await removeWorktree(pi, cwd, worktree.path);
+
+  return {
+    hasChanges: true,
+    branch: worktree.branch,
+    path: worktree.path,
+  };
+}
+
+/** Remove the private parent createWorktree made, once the worktree is gone. */
+function removeParentDir(worktreePath: string): void {
+  try { rmdirSync(dirname(worktreePath)); } catch { /* not empty or already gone */ }
 }
 
 /**
@@ -193,6 +226,7 @@ async function removeWorktree(pi: ExtensionAPI, cwd: string, worktreePath: strin
       await git(pi, cwd, ["worktree", "prune"], 5000);
     } catch { /* ignore */ }
   }
+  removeParentDir(worktreePath);
 }
 
 /**
