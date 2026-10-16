@@ -26,6 +26,7 @@ import {
   writeInitialEntry,
 } from "./output-file.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, sessionFileLine } from "./status-note.js";
+import { argumentRepair, NESTED_AGENT_ARG_SHAPE, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -228,6 +229,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       inherit_context: Type.Optional(Type.Boolean()),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
+    prepareArguments: argumentRepair(NESTED_AGENT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
@@ -417,6 +419,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       agent_id: Type.String(),
       wait: Type.Optional(Type.Boolean()),
     }),
+    prepareArguments: argumentRepair(RESULT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal) => {
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId)) {
@@ -445,6 +448,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       agent_id: Type.String(),
       message: Type.String(),
     }),
+    prepareArguments: argumentRepair(STEER_ARG_SHAPE),
     execute: async (_toolCallId, params) => {
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {

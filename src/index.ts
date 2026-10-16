@@ -41,6 +41,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, sessionFileLine } from "./status-note.js";
+import { AGENT_ARG_SHAPE, argumentRepair, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -2401,6 +2402,8 @@ Terse command-style prompts produce shallow, generic work.
       ...isolationParam(isWorktreeIsolationEnabled()),
       ...scheduleParam,
     }),
+    // Weak models' malformed arguments, repaired before validation (tool-args.ts).
+    prepareArguments: argumentRepair(AGENT_ARG_SHAPE),
 
     // ---- Custom rendering: Claude Code style ----
 
@@ -2558,8 +2561,9 @@ Terse command-style prompts produce shallow, generic work.
       // foreground path. Resume deliberately doesn't: it replays the stored
       // session and ignores `subagent_type` entirely, so a note about type
       // substitution would be describing something that didn't happen.
+      // A blank type is what a call without one is repaired to (tool-args.ts).
       const fallbackNote = dispatch.ok && dispatch.fellBackFrom !== undefined
-        ? `Note: Unknown agent type "${dispatch.fellBackFrom}" — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
+        ? `Note: ${dispatch.fellBackFrom ? `Unknown agent type "${dispatch.fellBackFrom}"` : "No agent type given"} — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
         : "";
 
       const displayName = getDisplayName(subagentType);
@@ -3662,6 +3666,7 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
+    prepareArguments: argumentRepair(RESULT_ARG_SHAPE),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
@@ -3759,6 +3764,7 @@ Terse command-style prompts produce shallow, generic work.
         description: "The steering message to send. This will appear as a user message in the agent's conversation.",
       }),
     }),
+    prepareArguments: argumentRepair(STEER_ARG_SHAPE),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
