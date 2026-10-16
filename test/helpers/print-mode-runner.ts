@@ -162,6 +162,12 @@ export interface RunPrintModeOptions {
   reasoning?: boolean;
   /** The parent session's thinking level. Default: Pi's (from settings). */
   thinkingLevel?: ThinkingLevel;
+  /**
+   * The parent's session manager. Default: in memory. Pass a persisted one
+   * (`SessionManager.create` / `.open`) to keep the parent's entries on disk, so
+   * a second run can reopen the same session as after a restart.
+   */
+  sessionManager?: SessionManager;
 }
 
 export interface PrintModeRun {
@@ -404,7 +410,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRegistry: modelRegistry as any,
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager: options.sessionManager ?? SessionManager.inMemory(cwd),
     settingsManager,
     ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
   });

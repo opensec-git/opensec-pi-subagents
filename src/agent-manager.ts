@@ -75,6 +75,12 @@ const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 const MAX_TOMBSTONES = 100;
 
 /**
+ * The same bound for owned children — nested agents and workflow children —
+ * counted apart, so a large workflow cannot push the session's own agents out.
+ */
+const MAX_OWNED_TOMBSTONES = 200;
+
+/**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
  * (parent cwd). Anything else must be an absolute path to an existing
  * directory — curated errors instead of TypeErrors from path/fs internals
@@ -548,6 +554,7 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
     maxSubagentDepth: record.maxSubagentDepth,
     rootSessionId: record.rootSessionId,
     model: record.invocation?.modelId,
+    thinking: record.invocation?.thinking,
     cwd: record.cwd,
     baseCwd: record.baseCwd,
     isolated: record.isolated,
@@ -558,16 +565,26 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
   };
 }
 
+/** Session entry a top-level agent's final record goes into (with its resume state). */
+export const RECORD_ENTRY_TYPE = "subagents:record";
 /**
- * The resume states a session's `subagents:record` entries carry, oldest
- * first. Entries written before they carried one, or malformed ones, are
- * skipped: there is nothing to reopen them from.
+ * Session entry an owned child's resume state goes into: a nested agent's or a
+ * workflow's. Kept apart from {@link RECORD_ENTRY_TYPE}, which other extensions
+ * read as the session's own agents, while an owned child reports only through
+ * its owner. Carries the resume state alone, so it stays small.
+ */
+export const RESUME_ENTRY_TYPE = "subagents:resume";
+
+/**
+ * The resume states a session's `subagents:record` and `subagents:resume`
+ * entries carry, oldest first. Entries written before they carried one, or
+ * malformed ones, are skipped: there is nothing to reopen them from.
  */
 export function resumeStatesFromEntries(entries: readonly unknown[]): AgentResumeState[] {
   const out: AgentResumeState[] = [];
   for (const entry of entries) {
     const e = entry as { type?: unknown; customType?: unknown; data?: { resume?: unknown } } | null;
-    if (e?.type !== "custom" || e.customType !== "subagents:record") continue;
+    if (e?.type !== "custom" || (e.customType !== RECORD_ENTRY_TYPE && e.customType !== RESUME_ENTRY_TYPE)) continue;
     const state = e.data?.resume as Partial<AgentResumeState> | undefined;
     if (
       typeof state?.id !== "string" || typeof state.type !== "string"
@@ -1792,6 +1809,7 @@ export class AgentManager {
       maxSubagentDepth: entry.maxSubagentDepth,
       rootSessionId: entry.rootSessionId,
       invocation: {
+        ...(entry.thinking ? { thinking: entry.thinking } : {}),
         ...(entry.isolated ? { isolated: true } : {}),
         ...(entry.worktree ? { isolation: "worktree" as const } : {}),
       },
@@ -2147,11 +2165,17 @@ export class AgentManager {
 
   private keepTombstone(state: AgentResumeState): void {
     this.tombstones.set(state.id, state);
-    // Bound the memory a long session can accumulate. Oldest first, since the
-    // agent someone still wants to reach is the one they used most recently.
-    while (this.tombstones.size > MAX_TOMBSTONES) {
-      const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
-      this.tombstones.delete(oldest.id);
+    // Bound the memory a long session can accumulate, per kind (top-level or
+    // owned). Oldest first, since the agent someone still wants to reach is the
+    // one they used most recently.
+    const topLevel = isTopLevelAgent(state);
+    const sameKind = [...this.tombstones.values()].filter(entry => isTopLevelAgent(entry) === topLevel);
+    let excess = sameKind.length - (topLevel ? MAX_TOMBSTONES : MAX_OWNED_TOMBSTONES);
+    if (excess <= 0) return;
+    sameKind.sort((a, b) => a.completedAt - b.completedAt);
+    for (const entry of sameKind) {
+      if (excess-- <= 0) break;
+      this.tombstones.delete(entry.id);
     }
   }
 

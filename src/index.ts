@@ -18,7 +18,7 @@ import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, RECORD_ENTRY_TYPE, RESUME_ENTRY_TYPE, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -669,12 +669,29 @@ export default function (pi: ExtensionAPI) {
    */
   function appendRecordEntry(record: AgentRecord): void {
     try {
-      pi.appendEntry("subagents:record", {
+      pi.appendEntry(RECORD_ENTRY_TYPE, {
         id: record.id, type: record.type, description: record.description,
         status: record.status, result: record.result, error: record.error,
         startedAt: record.startedAt, completedAt: record.completedAt,
         resume: resumeStateOf(record),
       });
+    } catch { /* a session already torn down cannot record anything */ }
+  }
+
+  /**
+   * Write an owned child's resume state (a nested agent's, a workflow's) into
+   * the parent session, so `session_start` can rebuild it after a restart,
+   * `/resume`, `/fork` or `/reload`: its owner can then reopen it from its
+   * session file — the parent agent's nested tools, or a workflow's
+   * `agent({ resume })`. Only the resume state, never the result: the owner
+   * already has that, and the entry stays small. Nothing for an agent without
+   * a session file.
+   */
+  function appendResumeEntry(record: AgentRecord): void {
+    const resume = resumeStateOf(record);
+    if (!resume) return;
+    try {
+      pi.appendEntry(RESUME_ENTRY_TYPE, { resume });
     } catch { /* a session already torn down cannot record anything */ }
   }
 
@@ -687,8 +704,11 @@ export default function (pi: ExtensionAPI) {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
-    // notification, and UI channels.
-    if (!isTopLevelAgent(record)) return;
+    // notification, and UI channels. Their resume state is still recorded.
+    if (!isTopLevelAgent(record)) {
+      appendResumeEntry(record);
+      return;
+    }
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -1260,12 +1280,15 @@ export default function (pi: ExtensionAPI) {
     // Pi tears this extension instance down with the session, so agents still
     // running cannot be kept alive across the switch. Stop them, and record
     // each as stopped and resumable in the session it belongs to.
-    const interrupted = manager.listAgents().filter(r => isTopLevelAgent(r) && (r.status === "running" || r.status === "queued"));
+    const interrupted = manager.listAgents().filter(r => r.status === "running" || r.status === "queued");
     manager.abortAll();
     // A stopped worktree agent still commits its changes to a branch while it
     // settles; dispose() does not wait for that, and the process exits next.
     await manager.awaitWorktreeCleanup(15_000);
-    for (const record of interrupted) appendRecordEntry(record);
+    for (const record of interrupted) {
+      if (isTopLevelAgent(record)) appendRecordEntry(record);
+      else appendResumeEntry(record);
+    }
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     // Neither may fire into a torn-down instance (or hold `pi -p` open).
@@ -2840,7 +2863,19 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
-      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
+      // A run from before a restart, `/resume` or `/reload` is found by its
+      // files: its journal and saved script sit in this session's task dir.
+      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks, (id) => {
+        try {
+          const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId());
+          const journal = join(dir, `${id}.workflow.jsonl`);
+          if (!existsSync(journal)) return undefined;
+          const script = join(dir, `${id}.workflow.js`);
+          return { journalPath: journal, ...(existsSync(script) ? { scriptPath: script } : {}) };
+        } catch {
+          return undefined;
+        }
+      });
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
       // A resume with no source of its own re-runs what that run ran. The

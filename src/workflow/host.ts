@@ -436,8 +436,20 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       startupStops.get(agentId)?.abort();
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
-      const id = records.get(agentId);
+    async resumeAgent(agentId, prompt, onResolved, recordId) {
+      // A child of this run by its run-local id; otherwise one replayed from
+      // the journal, by the record it ran as — accepted only for a workflow's
+      // own children, so a journal cannot reach the session's agents or a
+      // nested agent's. The record may be live or only a tombstone (restored
+      // after a restart), which the manager reopens from its session file.
+      let id = records.get(agentId);
+      if (id === undefined && recordId !== undefined) {
+        const known = manager.getRecord(recordId) ?? manager.findTombstone(recordId);
+        if (known?.workflowId !== undefined && known.parentAgentId === undefined) {
+          id = recordId;
+          records.set(agentId, id);
+        }
+      }
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }

@@ -603,6 +603,31 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     expect(stub.resume).not.toHaveBeenCalled();
   });
 
+  it("resumes a child replayed from the journal by the record it ran as — a workflow child only", async () => {
+    const stub = stubManager();
+    const tombstones: Record<string, { workflowId?: string; parentAgentId?: string }> = {
+      "wf-child": { workflowId: "wf_old" },
+      "top-level": {},
+      nested: { parentAgentId: "agent-1" },
+    };
+    (stub.manager as any).findTombstone = (id: string) => tombstones[id];
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    // A workflow's own child, known only as a tombstone after a restart.
+    expect(await host.resumeAgent?.("wf-agent-0", "continue", undefined, "wf-child")).toMatchObject({ ok: true });
+    expect(stub.resume).toHaveBeenCalledWith("wf-child", "continue", undefined, expect.anything());
+    // Mapped for the rest of the run, like a child it spawned.
+    host.abortAgent("wf-agent-0");
+    expect(stub.abort).toHaveBeenCalledWith("wf-child");
+
+    // A journal cannot reach the session's own agents or a nested agent's.
+    stub.resume.mockClear();
+    expect((await host.resumeAgent?.("wf-agent-1", "x", undefined, "top-level"))?.ok).toBe(false);
+    expect((await host.resumeAgent?.("wf-agent-2", "x", undefined, "nested"))?.ok).toBe(false);
+    expect((await host.resumeAgent?.("wf-agent-3", "x", undefined, "unknown"))?.ok).toBe(false);
+    expect(stub.resume).not.toHaveBeenCalled();
+  });
+
   it("asks the manager for a pre-cleanup hook only when the agent is gated", async () => {
     // The hook is how a gate reaches the child's worktree before it is deleted
     // (see workflow-gate-worktree.test.ts). An ungated agent must not acquire

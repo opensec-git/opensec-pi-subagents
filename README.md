@@ -92,11 +92,13 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
   file, under the same id, for as long as that file exists. Sessions are saved by default (`rememberAgents`; turn it
   off and agents are resumable only for those ten minutes).
 - What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
-  stay resumable by the model and by `@handle`. Agents still running are stopped, as before, and recorded as stopped
-  and resumable. `/new` starts with none. Nested agents can be resumed by their parent while their parent's manager
-  lives; across a restart only top-level agents are rebuilt.
+  stay resumable by the model and by `@handle`. `/new` starts with none. Nested agents and workflow children are
+  rebuilt too (their resume state is written to the parent session as `subagents:resume` entries, one small entry per
+  settled child): a nested agent stays resumable by the agent that owns it, once that agent is resumed under its id.
 - In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
-  was evicted.
+  was evicted. `resumeFromRunId` finds a run of the same session after a restart or `/resume` by its files, and a child
+  it replays from the journal can still be continued with `agent({ resume })`: the journal records which agent
+  produced each answer.
 
 ### Model and thinking level
 

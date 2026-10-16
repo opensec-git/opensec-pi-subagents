@@ -105,10 +105,10 @@ Every run journals each settled `agent()` call beside its script as `<run id>.wo
 
 Four things it will not do:
 
-- **Cross sessions.** The journal is keyed to the session that wrote it. Restart pi and the run id is dead — you get `No workflow run "<id>" in this session.`
+- **Cross sessions.** The journal is keyed to the session that wrote it; another session gets `No workflow run "<id>" in this session.` A restart, `/resume` or `/reload` of the same session keeps it: the run is found by its journal and saved script in the session's task directory.
 - **Resume a live run.** Stop it from `/agents → Workflows` first; while it is running you get `Workflow "<id>" is still running.`
 - **Replay a failure.** A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. That is the point.
-- **Replay a run that used `agent({ resume })` at all.** A replayed agent is text from a file rather than a live child, so there would be no conversation left for a later `resume` to continue.
+- **Replay a run whose `agent({ resume })` calls cannot be continued.** A replayed agent is text from a file rather than a live child. Each journal entry records the agent that produced it (`ref`), and the parent session records that agent's resume state, so a later `resume` of a replayed child reopens its conversation from its session file — also after a restart. A journal written before `ref` existed is declined whole if it used `resume`.
 
 Replayed rows are annotated `from resume journal` on the card and in the inspector, and the completion notification counts them — a resume never quietly looks like a run that was simply fast. Passing only `resumeFromRunId`, with no script of its own, re-runs that run's own script.
 

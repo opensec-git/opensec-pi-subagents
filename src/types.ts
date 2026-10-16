@@ -170,6 +170,11 @@ export interface AgentResumeState {
   rootSessionId?: string;
   /** `provider/id` of the model the agent's session ran on. */
   model?: string;
+  /**
+   * Thinking level its session ran at. Informational: a reopened session
+   * restores the level saved in its own file.
+   */
+  thinking?: EffectiveThinkingLevel;
   /** Caller-supplied working directory, if any. */
   cwd?: string;
   /** The directory it ran from; for a worktree agent, the repo. */

@@ -225,6 +225,12 @@ export interface WorkflowHost {
      * the row above it shows the one that ran.
      */
     onResolved?: WorkflowSpawnRequest["onResolved"],
+    /**
+     * The agent record the child ran as, when the runtime knows it. Set for a
+     * child replayed from the journal: it never ran in this run, so `agentId`
+     * is unknown to the host, and this is what it reopens instead.
+     */
+    recordId?: string,
   ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
@@ -500,6 +506,12 @@ interface CompletedChild {
   agentType: string;
   model?: string;
   isolation?: "worktree";
+  /**
+   * The agent record behind it, when known. What lets a child replayed from
+   * the journal — which never ran in this run — be continued: the host reopens
+   * that record from its session file.
+   */
+  recordId?: string;
 }
 
 /**
@@ -670,11 +682,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
    * recorded there — every later call runs live, however well it matches.
    * See the header of journal.ts for why this is a prefix and not a lookup.
    */
-  // A journal from a run that used `agent({ resume })` is declined whole: see
-  // journal.ts on why a replayed agent leaves nothing for a later resume to
-  // continue. Declining up front beats stranding the first `resume` call
-  // partway through a run that has already spent its cheap half.
-  const journalResumes = journalEntries.some(entry => entry.resumed);
+  // A journal from a run that used `agent({ resume })` is declined whole when
+  // those entries carry no `ref`: see journal.ts on why such a replayed agent
+  // leaves nothing for a later resume to continue. Declining up front beats
+  // stranding the first `resume` call partway through a run that has already
+  // spent its cheap half.
+  const journalResumes = journalEntries.some(entry => entry.resumed && entry.ref === undefined);
   let prefixIntact = journalEntries.length > 0 && !journalResumes;
   let replayedCount = 0;
 
@@ -963,10 +976,29 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           },
         ]);
         openLaunches.delete(callId);
+        // A replayed child with a known record can still be continued by a
+        // later `resume`: the host reopens it from its session file.
+        if (replayed.ref !== undefined) {
+          completedByLabel.set(label, {
+            agentId,
+            label,
+            agentType,
+            ...(model !== undefined ? { model } : {}),
+            ...(isolation !== undefined ? { isolation } : {}),
+            recordId: replayed.ref,
+          });
+        }
         // Re-recorded so this run's journal is complete on its own terms: a
         // resume of a resume must not have to walk back through a chain of
         // earlier files to find the prefix.
-        recordJournal?.({ index, key: replayed.key, ok: true, text: replayedText });
+        recordJournal?.({
+          index,
+          key: replayed.key,
+          ok: true,
+          text: replayedText,
+          ...(replayed.resumed ? { resumed: true as const } : {}),
+          ...(replayed.ref !== undefined ? { ref: replayed.ref } : {}),
+        });
         respond(callId, true, replayedText);
         return;
       }
@@ -1066,7 +1098,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             result =
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved, resumed.recordId)
                 : await host.spawnAgent({
                     agentId,
                     index,
@@ -1095,6 +1127,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                 agentType,
                 ...(model !== undefined ? { model } : {}),
                 ...(isolation !== undefined ? { isolation } : {}),
+                ...(base.recordId !== undefined ? { recordId: base.recordId } : {}),
               });
               // Re-checked here, not just in the child's tool: this is the one
               // place that decides the script's value matches the schema it
@@ -1152,7 +1185,16 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           if (result.ok) {
             const text = result.text ?? "";
             emit([{ ...common, state: "done", resultPreview: preview(text) }]);
-            recordJournal?.({ index, key, ok: true, text, ...resumeMark });
+            recordJournal?.({
+              index,
+              key,
+              ok: true,
+              text,
+              ...resumeMark,
+              // The record behind the answer, so a later run that replays this
+              // entry can still continue the agent.
+              ...(base.recordId !== undefined ? { ref: base.recordId } : {}),
+            });
             respond(callId, true, text);
             return;
           }
