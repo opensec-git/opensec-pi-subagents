@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, statSync }
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { commandExec } from "./exec-tree.js";
 
 export interface WorktreeInfo {
   /** Absolute path to the worktree directory (the copied repo's root). */
@@ -77,7 +78,9 @@ const FALLBACK_IDENTITY = ["-c", "user.name=pi-agent", "-c", "user.email=pi-agen
  * clean exit".
  */
 async function git(pi: ExtensionAPI, cwd: string, args: string[], timeout: number): Promise<string> {
-  const result = await pi.exec("git", args, { cwd, timeout });
+  // Through `commandExec`: a timeout ends git's whole process tree (hooks,
+  // filters), not only git itself.
+  const result = await commandExec(pi)("git", args, { cwd, timeout });
   if (result.killed || result.code !== 0) {
     throw new Error(result.stderr.trim() || `git ${args.join(" ")} failed (exit ${result.code})`);
   }

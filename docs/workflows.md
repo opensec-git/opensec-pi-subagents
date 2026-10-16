@@ -301,12 +301,15 @@ The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only
 | Items per `parallel`/`pipeline` **call** | 4096 |
 | Nested `workflow()` calls per run | 256 |
 | Script length | 512 KiB |
+| One `gate` command | 10 minutes, then SIGTERM to its whole process tree and SIGKILL 5 s later |
 
 These are three different things and are easy to conflate: 1000 is a budget for the whole run, the concurrency figure is how many run *simultaneously*, and 4096 is per call rather than per run. Excess items queue rather than melting the machine.
 
 Above 25 scheduled agents, or 1.5M tokens actual or projected, the card adds `⚠ Large workflow · /agents → Workflows to stop`.
 
 A run's concurrency limit is its own, independent of the session's `maxConcurrent` and `maxConcurrentForeground` pools — its agents do not enter either.
+
+A `gate` runs in its own process group (on Windows, as a process tree): a timeout or a stopped run ends everything the command started, and processes it leaves running when it exits (a dev server, a watcher) are ended too. The git calls behind worktree isolation are bounded the same way.
 
 ### Settings and the CLI flag
 

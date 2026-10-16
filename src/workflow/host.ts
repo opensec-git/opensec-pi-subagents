@@ -36,6 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { commandExec } from "../exec-tree.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import { isProjectCodeTrusted, isProjectTrustedBy } from "../project-trust.js";
@@ -184,9 +185,13 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    */
   async function executeGate(command: string, cwd: string, runSignal?: AbortSignal): Promise<WorkflowGateResult> {
     const signal = eitherSignal(deps.signal, runSignal);
-    const result = await pi.exec(GATE_SHELL[0], [GATE_SHELL[1], command], {
+    // Through `commandExec`: a timeout or abort ends the command's whole
+    // process tree, escalating to SIGKILL, and processes the gate leaves
+    // behind are ended when it exits.
+    const result = await commandExec(pi)(GATE_SHELL[0], [GATE_SHELL[1], command], {
       cwd,
       timeout: deps.gateTimeoutMs ?? DEFAULT_GATE_TIMEOUT_MS,
+      killTreeOnExit: true,
       ...(signal !== undefined ? { signal } : {}),
     });
     const output = [result.stdout, result.stderr]

@@ -25,6 +25,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
+import { useTreeKillingExec } from "./exec-tree.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -349,6 +350,10 @@ export default function (pi: ExtensionAPI) {
   // it, and the other disables itself with a warning.
   const releaseOwner = claimSubagentsOwner(pi, PACKAGE_NAME);
   if (!releaseOwner) return;
+
+  // Gates and worktree git calls run so a timeout or stop ends their whole
+  // process tree, which Pi's own `pi.exec` does not do (see exec-tree.ts).
+  useTreeKillingExec(pi);
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
