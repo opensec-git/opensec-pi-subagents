@@ -427,6 +427,40 @@ describe("createWorkflowHost — scopeModels", () => {
     registerAgents(new Map());
   });
 
+  it("runs an agent whose file names an ambiguous model on the parent's, warning once per run", async () => {
+    registerAgents(new Map([["pinned", {
+      name: "pinned", displayName: "Pinned", description: "pins an ambiguous model", extensions: false, skills: false,
+      model: "anthropic", systemPrompt: "pinned", promptMode: "replace",
+    } as any]]));
+    const stub = stubManager();
+    const parent = ALLOWED;
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx({ model: parent }), manager: stub.manager });
+
+    const first = await host.spawnAgent(request({ agentType: "pinned" }));
+    await host.spawnAgent(request({ agentType: "pinned" }));
+
+    expect(first.ok).toBe(true);
+    const options = stub.spawnAndWait.mock.calls[0][4];
+    expect(options.model).toBe(parent);
+    expect(options.modelNote).toBe(
+      'Note: model "anthropic" from the agent file is ambiguous (candidates: anthropic/allowed-model, '
+        + "anthropic/blocked-model); ran on anthropic/allowed-model instead.",
+    );
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(options.modelNote, "warning");
+  });
+
+  it("refuses an ambiguous model the script named, with the candidates", async () => {
+    const stub = stubManager();
+    const host = createWorkflowHost({ pi: {} as any, ctx: scopedCtx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ model: "anthropic" }));
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Model "anthropic" is ambiguous');
+    expect(stub.spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("refuses a model the script named that is out of scope, and fails only that agent", async () => {
     setScopeModelsEnabled(true);
     const stub = stubManager();

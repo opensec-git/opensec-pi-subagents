@@ -38,7 +38,7 @@ import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { commandExec } from "../exec-tree.js";
 import { isModelOverrideAllowed } from "../invocation-config.js";
-import { resolveModel } from "../model-resolver.js";
+import { resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import { isProjectCodeTrusted, isProjectTrustedBy } from "../project-trust.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
@@ -213,12 +213,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    */
   const startupStops = new Map<string, AbortController>();
   /**
-   * scopeModels warnings already toasted, so a fan-out that pins one
-   * out-of-scope agent file raises one notification rather than one per child.
-   * Kept for the whole run: the same message is the same warning at agent 200
-   * as it was at agent 1.
+   * Model warnings already toasted — scopeModels, and an agent file's model
+   * that did not resolve — so a fan-out that pins one such agent file raises
+   * one notification rather than one per child. Kept for the whole run: the
+   * same message is the same warning at agent 200 as it was at agent 1.
    */
-  const warnedScopeMessages = new Set<string>();
+  const warnedModelMessages = new Set<string>();
 
   /**
    * Run a gate command in `cwd`. The only place a gate is executed — `runGate`
@@ -255,8 +255,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
 
       // Same precedence as the Agent tool: the caller's model wins, the agent
       // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
+      // named and we cannot resolve (missing, or ambiguous) is an error; one the
+      // definition named falls back to the parent, with a warning — the
+      // script's value is the child's answer, so the note cannot go into it.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
       // A script's `model` and `effort` are per-call choices, ignored unless
@@ -266,12 +267,21 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const requestedModel = overridesAllowed ? request.model : undefined;
       const effort = overridesAllowed ? request.effort : undefined;
       const modelInput = requestedModel ?? config?.model;
+      let modelNote: string | undefined;
       if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (requestedModel !== undefined) return { ok: false, error: resolved };
+        const resolution = resolveModelDetailed(modelInput, ctx.modelRegistry);
+        if (resolution.ok) {
+          model = resolution.model;
+        } else if (requestedModel !== undefined) {
+          return { ok: false, error: resolution.message };
         } else {
-          model = resolved;
+          modelNote = unresolvedModelNote(modelInput, unresolvedReason(resolution), model ?? "the parent's model");
+          // Once per run and message, like the scope warning below: a fan-out
+          // of one agent type would otherwise repeat it per child.
+          if (!warnedModelMessages.has(modelNote)) {
+            warnedModelMessages.add(modelNote);
+            ctx.ui.notify(modelNote, "warning");
+          }
         }
       }
 
@@ -294,8 +304,8 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // takes above. The script sees `null` and its siblings carry on, which is
       // the difference between one refused model and a discarded fan-out.
       if (scopeVerdict.kind === "error") return { ok: false, error: scopeVerdict.message };
-      if (scopeVerdict.kind === "warn" && !warnedScopeMessages.has(scopeVerdict.message)) {
-        warnedScopeMessages.add(scopeVerdict.message);
+      if (scopeVerdict.kind === "warn" && !warnedModelMessages.has(scopeVerdict.message)) {
+        warnedModelMessages.add(scopeVerdict.message);
         ctx.ui.notify(scopeVerdict.message, "warning");
       }
 
@@ -378,6 +388,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
+            ...(modelNote !== undefined ? { modelNote } : {}),
             // Validated worker-side against the same list pi accepts, so the
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —

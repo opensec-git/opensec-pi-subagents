@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeModel, type ModelRegistry, resolveModel } from "../src/model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -194,11 +194,12 @@ describe("resolveModel", () => {
       expect(result).toContain("openai/gpt-4o");
     });
 
-    it("empty string matches a model (multi-part vacuous truth)", () => {
-      // Empty string splits to empty parts; every() on empty array is true
-      // This is fine — callers guard against empty input
+    it("empty string matches every model, so it is ambiguous rather than a pick", () => {
+      // Callers guard against empty input; if one slips through, it must not
+      // land on whichever model happens to come first.
       const result = resolveModel("", makeRegistry());
-      expect(typeof result).toBe("object");
+      expect(typeof result).toBe("string");
+      expect(result).toContain("is ambiguous");
     });
   });
 
@@ -232,10 +233,13 @@ describe("resolveModel", () => {
       { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
     ];
 
-    it("'sonnet' prefers tighter id match (shorter id)", () => {
+    it("'sonnet' matching two models is refused, naming both, closest first", () => {
       const result = resolveModel("sonnet", makeRegistry(SIMILAR_MODELS));
-      // "sonnet" is a larger fraction of "claude-sonnet-4-6" than "claude-sonnet-4-5-20241022"
-      expect(result).toEqual(SIMILAR_MODELS[0]);
+      expect(typeof result).toBe("string");
+      expect(result).toContain('Model "sonnet" is ambiguous');
+      // "sonnet" is a larger fraction of "claude-sonnet-4-6", so it is named first.
+      expect(result).toContain("anthropic/claude-sonnet-4-6, anthropic/claude-sonnet-4-5-20241022.");
+      expect(result).not.toContain("claude-haiku");
     });
 
     it("'sonnet 4.5' resolves to the 4.5 model via name", () => {
@@ -246,6 +250,71 @@ describe("resolveModel", () => {
     it("'4-6' picks the 4.6 model", () => {
       const result = resolveModel("4-6", makeRegistry(SIMILAR_MODELS));
       expect(result).toEqual(SIMILAR_MODELS[0]);
+    });
+  });
+
+  describe("ambiguity is an error, never a silent pick", () => {
+    it("still resolves an exact provider/id, case-insensitively", () => {
+      const SIMILAR = [
+        { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
+        { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic" },
+      ];
+      expect(resolveModel("Anthropic/Claude-Sonnet-4-5", makeRegistry(SIMILAR))).toEqual(SIMILAR[1]);
+    });
+
+    it("refuses an exact id that two providers serve", () => {
+      const twice = [
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" },
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" },
+      ];
+      const result = resolveModelDetailed("claude-haiku-4-5", makeRegistry(twice));
+      expect(result).toMatchObject({
+        ok: false,
+        reason: "ambiguous",
+        candidates: ["anthropic/claude-haiku-4-5", "openrouter/claude-haiku-4-5"],
+      });
+      // Naming the provider settles it.
+      expect(resolveModel("openrouter/claude-haiku-4-5", makeRegistry(twice))).toEqual(twice[1]);
+    });
+
+    it("prefers a unique exact id over looser matches of others", () => {
+      const models = [
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" },
+        { id: "claude-haiku-4-5-thinking", name: "Claude Haiku Thinking", provider: "anthropic" },
+      ];
+      expect(resolveModel("claude-haiku-4-5", makeRegistry(models))).toEqual(models[0]);
+    });
+
+    it("names at most five candidates, and how many more there are", () => {
+      const many = Array.from({ length: 8 }, (_, i) => ({ id: `gpt-5-variant-${i}`, name: `GPT 5 ${i}`, provider: "openai" }));
+      const result = resolveModelDetailed("gpt-5", makeRegistry(many));
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.candidates).toHaveLength(5);
+      expect(result.message).toContain("(and 3 more)");
+    });
+
+    it("reports an ambiguous bare name after the provider fallback as ambiguous, not missing", () => {
+      const twice = [
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "bedrock" },
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" },
+      ];
+      const result = resolveModelDetailed("anthropic/claude-haiku-4-5", makeRegistry(twice));
+      expect(result).toMatchObject({ ok: false, reason: "ambiguous" });
+    });
+
+    it("words the run's note with the candidates and the model used instead", () => {
+      const failure = resolveModelDetailed("sonnet", makeRegistry([
+        { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
+        { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic" },
+      ]));
+      if (failure.ok) throw new Error("expected ambiguity");
+      expect(unresolvedModelNote("sonnet", unresolvedReason(failure), { provider: "openai", id: "gpt-5" })).toBe(
+        'Note: model "sonnet" from the agent file is ambiguous (candidates: anthropic/claude-sonnet-4-6, '
+          + "anthropic/claude-sonnet-4-5); ran on openai/gpt-5 instead.",
+      );
+      expect(unresolvedModelNote("nope", unresolvedReason({ reason: "not-found", candidates: [] }), undefined, "the scheduled job"))
+        .toBe('Note: model "nope" from the scheduled job was not found among the available models; ran on the default model instead.');
     });
   });
 

@@ -31,7 +31,7 @@ import { GroupJoinManager } from "./group-join.js";
 import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { describeModel, type ModelRegistry, resolveModel, resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -269,6 +269,8 @@ function formatTaskNotification(
     // What the run actually ran on, which a fuzzy model name or a fallback can change.
     record.invocation?.modelId ? `<model>${escapeXml(record.invocation.modelId)}</model>` : null,
     record.invocation?.modelId && record.invocation.thinking ? `<thinking>${escapeXml(record.invocation.thinking)}</thinking>` : null,
+    // The agent file's model did not resolve and the run used another.
+    record.modelNote ? `<model-note>${escapeXml(record.modelNote)}</model-note>` : null,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
     resultBytes,
@@ -2273,13 +2275,13 @@ export default function (pi: ExtensionAPI) {
   // them goes too — a model told it may pick a model will keep trying.
   const modelOverrideAllowed = isModelOverrideAllowed();
   const modelGuideline = modelOverrideAllowed
-    ? `- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").\n- Use thinking to control extended thinking level.\n`
+    ? `- Use model to specify a different model (as "provider/modelId", or a short name such as "haiku" that matches exactly one available model; a name that matches several is refused).\n- Use thinking to control extended thinking level.\n`
     : "";
   const modelParamShape = {
     model: Type.Optional(
       Type.String({
         description:
-          'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+          'Optional model override. Accepts "provider/modelId", or a short name (e.g. "haiku") that matches exactly one available model; an ambiguous name is refused. Omit to use the agent type\'s default.',
       }),
     ),
     thinking: Type.Optional(
@@ -2634,16 +2636,23 @@ Terse command-style prompts produce shallow, generic work.
       });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
+      // A model the caller named and that does not resolve (missing, or
+      // ambiguous) is the caller's error. One the agent file names falls back
+      // to the parent's, and the result says so: never a silent substitution.
       let model = ctx.model;
+      let modelNote: string | undefined;
       if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return errorResult(resolved);
-          // config-specified: silent fallback to parent
+        const resolution = resolveModelDetailed(resolvedConfig.modelInput, ctx.modelRegistry);
+        if (resolution.ok) {
+          model = resolution.model;
+        } else if (resolvedConfig.modelFromParams) {
+          return errorResult(resolution.message);
         } else {
-          model = resolved;
+          modelNote = unresolvedModelNote(resolvedConfig.modelInput, unresolvedReason(resolution), model ?? "the parent's model");
         }
       }
+      // What every result of this spawn leads with.
+      const spawnNotes = fallbackNote + (modelNote ? `${modelNote}\n\n` : "");
 
       // Scope validation: the effective resolved model is checked against the
       // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
@@ -2927,7 +2936,7 @@ Terse command-style prompts produce shallow, generic work.
       const backgroundResult = (id: string, record: AgentRecord | undefined) => {
         const isQueued = record?.status === "queued";
         return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
+          `${spawnNotes}Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${params.description}\n` +
@@ -2973,6 +2982,7 @@ Terse command-style prompts produce shallow, generic work.
           isBackground: true,
           isolation,
           invocation: agentInvocation,
+          modelNote,
           rootSessionId: ctx.sessionManager.getSessionId(),
           ...bgCallbacks,
         });
@@ -3129,6 +3139,7 @@ Terse command-style prompts produce shallow, generic work.
           thinkingLevel: thinking,
           isolation,
           invocation: agentInvocation,
+          modelNote,
           signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           // Deliberately does NOT set fgId: that drives agentActivity, the
@@ -3188,7 +3199,7 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
         return textResult(
-          `${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}${agentIdLine(record.id)}`,
+          `${spawnNotes}Agent failed: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}${agentIdLine(record.id)}`,
           details,
           true,
         );
@@ -3211,7 +3222,7 @@ Terse command-style prompts produce shallow, generic work.
           ? "Agent was aborted after"
           : "Agent completed in";
       return textResult(
-        `${fallbackNote}${headline} ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${spawnNotes}${headline} ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
         (record.result?.trim() || "No output.") +
         (isFailedStatus(record.status) ? sessionFileLine(record) : "") +
         agentIdLine(record.id),
@@ -3822,6 +3833,7 @@ Terse command-style prompts produce shallow, generic work.
         `Agent: ${record.id}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         (modelText ? `Model: ${modelText}\n` : "") +
+        (record.modelNote ? `${record.modelNote}\n` : "") +
         `Description: ${record.description}\n\n`;
 
       const active = manager.isRunActive(record.id);
@@ -3924,10 +3936,11 @@ Terse command-style prompts produce shallow, generic work.
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
+    const resolution = resolveModelDetailed(cfg.model, registry);
+    // Configured but unresolvable: the run falls back to the parent model (and
+    // its result says so), so flag it here too rather than hiding the config.
+    if (!resolution.ok) return `${label} (${resolution.reason === "ambiguous" ? "ambiguous" : "unavailable"}, fallback: inherit)`;
+    const resolved = resolution.model;
     // Surface what it actually resolved to when that differs from the config —
     // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.

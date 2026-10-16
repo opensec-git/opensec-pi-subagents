@@ -390,6 +390,26 @@ describe("SubagentScheduler — fire path", () => {
     expect(optsArg.invocation.thinking).toBeUndefined();
   });
 
+  it("fire still runs a job whose model no longer resolves, with a note saying so", () => {
+    setModelOverrideAllowed(true);
+    try {
+      scheduler.addJob({
+        name: "every-1m", description: "x", schedule: "1m",
+        subagent_type: "general-purpose", prompt: "x", model: "gone/model",
+      });
+
+      vi.advanceTimersByTime(60_000);
+      const optsArg = manager.spawn.mock.calls[0][4];
+      expect(optsArg.model).toBeUndefined();
+      expect(optsArg.modelNote).toBe(
+        'Note: model "gone/model" from the scheduled job was not found among the available models; '
+          + "ran on the agent's default model instead.",
+      );
+    } finally {
+      setModelOverrideAllowed(false);
+    }
+  });
+
   it("fire normalizes an unlimited turn budget out of the snapshot", () => {
     // 0 means unlimited; "max turns: 0" would read as a limit of none.
     scheduler.addJob({

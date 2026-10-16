@@ -211,6 +211,35 @@ describe("child-safe nested Agent tools", () => {
     expect(inScope.isError).toBe(false);
   });
 
+  it("runs an agent whose file names an ambiguous model on the parent's, and says so", async () => {
+    writeAgent("pinned", "model: anthropic\n");
+    const parentModel = MODELS[0];
+    const [agent] = tools();
+    const result = await agent.execute(
+      "call-1",
+      { subagent_type: "pinned", description: "pinned", prompt: "Do it" },
+      undefined,
+      undefined,
+      { ...ctx(), model: parentModel },
+    );
+    expect(result.isError).toBe(false);
+    expect(spawnAndWait.mock.calls[0][4]).toMatchObject({ model: parentModel });
+    expect(result.content[0].text).toMatch(
+      /^Note: model "anthropic" from the agent file is ambiguous \(candidates: anthropic\/allowed, anthropic\/blocked\); ran on anthropic\/allowed instead\.\n\n/,
+    );
+    expect(spawnAndWait.mock.calls[0][4].modelNote).toContain('model "anthropic" from the agent file is ambiguous');
+  });
+
+  it("refuses a caller-supplied model that matches several, naming them", async () => {
+    setModelOverrideAllowed(true);
+    const [agent] = tools();
+    const result = await execute(agent, { subagent_type: "scout", description: "d", prompt: "p", model: "anthropic" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Model "anthropic" is ambiguous');
+    expect(result.content[0].text).toContain("anthropic/allowed, anthropic/blocked");
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+
   it("offers no model or thinking parameter and ignores both while overrides are off (the default)", async () => {
     const [agent] = tools();
     expect(Object.keys(agent.parameters.properties)).not.toContain("model");

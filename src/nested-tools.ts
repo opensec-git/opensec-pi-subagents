@@ -17,7 +17,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -60,6 +60,8 @@ interface NestedSpawnOptions {
   isBackground?: boolean;
   isolation?: IsolationMode;
   invocation?: AgentInvocation;
+  /** The agent file's model did not resolve; see `AgentRecord.modelNote`. */
+  modelNote?: string;
   signal?: AbortSignal;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
@@ -293,15 +295,22 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: false,
       });
+      // Same rule as the top-level tool: a model the caller named must
+      // resolve; one the agent file names falls back to this agent's model,
+      // and the result says so.
       let model = ctx.model;
+      let modelNote: string | undefined;
       if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
+        const resolution = resolveModelDetailed(invocation.modelInput, ctx.modelRegistry);
+        if (resolution.ok) {
+          model = resolution.model;
+        } else if (invocation.modelFromParams) {
+          return textResult(resolution.message, true);
         } else {
-          model = resolvedModel;
+          modelNote = unresolvedModelNote(invocation.modelInput, unresolvedReason(resolution), model ?? "the parent agent's model");
         }
       }
+      const notePrefix = modelNote ? `${modelNote}\n\n` : "";
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn
       // must not escape the allowlist. A "warn" verdict proceeds silently:
@@ -336,6 +345,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           runInBackground: invocation.runInBackground,
           isolation: invocation.isolation,
         },
+        modelNote,
         onAssistantUsage: bookIntoAncestors,
         depth: childDepth,
         parentAgentId: context.parentAgentId,
@@ -393,7 +403,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           // Worktree isolation starts the agent asynchronously; surface its
           // failure as a tool error, like the synchronous throw used to.
           await context.manager.awaitStartup(id);
-          return textResult(`Nested agent started in background. Agent ID: ${id}`);
+          return textResult(`${notePrefix}Nested agent started in background. Agent ID: ${id}`);
         }
 
         const { record } = await context.manager.spawnAndWait(
@@ -404,7 +414,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           { ...options, signal },
           attachTranscript,
         );
-        return textResult(formatRecord(record, "inline"), isFailedStatus(record.status));
+        return textResult(notePrefix + formatRecord(record, "inline"), isFailedStatus(record.status));
       } catch (err) {
         return textResult(err instanceof Error ? err.message : String(err), true);
       }

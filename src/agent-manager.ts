@@ -342,6 +342,8 @@ interface SpawnOptions {
   onBeforeWorktreeCleanup?: (worktreePath: string) => Promise<void>;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
+  /** The caller's note that the agent file's model did not resolve (see `AgentRecord.modelNote`). */
+  modelNote?: string;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /**
@@ -1136,6 +1138,7 @@ export class AgentManager {
       // `options` has stopped being the interesting object.
       blocking: options.blocking,
       invocation: options.invocation,
+      modelNote: options.modelNote,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
@@ -1514,11 +1517,12 @@ export class AgentManager {
         try { options.onSessionCreated?.(session); } catch { /* ignore caller wiring errors */ }
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns }) => {
+      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried, maxTurns, modelNote }) => {
         // Abandoned after a stop it ignored: the record was settled without
         // this run, and may already belong to a newer one.
         if (run.abandoned) return responseText;
         record.maxTurns = maxTurns;
+        record.modelNote ??= modelNote;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn

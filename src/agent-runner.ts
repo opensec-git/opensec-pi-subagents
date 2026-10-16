@@ -27,6 +27,7 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { unresolvedModelNote } from "./model-resolver.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { isProjectCodeTrusted, isProjectTrustedBy } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -777,6 +778,11 @@ export interface RunResult {
   structuredRetried?: boolean;
   /** The turn limit this run enforced (undefined = unlimited), for later resumes. */
   maxTurns?: number;
+  /**
+   * Set when the agent file's `model:` could not be used and the run fell back
+   * to the parent's model: the visible note for the record (`modelNote`).
+   */
+  modelNote?: string;
 }
 
 /**
@@ -1149,6 +1155,15 @@ export async function runAgent(
   const model = options.model ?? resolveDefaultModel(
     parent.model, parent.modelRegistry, agentConfig?.model,
   );
+  // Spawns that pass no model (mentions, RPC, the scheduler) resolve the agent
+  // file's here, by exact provider/id only. A pin that falls back to the parent
+  // still runs, but says so rather than passing the parent's model off as it.
+  const configModel = agentConfig?.model;
+  const configModelUnused = options.model === undefined && configModel !== undefined && model === parent.model
+    && !(model && `${model.provider}/${model.id}`.toLowerCase() === configModel.toLowerCase());
+  const modelNote = configModelUnused
+    ? unresolvedModelNote(configModel, "did not match an available model's exact provider/id", model ?? "the session's default model")
+    : undefined;
 
   // Omitting this SDK option uses saved settings, not the live parent's effort.
   // A reopened session keeps the level it ran with — saved in its file —
@@ -1409,6 +1424,7 @@ export async function runAgent(
     steered: run.steered,
     failure: run.failure ?? structuredFailure,
     maxTurns,
+    ...(modelNote !== undefined ? { modelNote } : {}),
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };

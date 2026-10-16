@@ -301,6 +301,12 @@ export interface AgentRecord {
    */
   invocation?: AgentInvocation;
   /**
+   * Set when the model the agent file names did not resolve (missing, or
+   * ambiguous) and the run used another: says what was asked for, why it was
+   * not used, and what ran instead. Shown wherever the result is.
+   */
+  modelNote?: string;
+  /**
    * The turn limit the first run enforced (undefined = unlimited). A resumed
    * run gets the same limit, counted afresh, unless its caller passes one.
    */

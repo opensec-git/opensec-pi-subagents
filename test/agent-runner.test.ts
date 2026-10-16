@@ -2967,3 +2967,51 @@ describe("disabledBuiltinExtensions", () => {
     expect(disabledBuiltinExtensions(false, ["-ne"])).toEqual(["codemode", "tool-search", "mcp"]);
   });
 });
+
+// The runner resolves the agent file's `model:` itself for spawns that pass no
+// model (mentions, RPC, the scheduler), by exact provider/id. A pin it cannot
+// use still falls back to the parent's model — but the result now says so.
+describe("an agent file model the runner cannot use", () => {
+  const parentModel = { provider: "anthropic", id: "claude-opus-4-6" };
+
+  async function withPinnedModel(model: string, run: () => Promise<void>) {
+    const { getAgentConfig } = await import("../src/agent-types.js");
+    const base = vi.mocked(getAgentConfig).getMockImplementation()!("Explore")!;
+    vi.mocked(getAgentConfig).mockImplementation(() => ({ ...base, model }));
+    try {
+      await run();
+    } finally {
+      vi.mocked(getAgentConfig).mockImplementation(() => base);
+    }
+  }
+
+  it("runs on the parent's model and returns a note saying so", async () => {
+    await withPinnedModel("haiku", async () => {
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+
+      const result = await runAgent({ ...ctx, model: parentModel }, "Explore", "go", { pi });
+
+      expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ model: parentModel }));
+      expect(result.modelNote).toBe(
+        'Note: model "haiku" from the agent file did not match an available model\'s exact provider/id; '
+          + "ran on anthropic/claude-opus-4-6 instead.",
+      );
+    });
+  });
+
+  it("adds no note when the pin resolves, or when the caller chose the model", async () => {
+    const haiku = { provider: "anthropic", id: "claude-haiku-4-5" };
+    await withPinnedModel("anthropic/claude-haiku-4-5", async () => {
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      const registry = { find: vi.fn(() => haiku), getAvailable: vi.fn(() => [haiku]) };
+
+      const resolved = await runAgent({ ...ctx, model: parentModel, modelRegistry: registry }, "Explore", "go", { pi });
+      expect(resolved.modelNote).toBeUndefined();
+
+      const chosen = await runAgent({ ...ctx, model: parentModel }, "Explore", "go", { pi, model: parentModel as any });
+      expect(chosen.modelNote).toBeUndefined();
+    });
+  });
+});
