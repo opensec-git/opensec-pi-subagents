@@ -488,6 +488,18 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
+  /**
+   * Set once this activation's session is shutting down (`/new`, `/resume`,
+   * `/reload`, quit). Pi invalidates `pi` and every ctx then, and a call on a
+   * stale one throws — from a detached completion that is an unhandled
+   * rejection, which ends pi. Every detached path checks it first.
+   */
+  let disposed = false;
+  /** Bumped at every shutdown: work started under an older value belongs to a torn-down session. */
+  let sessionGeneration = 0;
+  /** Off-screen mention clones in flight, aborted at shutdown so they stop spending. */
+  const mentionClones = new Set<AbortController>();
+
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
@@ -628,6 +640,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   const manager = new AgentManager((record) => {
+    // After shutdown `pi` is stale, and the shutdown handler records the
+    // agents it interrupted itself.
+    if (disposed) return;
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -671,7 +686,7 @@ export default function (pi: ExtensionAPI) {
     // 'delivered' → group callback already fired
     widget.update();
   }, undefined, (record) => {
-    if (!isTopLevelAgent(record)) return;
+    if (disposed || !isTopLevelAgent(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -687,7 +702,7 @@ export default function (pi: ExtensionAPI) {
       description: record.description,
     });
   }, (record, info) => {
-    if (!isTopLevelAgent(record)) return;
+    if (disposed || !isTopLevelAgent(record)) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -846,6 +861,7 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    disposed = false;
     currentCtx = ctx;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -1087,8 +1103,24 @@ export default function (pi: ExtensionAPI) {
       // Not awaited: the clone runs a full model turn, and prompt() is blocked
       // until this hook returns. The user gets their prompt back immediately
       // and the agent appears in the widget when it starts.
-      void runMentionClone({ ctx, type, message: mention.message, agentTool: registeredAgentTool })
+      //
+      // The clone can outlive this session (`/new`, `/resume`, `/reload` while
+      // it thinks), and then `ctx` and `pi` are stale and throw: everything
+      // after it checks the generation, and the chain ends in a catch, since an
+      // unhandled rejection ends pi. Shutdown aborts the clone itself.
+      const generation = sessionGeneration;
+      const live = () => generation === sessionGeneration && !disposed;
+      const cloneStop = new AbortController();
+      mentionClones.add(cloneStop);
+      void runMentionClone({
+        ctx,
+        type,
+        message: mention.message,
+        agentTool: registeredAgentTool,
+        signal: cloneStop.signal,
+      })
         .then(async (result) => {
+          if (!live()) return;
           if (result.spawned) return;
           // A clone that could not run must not swallow the mention: start the
           // agent the direct way rather than leaving the user with a toast and
@@ -1101,14 +1133,18 @@ export default function (pi: ExtensionAPI) {
             // Same reason as the direct path below: the agent may still be
             // starting, and a failure there must reach this catch.
             await manager.awaitStartup(id);
-            ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
+            if (live()) ctx.ui.notify(`Started ${label} directly — ${result.error}`, "warning");
           } catch (err) {
-            ctx.ui.notify(
-              `Could not start ${label}: ${err instanceof Error ? err.message : String(err)}`,
-              "error",
-            );
+            if (live()) {
+              ctx.ui.notify(
+                `Could not start ${label}: ${err instanceof Error ? err.message : String(err)}`,
+                "error",
+              );
+            }
           }
-        });
+        })
+        .catch(() => { /* the session went away mid-flight */ })
+        .finally(() => { mentionClones.delete(cloneStop); });
       return { action: "handled" };
     }
 
@@ -1142,6 +1178,10 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    disposed = true;
+    sessionGeneration++;
+    for (const stop of mentionClones) stop.abort();
+    mentionClones.clear();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1170,6 +1210,11 @@ export default function (pi: ExtensionAPI) {
     for (const record of interrupted) appendRecordEntry(record);
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    // Neither may fire into a torn-down instance (or hold `pi -p` open).
+    groupJoin.dispose();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
     fleet.dispose();
     // Its 80 ms refresh interval otherwise outlives the session across /reload.
     // The interval is cleared first; the UI calls after it may meet a context
@@ -2740,7 +2785,9 @@ Terse command-style prompts produce shallow, generic work.
 
       // Background, like Claude Code: the id comes back now and the run keeps
       // going without the tool call.
-      void runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task));
+      void runWorkflowTask(ctx, task)
+        .then(() => { if (!disposed) notifyWorkflowFinished(task); })
+        .catch(() => { /* the session went away mid-flight */ });
 
       return {
         content: [{
@@ -2896,6 +2943,7 @@ Terse command-style prompts produce shallow, generic work.
     // Detached: session_start is awaited by the host, and a workflow can run for
     // minutes — blocking here would hold the whole session's startup.
     void runWorkflowTask(ctx, task).then(() => {
+      if (disposed) return;
       // No tool call to attach a result card to, so the card becomes a session
       // entry (same layout), and the outcome is handed to the model as context
       // for its next turn rather than forcing one.
@@ -2907,7 +2955,7 @@ Terse command-style prompts produce shallow, generic work.
       }, { deliverAs: "nextTurn" });
       widget.update();
       fleet.update();
-    });
+    }).catch(() => { /* the session went away mid-flight */ });
   }
 
   // ---- get_subagent_result tool ----

@@ -17,6 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
@@ -994,10 +995,18 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
       undefined, undefined, workflowCtx(),
     );
 
-    await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
-
-    const sent = await awaitNotification(startedTaskId(result));
-    expect(String(sent[0].content)).toContain("<status>Stopped</status>");
+    const terminate = vi.spyOn(Worker.prototype, "terminate");
+    try {
+      await booted.lifecycle.get("session_shutdown")?.({}, workflowCtx());
+      await vi.waitFor(() => expect(terminate).toHaveBeenCalled(), { timeout: 10_000 });
+      await new Promise(r => setTimeout(r, 300)); // past the notification hold
+      // No notification into the torn-down session: its `pi` is stale, and in
+      // pi a call on it throws.
+      const taskId = startedTaskId(result);
+      expect(booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(taskId))).toBe(false);
+    } finally {
+      terminate.mockRestore();
+    }
   });
 
   it("reports a script that threw, rather than a run that quietly ended", async () => {

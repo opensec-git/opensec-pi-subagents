@@ -83,6 +83,8 @@ export interface MentionCloneOptions {
   message: string;
   /** The registered `Agent` tool, reused so the spawn is an ordinary one. */
   agentTool: ToolDefinition;
+  /** Aborts the clone's turn — the session it belongs to is going away. */
+  signal?: AbortSignal;
 }
 
 export interface MentionCloneResult {
@@ -98,7 +100,8 @@ export interface MentionCloneResult {
  * back to starting the agent directly.
  */
 export async function runMentionClone(opts: MentionCloneOptions): Promise<MentionCloneResult> {
-  const { ctx, type, message, agentTool } = opts;
+  const { ctx, type, message, agentTool, signal: stop } = opts;
+  if (stop?.aborted) return { spawned: false, error: "the session ended before the clone started" };
 
   let spawned = false;
   const cloneAgentTool: ToolDefinition = {
@@ -133,6 +136,8 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
   };
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  const onStop = () => { void session?.abort().catch(() => {}); };
+  stop?.addEventListener("abort", onStop, { once: true });
   try {
     // Pi 0.80.8 moved createAgentSession from modelRegistry to modelRuntime;
     // agent-runner.ts carries the same shim for the same reason — pass both so
@@ -196,12 +201,15 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     const restored = session.agent.state.messages.some((m: { role: string }) => m.role !== "system");
     if (!restored) session.agent.state.messages.push(...conversation.messages);
 
+    if (stop?.aborted) return { spawned, error: "the session ended before the clone ran" };
+
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.
     await session.prompt(`${message}\n\n${agentMentionReminder(type)}`);
   } catch (err) {
     return { spawned, error: err instanceof Error ? err.message : String(err) };
   } finally {
+    stop?.removeEventListener("abort", onStop);
     session?.dispose?.();
   }
 

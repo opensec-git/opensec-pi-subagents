@@ -399,3 +399,28 @@ describe("when the clone cannot deliver", () => {
     expect(session.dispose).toHaveBeenCalled();
   });
 });
+
+describe("the clone's lifetime", () => {
+  it("is aborted when its session goes away mid-turn", async () => {
+    let release!: () => void;
+    const session = cloneSession(() => new Promise<void>(r => { release = r; }));
+    const stop = new AbortController();
+    session.abort = vi.fn(async () => { release(); });
+    const pending = runMentionClone(opts({ signal: stop.signal }));
+    await new Promise(r => setTimeout(r, 0));
+    stop.abort();
+    const result = await pending;
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.spawned).toBe(false);
+    expect(session.dispose).toHaveBeenCalled();
+  });
+
+  it("does not start at all once its session is gone", async () => {
+    cloneSession();
+    const stop = new AbortController();
+    stop.abort();
+    const result = await runMentionClone(opts({ signal: stop.signal }));
+    expect(result.spawned).toBe(false);
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+});
