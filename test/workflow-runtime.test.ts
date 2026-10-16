@@ -568,6 +568,26 @@ describe("abort", () => {
       expect(rows.at(-1)?.model).toBe("haiku 4.5");
     });
 
+    it("puts an isolated child's branch and kept worktree on its finished row", async () => {
+      const seen: WorkflowEntry[][] = [];
+      const host = {
+        async spawnAgent(request: any) {
+          return request.index === 0
+            ? { ok: true, text: "{}", branch: "pi-agent-a" }
+            : { ok: false, error: "failed", branch: "pi-agent-b", worktreePath: "/wt/b" };
+        },
+        abortAgent() {},
+      };
+
+      await run('await agent("one", { isolation: "worktree" }); return await agent("two", { isolation: "worktree" });', {
+        host,
+        onProgress(e) { seen.push([...e]); },
+      });
+
+      expect(rowsFor(seen, 0).at(-1)).toMatchObject({ state: "done", branch: "pi-agent-a" });
+      expect(rowsFor(seen, 1).at(-1)).toMatchObject({ state: "error", branch: "pi-agent-b", worktreePath: "/wt/b" });
+    });
+
     it("fills in a row for an agent that named no model at all", async () => {
       const seen: WorkflowEntry[][] = [];
       const host = {

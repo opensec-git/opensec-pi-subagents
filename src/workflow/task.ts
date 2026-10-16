@@ -295,6 +295,15 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
     : task.status === "killed" ? "Stopped"
     : `Error: ${task.error ?? "unknown"}`;
   const result = workflowResultText(task);
+  // Isolated children's branches and kept worktrees, whatever the script
+  // returned: the script's value may well not mention them.
+  const worktrees = collapse(task.workflowProgress).agents
+    .filter((agent) => agent.branch !== undefined || agent.worktreePath !== undefined)
+    .map((agent) => [
+      `${agent.label}:`,
+      agent.branch !== undefined ? `branch ${agent.branch}` : undefined,
+      agent.worktreePath !== undefined ? `worktree kept at ${agent.worktreePath}` : undefined,
+    ].filter(Boolean).join(" "));
   return [
     `<task-notification>`,
     `<task-id>${task.id}</task-id>`,
@@ -305,6 +314,7 @@ export function formatWorkflowNotification(task: WorkflowTask, now = Date.now())
       task.replayedCount > 0 ? `, ${task.replayedCount} replayed from ${escapeXml(task.resumedFrom ?? "an earlier run")}` : ""
     }</summary>`,
     `<result>${escapeXml(result.length > 4000 ? `${result.slice(0, 4000)}\n...(truncated)` : result)}</result>`,
+    worktrees.length > 0 ? `<worktrees>\n${escapeXml(worktrees.join("\n"))}\n</worktrees>` : null,
     `<usage><total_tokens>${task.totalTokens}</total_tokens><tool_uses>${task.totalToolCalls}</tool_uses><duration_ms>${elapsedMs(task, now)}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join("\n");

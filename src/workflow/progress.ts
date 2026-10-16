@@ -102,6 +102,10 @@ export interface WorkflowAgentEntry {
   requestedModel?: string;
   fallbackModel?: string;
   isolation?: "worktree";
+  /** The branch an isolated child's changes were saved to. */
+  branch?: string;
+  /** An isolated child's worktree, when it was kept on disk (see `WorkflowSpawnResult.worktreePath`). */
+  worktreePath?: string;
   error?: string;
   skipped?: boolean;
   blocked?: boolean;

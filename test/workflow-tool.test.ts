@@ -122,6 +122,37 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.description).toBe("review:bugs");
   });
 
+  it("reports an isolated child's branch beside a schema'd answer, which stays parseable JSON", async () => {
+    const stub = stubManager(() => record({
+      structuredJson: '{"files":["a.ts"]}',
+      result: "prose\n\n---\nChanges saved to branch `pi-agent-x`.",
+      worktreeResult: { hasChanges: true, branch: "pi-agent-x", path: "/wt/copy" },
+    }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    const result = await host.spawnAgent(request({ isolation: "worktree" }));
+
+    expect(result).toMatchObject({ ok: true, text: '{"files":["a.ts"]}', branch: "pi-agent-x" });
+    expect(result.worktreePath).toBeUndefined();
+  });
+
+  it("names the branch and a kept worktree on a failed or stopped child's error", async () => {
+    const worktreeResult = { hasChanges: true, branch: "pi-agent-y", path: "/wt/kept", kept: true };
+    const failedHost = createWorkflowHost({
+      pi: {} as any, ctx: ctx(), manager: stubManager(() => record({ status: "error", error: "provider died", worktreeResult })).manager,
+    });
+    const failed = await failedHost.spawnAgent(request({ isolation: "worktree" }));
+    expect(failed).toMatchObject({ ok: false, branch: "pi-agent-y", worktreePath: "/wt/kept" });
+    expect(failed.error).toMatch(/provider died[\s\S]*pi-agent-y[\s\S]*\/wt\/kept/);
+
+    const stoppedHost = createWorkflowHost({
+      pi: {} as any, ctx: ctx(), manager: stubManager(() => record({ status: "stopped", worktreeResult })).manager,
+    });
+    const stopped = await stoppedHost.spawnAgent(request({ isolation: "worktree" }));
+    expect(stopped).toMatchObject({ ok: false, skipped: true, branch: "pi-agent-y" });
+    expect(stopped.error).toContain("pi-agent-y");
+  });
+
   it("passes isolation and the run's abort signal down to the spawn", async () => {
     const stub = stubManager();
     const controller = new AbortController();

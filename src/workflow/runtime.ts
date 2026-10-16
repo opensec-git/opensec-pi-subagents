@@ -165,6 +165,14 @@ export interface WorkflowSpawnResult {
    */
   cwd?: string;
   /**
+   * The branch an isolated child's changes were saved to, whether it succeeded
+   * or not. Reported beside `text` rather than in it: a schema'd child's text
+   * is JSON the script parses, and a failed child's work is on the branch too.
+   */
+  branch?: string;
+  /** An isolated child's worktree, when it was kept on disk instead of (or besides) a branch. */
+  worktreePath?: string;
+  /**
    * The outcome of this agent's `gate`, when the host already ran it.
    *
    * Set only by a host that ran the command itself — inside the child's
@@ -1137,6 +1145,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             durationMs: finishedAt - startedAt,
             ...(result.tokens !== undefined ? { tokens: result.tokens } : {}),
             ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
+            ...(result.branch !== undefined ? { branch: result.branch } : {}),
+            ...(result.worktreePath !== undefined ? { worktreePath: result.worktreePath } : {}),
           };
 
           if (result.ok) {

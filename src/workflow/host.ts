@@ -127,11 +127,27 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   // magnitude and make the documented guards useless.
   const outputTokens = record.lifetimeUsage?.output ?? 0;
   const cwd = childCwd(record);
+  // Where an isolated child's work went. On its own fields: `text` may be JSON
+  // the script parses, and the note on `record.result` never reaches a
+  // schema'd or failed child's result otherwise.
+  const wt = record.worktreeResult;
+  const branch = wt?.hasChanges ? wt.branch : undefined;
+  const worktreePath = wt?.hasChanges && wt.path && (wt.kept || !wt.branch) ? wt.path : undefined;
   const common = {
     ...(tokens > 0 ? { tokens } : {}),
     ...(outputTokens > 0 ? { outputTokens } : {}),
     ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
+    ...(branch !== undefined ? { branch } : {}),
+    ...(worktreePath !== undefined ? { worktreePath } : {}),
+  };
+  /** A failure's error, with where the child's changes went unless it already says. */
+  const failure = (error: string): string => {
+    const where = [
+      branch !== undefined && !error.includes(branch) ? `Changes saved to branch \`${branch}\`.` : undefined,
+      worktreePath !== undefined && !error.includes(worktreePath) ? `Worktree kept at \`${worktreePath}\`.` : undefined,
+    ].filter(Boolean);
+    return where.length > 0 ? `${error}\n\n${where.join(" ")}` : error;
   };
 
   if (succeeded(record)) {
@@ -150,9 +166,9 @@ function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
   // fleet list, a workflow abort. That is the same thing the workflows dialog's
   // skip action means, so it renders as skipped rather than failed.
   if (record.status === "stopped") {
-    return { ...common, ok: false, skipped: true, error: record.error ?? "Stopped." };
+    return { ...common, ok: false, skipped: true, error: failure(record.error ?? "Stopped.") };
   }
-  return { ...common, ok: false, error: record.error ?? `Agent ${record.status}.` };
+  return { ...common, ok: false, error: failure(record.error ?? `Agent ${record.status}.`) };
 }
 
 /** A signal that fires when either does, or whichever one exists. */

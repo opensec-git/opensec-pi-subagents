@@ -31,6 +31,16 @@ export type MemoryScope = "user" | "project" | "local";
 export type IsolationMode = "worktree" | "off";
 
 /** Unified agent configuration — used for both default and user-defined agents. */
+/** Where an isolated agent's work went (see `WorktreeCleanupResult` in worktree.ts). */
+export interface WorktreeOutcome {
+  hasChanges: boolean;
+  branch?: string;
+  path?: string;
+  /** The worktree was left on disk, for the reasons in `notes`. */
+  kept?: boolean;
+  notes?: string[];
+}
+
 export interface AgentConfig {
   name: string;
   /** UI name. `display_name` wins; Claude Code's `name` is accepted as a fallback. */
@@ -168,8 +178,8 @@ export interface AgentResumeState {
   isolated?: boolean;
   /** Turn limit of its runs; 0 = unlimited. Absent = the type's default. */
   maxTurns?: number;
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
-  worktreeResult?: { hasChanges: boolean; branch?: string; path?: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; stashTop?: string };
+  worktreeResult?: WorktreeOutcome;
 }
 
 /** A top-level agent's resume state: the one `@handle` can address. */
@@ -244,9 +254,9 @@ export interface AgentRecord {
    */
   baseCwd?: string;
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: { path: string; branch: string; baseSha: string; workPath: string; stashTop?: string };
   /** Worktree cleanup result after agent completion. */
-  worktreeResult?: { hasChanges: boolean; branch?: string; path?: string };
+  worktreeResult?: WorktreeOutcome;
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
