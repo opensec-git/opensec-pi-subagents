@@ -103,6 +103,12 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
 model and thinking level unless their definition or call overrides them.
 
+`tools:` limits built-in tools only. Tools registered by extensions stay available unless the file sets
+`extensions: false` (or names the extensions to load), or lists `ext:` selectors in `tools:`, which turns extension
+tools into an allowlist. The built-in `Explore` and `Plan` agents get `read`, `grep`, `find` and `ls` and no extension
+tools, so they cannot write files or run commands; a file named `Explore.md` or `Plan.md` replaces them if you want
+them to have more.
+
 ### Project trust
 
 Subagents follow Pi's project trust decision for the parent session.
