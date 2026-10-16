@@ -14,10 +14,10 @@
 import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import type { AgentRecord } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
-import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction, type ViewerRenderOptions } from "./conversation-viewer.js";
 import { RefreshTicker } from "./refresh-ticker.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -137,17 +137,10 @@ export class FleetList {
      */
     private showCost: () => boolean = () => false,
     /**
-     * The user's `viewerMarkdown` setting, for a conversation overlay opened
-     * from here. Read live rather than captured, because the viewer's `m` key
-     * changes it while the overlay is up. Omitted → the viewer's own default.
+     * Pi's chat settings for a conversation overlay opened from here, read when
+     * it opens, so it draws like one opened from `/agents`. Omitted → Pi's defaults.
      */
-    private viewerMarkdown?: () => ViewerMarkdownMode,
-    /**
-     * Persist a mode chosen with `m` in that overlay, so the key means the same
-     * thing here as it does from `/agents` — one setting, not one per entry
-     * point. Omitted → `m` still cycles, viewer-locally.
-     */
-    private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
+    private viewerRenderOptions: () => ViewerRenderOptions | undefined = () => undefined,
     /** Shared with the widget by the extension, so both redraw on one frame. */
     private ticker: RefreshTicker = new RefreshTicker(),
     /**
@@ -467,10 +460,9 @@ export class FleetList {
           keybindings,
           (message: string) => this.manager.steer(record.id, message),
           this.showCost(),
-          this.viewerMarkdown,
-          this.onViewerMarkdown,
           this.backgroundAction?.(record, message => this.ui?.notify(message, "info")),
           this.scrollbarMode(),
+          this.viewerRenderOptions(),
         );
       },
       {

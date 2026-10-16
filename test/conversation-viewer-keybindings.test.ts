@@ -103,6 +103,35 @@ describe("viewer-keys", () => {
   });
 });
 
+describe("tool output toggle", () => {
+  const CTRL_O = "\x0f";
+  const CTRL_E = "\x05";
+  /** A manager that knows Pi's `app.tools.expand`, as the one `ctx.ui.custom()` passes does. */
+  function appKeybindings(user: Record<string, string> = {}): ViewerKeybindings {
+    const definitions = { ...TUI_KEYBINDINGS, "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } };
+    return new KeybindingsManager(definitions as typeof TUI_KEYBINDINGS, user) as unknown as ViewerKeybindings;
+  }
+
+  it("is ctrl+o without a manager", () => {
+    const keys = createViewerKeys();
+    expect(keys.toggleExpand(CTRL_O)).toBe(true);
+    expect(keys.expandLabel).toBe("ctrl+o");
+  });
+
+  it("follows a rebinding of Pi's app.tools.expand, footer label included", () => {
+    const keys = createViewerKeys(appKeybindings({ "app.tools.expand": "ctrl+e" }));
+    expect(keys.toggleExpand(CTRL_E)).toBe(true);
+    expect(keys.toggleExpand(CTRL_O)).toBe(false);
+    expect(keys.expandLabel).toBe("ctrl+e");
+  });
+
+  it("is unbound, with no footer hint, when the manager has no binding for it", () => {
+    const keys = createViewerKeys(createEmacsKeybindings());
+    expect(keys.toggleExpand(CTRL_O)).toBe(false);
+    expect(keys.expandLabel).toBe("");
+  });
+});
+
 describe("ConversationViewer custom keybindings", () => {
   it("scrolls with ctrl+p/ctrl+n when bound to tui.select.up/down", () => {
     const viewer = createViewer(createEmacsKeybindings());

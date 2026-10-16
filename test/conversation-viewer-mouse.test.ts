@@ -1,8 +1,12 @@
 import type { AgentSession, AgentSessionEventListener } from "@earendil-works/pi-coding-agent";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { Input, ScrollView, type ScrollViewScrollbar, type Terminal, Text, type TUI, TuiAltScreen, type TuiMode, type TuiMouseEvent, VStack, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentRecord } from "../src/types.js";
 import { ConversationViewer, getConversationOverlayOptions } from "../src/ui/conversation-viewer.js";
+
+// The transcript is drawn with Pi's components, which read Pi's global theme.
+initTheme("dark", false);
 
 function setup(rows = 20, columns = 100, host?: TUI, scrollbar: ScrollViewScrollbar = "always", mode: TuiMode = "fullscreen") {
   const terminal = { rows, columns };
@@ -18,7 +22,7 @@ function setup(rows = 20, columns = 100, host?: TUI, scrollbar: ScrollViewScroll
   const viewer = new ConversationViewer(tui, session, record, undefined, {
     fg: (_color: string, text: string) => text,
     bold: (text: string) => text,
-  }, done, stop, undefined, steer, false, undefined, undefined, undefined, scrollbar);
+  }, done, stop, undefined, steer, false, undefined, scrollbar);
   const render = () => viewer.render(terminal.columns);
   const mouse = (event: Partial<TuiMouseEvent>) => viewer.handleMouse({
     type: "wheel", button: "none", x: 10, y: 8, screenX: 10, screenY: 8,
@@ -33,6 +37,10 @@ function setup(rows = 20, columns = 100, host?: TUI, scrollbar: ScrollViewScroll
   };
   const emit: AgentSessionEventListener = event => listener(event);
   return { viewer, tui, terminal, messages, render, mouse, click, done, stop, steer, unsubscribe, emit };
+}
+
+function stripAnsi(line: string): string {
+  return line.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function firstRow(lines: string[]): string | undefined {
@@ -182,8 +190,9 @@ describe("fullscreen conversation observer", () => {
   it("does not reserve a content column in hidden mode", () => {
     const { render, messages, viewer } = setup(20, 100, undefined, "hidden");
     try {
-      messages[0].content = "x".repeat(99);
-      expect(render()).toContain(` ${"x".repeat(99)}`);
+      // Pi's user message pads one column each side: 97 of the 99 columns hold text.
+      messages[0].content = "x".repeat(97);
+      expect(render().map(stripAnsi)).toContainEqual(expect.stringContaining(` ${"x".repeat(97)} `));
     } finally {
       viewer.dispose();
     }
@@ -194,11 +203,11 @@ describe("fullscreen conversation observer", () => {
   it("reserves the scrollbar column in auto mode, so showing the bar re-wraps nothing", () => {
     const { render, messages, viewer, mouse } = setup(20, 100, undefined, "auto");
     try {
-      messages[0].content = `${"x".repeat(98)}\n${Array.from({ length: 60 }, (_, i) => `row-${i}`).join("\n")}`;
+      messages[0].content = `${"x".repeat(96)}\n${Array.from({ length: 60 }, (_, i) => `row-${i}`).join("\n")}`;
       render();
       mouse({ wheelDelta: -100 });
       const scrolled = render();
-      expect(scrolled.some(line => line.startsWith(` ${"x".repeat(98)}`) && visibleWidth(line) === 100)).toBe(true);
+      expect(scrolled.some(line => stripAnsi(line).includes(` ${"x".repeat(96)} `) && visibleWidth(line) === 100)).toBe(true);
     } finally {
       viewer.dispose();
     }
@@ -287,6 +296,20 @@ describe("fullscreen conversation observer", () => {
     mouse({ type: "release", button: "left", x: 80, y: 2 });
     mouse({ type: "drag", button: "left", x: 80, y: 19 });
     expect(render().join("\n")).toContain("row-000");
+  });
+
+  it("clicks the expand control to toggle tool output, whatever key it is bound to", () => {
+    const { render, click, viewer } = setup();
+    try {
+      expect(render().at(-1)).toContain("ctrl+o expand");
+      click("ctrl+o expand");
+      expect((viewer as any).transcript.isExpanded).toBe(true);
+      expect(render().at(-1)).toContain("ctrl+o collapse");
+      click("ctrl+o collapse");
+      expect((viewer as any).transcript.isExpanded).toBe(false);
+    } finally {
+      viewer.dispose();
+    }
   });
 
   it("clicks steer, sends only to the child, and closes without stopping it", () => {

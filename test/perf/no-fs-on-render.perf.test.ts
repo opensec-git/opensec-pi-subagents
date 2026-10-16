@@ -35,7 +35,10 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const { AgentWidget } = await import("../../src/ui/agent-widget.js");
 const { ConversationViewer } = await import("../../src/ui/conversation-viewer.js");
-const { makeFleet, makeSession, mountViewer, mountWidget } = await import("../helpers/perf-fixtures.js");
+const { makeFleet, makeSession, mountViewer, mountWidget, usePiTheme } = await import("../helpers/perf-fixtures.js");
+
+// Pi's theme is loaded from disk once, before any frame; the viewer's frames draw with it.
+usePiTheme();
 
 describe("a rendered frame touches no filesystem", () => {
   it("AgentWidget.render", () => {
