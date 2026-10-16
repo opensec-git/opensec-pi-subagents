@@ -250,6 +250,8 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 
+A resumed child is bounded like a first run (its turn limit, grace turns and tool timeout). An isolated child resumes in its worktree, restored from its branch; if the branch is gone, `agent()` resolves to `null` with the reason. A child whose record was evicted (about ten minutes after it finished) is reopened from its saved session file under the same id.
+
 ### `pipeline()` and `parallel()`
 
 ```js

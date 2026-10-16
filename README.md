@@ -70,7 +70,33 @@ Agent({ subagent_type: "Explore", prompt: "Find authentication code", descriptio
 | Command | What it does |
 |---|---|
 | `/agents` | Inspect and manage agents: live conversations, settings, workflows, and scheduled jobs (`/agents → Scheduled jobs`). |
-| `@<agent> <message>` | With agent mentions enabled, sends a message to that agent, e.g. `@explore check the RPC path`. A finished agent can be resumed. |
+| `@<agent> <message>` | With agent mentions enabled, sends a message to that agent, e.g. `@explore check the RPC path`. A finished agent is resumed (see [Resuming agents](#resuming-agents)). |
+
+### Resuming agents
+
+Every agent result names the agent: `Agent ID: <id>` (foreground and background results alike). Pass it back to continue
+the same conversation instead of starting a fresh agent:
+
+```text
+Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continue audit", subagent_type: "Explore" })
+```
+
+- `resume` accepts the id or the agent's handle (`explore`, `explore-2`, or its `name`). It runs detached unless
+  `run_in_background: false`; `subagent_type` is ignored. A running agent cannot be resumed: steer it instead.
+- The resumed run keeps what the agent ran with: its model, the thinking level saved in its session, its working
+  directory, `isolated`, and its turn limit (`max_turns` on the resume call replaces it), with the same grace turns and
+  tool timeout as a first run.
+- A worktree agent resumes in its worktree: it is restored at the same path from the agent's branch, and the new work
+  is committed to that branch afterwards. If the branch is gone the resume is refused and nothing runs.
+- How long: a finished agent stays in memory for about ten minutes; after that it is reopened from its saved session
+  file, under the same id, for as long as that file exists. Sessions are saved by default (`rememberAgents`; turn it
+  off and agents are resumable only for those ten minutes).
+- What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
+  stay resumable by the model and by `@handle`. Agents still running are stopped, as before, and recorded as stopped
+  and resumable. `/new` starts with none. Nested agents can be resumed by their parent while their parent's manager
+  lives; across a restart only top-level agents are rebuilt.
+- In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
+  was evicted.
 
 ### Custom agents
 
