@@ -391,6 +391,15 @@ function worktreeNote(
 }
 
 /**
+ * Whether a run is in flight or waiting for a slot. A function rather than an
+ * inline test so TypeScript does not narrow `status` across an `await` that
+ * can change it.
+ */
+function isBusy(record: AgentRecord): boolean {
+  return record.status === "running" || record.status === "queued";
+}
+
+/**
  * Terminal status of a resumed run, with the spawn path's precedence: an
  * external stop stays "stopped", a hard abort at the turn limit is "aborted",
  * then a failed final turn is an honest "error" (#144) — the resumed text stays
@@ -1160,6 +1169,17 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    if (isBusy(record)) return undefined;
+
+    // `abort()` marks a record "stopped" at once, while its run is still
+    // winding down: pi may still be streaming, and the settle path may still
+    // be committing the worktree. Resuming before that settles fails with
+    // "Agent is already processing", or lets the old settle path overwrite the
+    // new run's status, append its worktree note to the new result and remove
+    // the worktree under it. Wait for it, then check again: another resume may
+    // have claimed the record meanwhile.
+    await this.waitForSettle(record);
+    if (isBusy(record)) return undefined;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1177,7 +1197,7 @@ export class AgentManager {
       // whose settle path would abort the LIVE run's children and report a
       // failure for a run that is still going. Refuse instead, leaving the
       // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
+      if (isBusy(record)) return undefined;
 
       record.isBackground = true;
       record.resultConsumed = false;
@@ -1216,7 +1236,7 @@ export class AgentManager {
 
     // Foreground resume returns its result inline, but still participates in
     // lifecycle observers (widget, fleet list) like every other run.
-    if (record.status === "running" || record.status === "queued") return undefined;
+    if (isBusy(record)) return undefined;
     record.isBackground = false;
     record.resultConsumed = true;
     record.status = "running";
@@ -1274,6 +1294,12 @@ export class AgentManager {
     record.promise = promise;
     await promise;
     return record;
+  }
+
+  /** Resolve once the record's previous run, including its startup, has fully settled. */
+  private async waitForSettle(record: AgentRecord): Promise<void> {
+    await this.startups.get(record.id)?.catch(() => {});
+    await record.promise?.catch(() => {});
   }
 
   /**

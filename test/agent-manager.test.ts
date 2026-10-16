@@ -2508,3 +2508,46 @@ describe("AgentManager — effective model and thinking write-back", () => {
     expect(record.invocation).toEqual({ thinking: "max" });
   });
 });
+
+describe("AgentManager — resume after a stop", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  // abort() marks the record "stopped" before its run has wound down. A resume
+  // that starts then races the old run: pi rejects the prompt ("Agent is
+  // already processing"), and the old settle path rewrites the new run's
+  // status and fires a second completion while it is still running.
+  for (const isBackground of [false, true]) {
+    it(`waits for the stopped run to settle before a ${isBackground ? "background" : "foreground"} resume starts`, async () => {
+      const onComplete = vi.fn();
+      manager = new AgentManager(onComplete);
+      let finishFirst!: () => void;
+      vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => {
+        finishFirst = () => resolve({ responseText: "first", session: mockSession(), aborted: false, steered: false });
+      }) as any);
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "task", { description: "task", isBackground: true });
+      await Promise.resolve();
+      // A session exists once the run is underway; the mock never reports one.
+      manager.getRecord(id)!.session = mockSession();
+
+      expect(manager.abort(id)).toBe(true);
+      expect(manager.getRecord(id)!.status).toBe("stopped");
+
+      vi.mocked(resumeAgent).mockClear();
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "resumed" });
+      const resumed = manager.resume(id, "go on", undefined, { isBackground });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(resumeAgent).not.toHaveBeenCalled();
+
+      finishFirst();
+      const record = await resumed;
+      await record?.promise;
+
+      expect(resumeAgent).toHaveBeenCalledTimes(1);
+      expect(record?.status).toBe("completed");
+      expect(record?.result).toBe("resumed");
+      // One completion for the stopped run, one for the resume — none stray.
+      expect(onComplete).toHaveBeenCalledTimes(2);
+    });
+  }
+});
