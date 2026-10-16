@@ -209,8 +209,39 @@ function getStatusLabel(status: string, error?: string): string {
   }
 }
 
-/** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
+/** Lines of a result a completion notification carries; get_subagent_result has the rest. */
+const NOTIFICATION_PREVIEW_LINES = 10;
+
+/**
+ * The head of a result for a notification: its first `maxLines` lines, cut at
+ * `maxLen` characters as well so one huge line cannot flood the parent's
+ * context. When anything is left out, a note says how much and where the rest
+ * is.
+ */
+export function previewResult(result: string, maxLen: number, maxLines: number): string {
+  const lines = result.split("\n");
+  let head = lines.slice(0, maxLines).join("\n");
+  if (head.length > maxLen) head = head.slice(0, maxLen);
+  if (head.length === result.length) return result;
+  // A line cut part-way counts as not shown: its end is missing.
+  const headLines = head.split("\n").length;
+  const fullLines = result[head.length] === "\n" ? headLines : headLines - 1;
+  const totalBytes = Buffer.byteLength(result, "utf8");
+  const missingBytes = totalBytes - Buffer.byteLength(head, "utf8");
+  return `${head}\n...(truncated: ${lines.length - fullLines} of ${lines.length} lines and ${missingBytes} of ${totalBytes} bytes ` +
+    "not shown; use get_subagent_result for the full output)";
+}
+
+/**
+ * Format a structured task notification matching Claude Code's <task-notification> XML.
+ * The result is previewed by lines (`maxLines`) within `resultMaxLen` characters.
+ */
+function formatTaskNotification(
+  record: AgentRecord,
+  resultMaxLen: number,
+  showCost = false,
+  maxLines = NOTIFICATION_PREVIEW_LINES,
+): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
@@ -222,11 +253,9 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
 
-  const resultPreview = record.result
-    ? record.result.length > resultMaxLen
-      ? record.result.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
-      : record.result
-    : "No output.";
+  const resultPreview = record.result ? previewResult(record.result, resultMaxLen, maxLines) : "No output.";
+  // The whole result's size, so the parent can judge whether fetching the rest is worth it.
+  const resultBytes = record.result ? `<result_bytes>${Buffer.byteLength(record.result, "utf8")}</result_bytes>` : null;
 
   return [
     `<task-notification>`,
@@ -238,6 +267,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
+    resultBytes,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
@@ -1538,9 +1568,11 @@ export default function (pi: ExtensionAPI) {
     // Through the completion outbox, like every other completion: delivered at
     // this session's next boundary (a turn when idle), coalesced with anything
     // else that finished, and cancelled per agent by get_subagent_result.
-    // An entry is all there is of an evicted agent, and get_subagent_result
-    // cannot fetch more, so its whole result goes in.
-    const maxLen = (r: AgentRecord) => (manager.getRecord(r.id) === r ? 500 : 20_000);
+    // An entry is all there is of an evicted agent's record, so its whole
+    // result goes in (up to 20 000 characters), not a preview: its saved
+    // session holds the agent's text, but not what the record added to it,
+    // such as the note naming its worktree branch.
+    const live = (r: AgentRecord) => manager.getRecord(r.id) === r;
     for (const r of records) {
       agentActivity.delete(r.id);
       widget.markFinished(r.id);
@@ -1548,7 +1580,10 @@ export default function (pi: ExtensionAPI) {
     }
     const parts = records.flatMap(r => {
       try {
-        return [{ id: r.id, text: formatTaskNotification(r, maxLen(r), showCost), details: buildNotificationDetails(r, 300) }];
+        const text = live(r)
+          ? formatTaskNotification(r, 500, showCost)
+          : formatTaskNotification(r, 20_000, showCost, Number.POSITIVE_INFINITY);
+        return [{ id: r.id, text, details: buildNotificationDetails(r, 300) }];
       } catch { return []; /* as in sendIndividualNudge */ }
     });
     if (parts.length > 0) {
