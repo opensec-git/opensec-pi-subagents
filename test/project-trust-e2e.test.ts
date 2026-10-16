@@ -13,12 +13,18 @@ import { join } from "node:path";
 import { fauxToolCall } from "@earendil-works/pi-ai";
 import { getAgentDir, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
+
 import { agentCall, agentToolResults, type FauxResponder, runPrintMode } from "./helpers/print-mode-runner.js";
 
 const dirs: string[] = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+/** These tests pin `projectTrust: "pi"` in the run's global subagents.json; the default, "full", trusts every project. */
+function followPiTrust(): void {
+  writeFileSync(join(getAgentDir(), "subagents.json"), JSON.stringify({ projectTrust: "pi" }));
+}
 
 function project(): string {
   const cwd = mkdtempSync(join(tmpdir(), "trust-e2e-"));
@@ -47,6 +53,26 @@ const isParent = (tools: Array<{ name: string }> | undefined) => (tools ?? []).s
 const hasToolResult = (messages: Array<{ role: string }>) => messages.some((m) => m.role === "toolResult");
 
 describe("subagents and project trust", () => {
+  it("by default (projectTrust: full) a child loads the project's .pi/extensions even when the parent does not trust it", async () => {
+    const cwd = project();
+    addProjectExtension(cwd);
+    let childTools: string[] | undefined;
+    const respond: FauxResponder = (context) => {
+      if (isParent(context.tools)) {
+        return hasToolResult(context.messages)
+          ? "parent done"
+          : agentCall({ prompt: "look around", description: "trust probe", run_in_background: false });
+      }
+      childTools ??= (context.tools ?? []).map((t) => t.name);
+      return "child done";
+    };
+
+    const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: false });
+    await run.dispose();
+
+    expect(childTools).toContain("probe_tool");
+  }, 60_000);
+
   for (const trusted of [false, true]) {
     it(`a child loads the project's .pi/extensions only when the parent trusts the project (trusted: ${trusted})`, async () => {
       const cwd = project();
@@ -62,7 +88,7 @@ describe("subagents and project trust", () => {
         return "child done";
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
       await run.dispose();
 
       expect(childTools).toBeDefined();
@@ -89,7 +115,7 @@ describe("subagents and project trust", () => {
         return hasToolResult(context.messages) ? "child done" : fauxToolCall("bash", { command: "echo child" });
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
       await run.dispose();
 
       const ran = existsSync(marker) ? readFileSync(marker, "utf-8").trim().split("\n").length : 0;
@@ -115,7 +141,7 @@ describe("the extension's own project files and project trust", () => {
         return "child done";
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
       const results = agentToolResults(run.parentSession).join("\n");
       await run.dispose();
 
@@ -167,7 +193,10 @@ export default function (pi: any) {
         prompt: "go",
         respond,
         projectTrusted: true,
-        beforeRun: () => { if (recorded) new ProjectTrustStore(getAgentDir()).set(cwd, true); },
+        beforeRun: () => {
+          followPiTrust();
+          if (recorded) new ProjectTrustStore(getAgentDir()).set(cwd, true);
+        },
       });
       await run.dispose();
 

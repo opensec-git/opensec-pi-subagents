@@ -3827,9 +3827,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // Compile-time completeness guard for snapshotSettings(). If a field is added
   // to SubagentsSettings and not mirrored above, this Exclude is non-empty and
   // fails to satisfy `never` — turning a silent settings-erasure bug into a
-  // typecheck error. `npm run typecheck` runs in CI.
+  // typecheck error. `npm run typecheck` runs in CI. (`projectTrust` is read from the
+  // global file only, so it is never part of the project snapshot.)
   type _NoMissingSettingsKeys =
-    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings>> extends never
+    Exclude<keyof SubagentsSettings, keyof ReturnType<typeof snapshotSettings> | "projectTrust"> extends never
       ? true
       : ["snapshotSettings() is missing a SubagentsSettings key"];
   const _settingsSnapshotIsComplete: _NoMissingSettingsKeys = true;

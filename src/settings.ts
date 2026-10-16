@@ -9,6 +9,8 @@ import { NO_FALLBACK } from "./agent-types.js";
 import { createDiscoveryCache } from "./discovery-cache.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
+export type ProjectTrustMode = "full" | "pi";
+
 export interface SubagentsSettings {
   maxConcurrent?: number;
   /**
@@ -106,6 +108,17 @@ export interface SubagentsSettings {
    * Defaults to false.
    */
   strictAgentFiles?: boolean;
+  /**
+   * Which project files subagents and this extension may use.
+   * - "full" (default): every project's agents, skills, workflows, `subagents.json`,
+   *   agent-file `extensions:` and, in child sessions, its `.pi` extensions and settings,
+   *   as before 0.20.1.
+   * - "pi": follow Pi's trust decision for the folder: an untrusted project's files are
+   *   not used, and project code needs a saved decision (`/trust`).
+   * Read from the global `~/.pi/agent/subagents.json` only: a project's own file cannot
+   * decide whether that project is trusted.
+   */
+  projectTrust?: ProjectTrustMode;
   /**
    * When true, the three built-in default agents (general-purpose, Explore, Plan)
    * are not registered at startup. User-defined agents from project/global custom
@@ -424,6 +437,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.strictAgentFiles === "boolean") {
     out.strictAgentFiles = r.strictAgentFiles;
   }
+  if (r.projectTrust === "full" || r.projectTrust === "pi") {
+    out.projectTrust = r.projectTrust;
+  }
   if (typeof r.disableDefaultAgents === "boolean") {
     out.disableDefaultAgents = r.disableDefaultAgents;
   }
@@ -514,6 +530,11 @@ function readSettingsFile(path: string): SubagentsSettings {
  * `project: false` reads the global file only — the project is not trusted,
  * and Pi ignores its `.pi/settings.json` too.
  */
+/** `projectTrust` from the global settings file (see `SubagentsSettings.projectTrust`). */
+export function globalProjectTrustMode(): ProjectTrustMode {
+  return readSettingsFile(globalPath()).projectTrust ?? "full";
+}
+
 export function loadSettings(cwd: string = process.cwd(), project = true): SubagentsSettings {
   return { ...readSettingsFile(globalPath()), ...(project ? readSettingsFile(projectPath(cwd)) : {}) };
 }

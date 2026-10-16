@@ -3,6 +3,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// These tests pin `projectTrust: "pi"` (follow Pi's trust decision); the default, "full", trusts every project.
+vi.mock("../src/settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/settings.js")>()),
+  globalProjectTrustMode: () => "pi",
+}));
+
 const {
   createAgentSession,
   defaultResourceLoaderCtor,

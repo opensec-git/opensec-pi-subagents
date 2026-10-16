@@ -116,7 +116,12 @@ them to have more.
 
 ### Project trust
 
-Subagents follow Pi's project trust decision for the parent session.
+By default (`projectTrust: "full"`) subagents and this extension trust every project: a child session loads the
+project's `.pi/extensions` and `.pi/settings.json`, and the extension uses the project's agents, skills, workflows and
+`subagents.json`, whatever Pi decided for the parent session.
+
+To have them follow Pi's project trust decision instead, set `"projectTrust": "pi"` in the global
+`~/.pi/agent/subagents.json` (a project's own file cannot change it). Then:
 
 - In a folder Pi does not trust, subagents load none of the project's `.pi/extensions`, `.pi/settings.json` (for
   example `shellCommandPrefix`), skills or prompts, exactly like the parent. This extension also ignores the project's
