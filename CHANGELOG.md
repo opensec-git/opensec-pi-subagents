@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Ports upstream `@tintinweb/pi-subagents` 0.20.0, 0.21.0 and 0.22.0 onto this fork (package-shipped agents and MCP for
-subagents are not ported).
+## [0.20.3] - 2026-10-16
+
+Background agents survive a session switch, subagents run on the parent's model by default, and nested and workflow
+agents stay resumable after a restart. Also ports upstream `@tintinweb/pi-subagents` 0.20.0, 0.21.0 and 0.22.0
+(package-shipped agents and MCP for subagents are not ported).
 
 > **Possibly breaking:**
+> - **Subagents run on the parent's model and thinking level by default**; the `Agent` and nested tools no longer offer
+>   `model`/`thinking` unless `allowModelOverride` is on.
+> - **Background agents keep running across `/new`, `/resume`, `/fork` and `/reload`** when their session is saved.
 > - **Pi 1.1.0 or newer is required** (peer range `>=1.1.0`).
 > - **Background completions are delivered at the parent's next boundary.** `smart`, the default join mode, no longer
 >   combines a turn's agents into one notification after waiting for all of them; `group` does that, per parent turn.
@@ -20,6 +26,7 @@ subagents are not ported).
 
 ### Added
 
+- **Background agents keep running across a session switch.** `/new`, `/resume`, `/fork` and `/reload` no longer stop them when their session is saved: the next session takes over the running agents. An agent belongs to the session that started it: other sessions do not list or address it, and a result that lands while another session is open is written into its own session and delivered as the usual notification when you return there. Quitting still stops every agent and saves worktrees.
 - **`ctrl+b` sends running foreground `Agent` calls to the background**, as in Claude Code; `b` in the conversation
   viewer sends one ([tintinweb/pi-subagents#261](https://github.com/tintinweb/pi-subagents/pull/261)). The run keeps
   going and its result arrives as a background notification. The key is configurable as `backgroundKey` in
@@ -36,12 +43,15 @@ subagents are not ported).
 
 ### Changed
 
+- **Subagents run on your model and thinking level.** By default every subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent` tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. Per-call choices are ignored, and the `Agent` and nested tools no longer offer `model` or `thinking`, so the main model cannot pick cheaper models or lower effort on its own. An agent file's `model:` or `thinking:` still applies, and a resumed agent keeps what it ran with. The new `allowModelOverride` setting (`subagents.json` or `/agents → Settings → Model override`) restores the per-call overrides and the tool parameters.
 - **Background completions reach a busy parent before its next model call**, after its current tool batch, through
   Pi's steering queue instead of a follow-up held until the parent stopped
   ([tintinweb/pi-subagents#387](https://github.com/tintinweb/pi-subagents/pull/387)). Completions that finish together
   arrive as one message and none waits for its siblings (`async` now means `smart`); an idle parent gets a turn about
   200 ms after a completion; `group` batches by parent turn; `get_subagent_result` suppresses a notification any time
-  before it is sent ([tintinweb/pi-subagents#388](https://github.com/tintinweb/pi-subagents/pull/388)).
+  before it is sent ([tintinweb/pi-subagents#388](https://github.com/tintinweb/pi-subagents/pull/388)). Results that
+  land while another session is open, or that are still waiting when you switch away, are delivered the same way when
+  you return to their session.
 - **An agent file's `isolated:` and `isolation:` hold on every spawn path**: direct and fallback `@handle` mentions,
   cross-extension RPC and registry spawns. A caller's value applies only when the file leaves the field unset; the
   widget's `worktree` tag shows for every worktree agent. Workflow `agent()` calls keep Claude Code's rule (only the
@@ -56,6 +66,7 @@ subagents are not ported).
 
 ### Fixed
 
+- **Nested agents and workflow children stay resumable after a restart**, `/resume`, `/fork` or `/reload`: their resume state is recorded in the parent session (`subagents:resume` entries), so a nested agent can be resumed by its owner and a workflow child with `agent({ resume })`. `resumeFromRunId` finds a run of the same session after a restart, and a child replayed from the journal can still be continued: the journal records which agent produced each answer.
 - `SubagentWorkflow` honours an agent file's `isolated: true`
   ([tintinweb/pi-subagents#339](https://github.com/tintinweb/pi-subagents/pull/339)).
 - FleetView ends with a blank line above Pi's footer

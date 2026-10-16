@@ -37,6 +37,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { commandExec } from "../exec-tree.js";
+import { isModelOverrideAllowed } from "../invocation-config.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import { isProjectCodeTrusted, isProjectTrustedBy } from "../project-trust.js";
@@ -258,11 +259,17 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       // back to the parent silently, because the script never asked for it.
       let model = ctx.model;
       const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model ?? config?.model;
+      // A script's `model` and `effort` are per-call choices, ignored unless
+      // the user allowed them (`allowModelOverride`): the child then runs on
+      // the agent definition's model and level, else the parent's.
+      const overridesAllowed = isModelOverrideAllowed();
+      const requestedModel = overridesAllowed ? request.model : undefined;
+      const effort = overridesAllowed ? request.effort : undefined;
+      const modelInput = requestedModel ?? config?.model;
       if (modelInput !== undefined) {
         const resolved = resolveModel(modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
+          if (requestedModel !== undefined) return { ok: false, error: resolved };
         } else {
           model = resolved;
         }
@@ -279,7 +286,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: request.model !== undefined,
+        callerSupplied: requestedModel !== undefined,
         agentLabel: config?.displayName ?? dispatch.type,
         modelInput,
       });
@@ -375,7 +382,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —
             // same precedence as `model` above.
-            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            ...(effort !== undefined ? { thinkingLevel: effort as ThinkingLevel } : {}),
             // Seeded with the REQUEST, not the outcome. The manager overwrites
             // the effective half at session creation; without a seed there is
             // nothing for it to compare against, so a level pi clamped would be
@@ -387,7 +394,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // therefore always got what it asked for. Seeding a `requestedModel`
             // would describe a precedence this path does not have.
             invocation: {
-              ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
+              ...(effort !== undefined ? { thinking: effort as ThinkingLevel } : {}),
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.
@@ -433,8 +440,20 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       startupStops.get(agentId)?.abort();
     },
 
-    async resumeAgent(agentId, prompt, onResolved) {
-      const id = records.get(agentId);
+    async resumeAgent(agentId, prompt, onResolved, recordId) {
+      // A child of this run by its run-local id; otherwise one replayed from
+      // the journal, by the record it ran as — accepted only for a workflow's
+      // own children, so a journal cannot reach the session's agents or a
+      // nested agent's. The record may be live or only a tombstone (restored
+      // after a restart), which the manager reopens from its session file.
+      let id = records.get(agentId);
+      if (id === undefined && recordId !== undefined) {
+        const known = manager.getRecord(recordId) ?? manager.findTombstone(recordId);
+        if (known?.workflowId !== undefined && known.parentAgentId === undefined) {
+          id = recordId;
+          records.set(agentId, id);
+        }
+      }
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }

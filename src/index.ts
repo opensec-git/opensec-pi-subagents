@@ -18,7 +18,7 @@ import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
+import { AgentManager, type CompactionInfo, isTopLevelAgent, type ManagerObservers, managerServices, RECORD_ENTRY_TYPE, RESUME_ENTRY_TYPE, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -28,7 +28,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { useTreeKillingExec } from "./exec-tree.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
@@ -38,6 +38,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -78,7 +79,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { readWorkflowScriptFile } from "./workflow/script-file.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, pruneSettledWorkflowTasks, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
-import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
+import { workflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, MERGED_BRANCH_MAX_AGE_DAYS, pruneMergedAgentBranches, recoverLeftoverWorktrees, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
@@ -258,6 +259,111 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
         : record.result
       : "No output.",
   };
+}
+
+/** Session entry marking `pending` results (see {@link recordEntryData}) as delivered. */
+const DELIVERED_ENTRY_TYPE = "subagents:delivered";
+
+/**
+ * A top-level agent's `subagents:record` entry. `pending`: its session has not
+ * been notified yet — it finished while another session was open — and
+ * delivers the notification when it starts; the extra figures let it render
+ * one from the entry alone.
+ */
+function recordEntryData(record: AgentRecord, pending = false): Record<string, unknown> {
+  return {
+    id: record.id, type: record.type, description: record.description,
+    status: record.status, result: record.result, error: record.error,
+    startedAt: record.startedAt, completedAt: record.completedAt,
+    resume: resumeStateOf(record),
+    ...(pending
+      ? { pending: true, toolUses: record.toolUses, lifetimeUsage: { ...record.lifetimeUsage }, outputFile: record.outputFile, toolCallId: record.toolCallId }
+      : {}),
+  };
+}
+
+/** An owned child's `subagents:resume` entry, or undefined without a session file to reopen. */
+function resumeEntryData(record: AgentRecord): { resume: ReturnType<typeof resumeStateOf> } | undefined {
+  const resume = resumeStateOf(record);
+  return resume ? { resume } : undefined;
+}
+
+/**
+ * The `pending` results among a session's entries that no later
+ * `subagents:delivered` entry covers, in order, as record-shaped objects a
+ * notification can be rendered from.
+ */
+export function pendingResultsFromEntries(entries: readonly unknown[]): AgentRecord[] {
+  const pending = new Map<string, AgentRecord>();
+  for (const entry of entries) {
+    const e = entry as { type?: unknown; customType?: unknown; data?: Record<string, unknown> } | null;
+    if (e?.type !== "custom" || !e.data) continue;
+    if (e.customType === RECORD_ENTRY_TYPE && e.data.pending === true && typeof e.data.id === "string") {
+      const d = e.data;
+      pending.set(d.id as string, {
+        id: d.id as string,
+        type: String(d.type ?? ""),
+        description: String(d.description ?? ""),
+        status: (d.status as AgentRecord["status"]) ?? "completed",
+        result: typeof d.result === "string" ? d.result : undefined,
+        error: typeof d.error === "string" ? d.error : undefined,
+        startedAt: typeof d.startedAt === "number" ? d.startedAt : 0,
+        completedAt: typeof d.completedAt === "number" ? d.completedAt : undefined,
+        toolUses: typeof d.toolUses === "number" ? d.toolUses : 0,
+        lifetimeUsage: (d.lifetimeUsage as LifetimeUsage | undefined) ?? { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        compactionCount: 0,
+        outputFile: typeof d.outputFile === "string" ? d.outputFile : undefined,
+        toolCallId: typeof d.toolCallId === "string" ? d.toolCallId : undefined,
+      });
+    } else if (e.customType === DELIVERED_ENTRY_TYPE && Array.isArray(e.data.ids)) {
+      for (const id of e.data.ids) if (typeof id === "string") pending.delete(id);
+    }
+  }
+  return [...pending.values()];
+}
+
+/**
+ * Stop a parked manager's agents with this (the parking instance's) code and
+ * record each in its own session, as a quit would. For an adopter of another
+ * version, or a parked manager something else replaced. Touches no instance
+ * state: the instance that parked it is gone.
+ */
+async function stopParkedAgents(manager: AgentManager, entry: ParkedSubagents, write?: EntryWriter): Promise<void> {
+  manager.setObservers({});
+  const put = (record: AgentRecord, pending: boolean): void => {
+    const [type, data] = isTopLevelAgent(record)
+      ? [RECORD_ENTRY_TYPE, recordEntryData(record, pending)]
+      : [RESUME_ENTRY_TYPE, resumeEntryData(record)];
+    if (!data) return;
+    if (!write?.(record.ownerSession, type, data)) appendToSessionFile(record.ownerSession, type, data);
+  };
+  for (const record of entry.completed.splice(0) as AgentRecord[]) put(record, isTopLevelAgent(record) && !record.resultConsumed);
+  const interrupted = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
+  manager.abortAll();
+  await manager.awaitWorktreeCleanup(15_000);
+  for (const record of interrupted) put(record, false);
+  await manager.dispose();
+}
+
+/**
+ * The process is exiting with a manager still parked (no instance took it
+ * over): record what can be recorded, synchronously — results that settled
+ * while parked, and the running agents as stopped. Worktrees cannot be
+ * committed this late; a later start recovers them (`recoverLeftoverWorktrees`).
+ */
+function recordParkedAgentsAtExit(manager: AgentManager, entry: ParkedSubagents): void {
+  manager.setObservers({});
+  const put = (record: AgentRecord, pending: boolean): void => {
+    const data = isTopLevelAgent(record) ? recordEntryData(record, pending) : resumeEntryData(record);
+    if (data) appendToSessionFile(record.ownerSession, isTopLevelAgent(record) ? RECORD_ENTRY_TYPE : RESUME_ENTRY_TYPE, data);
+  };
+  for (const record of entry.completed.splice(0) as AgentRecord[]) put(record, isTopLevelAgent(record) && !record.resultConsumed);
+  for (const record of manager.listAllAgents()) {
+    if (record.status !== "running" && record.status !== "queued") continue;
+    record.status = "stopped";
+    record.completedAt ??= Date.now();
+    put(record, false);
+  }
 }
 
 /**
@@ -676,36 +782,88 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Background completion: route through group join or send individual nudge
   /**
-   * Write a top-level agent's final record into the parent session. `resume`
-   * carries what reopening it needs (session file, handle, model, directory,
-   * worktree, isolation, turn limit); `session_start` reads it back, so the
-   * agent stays resumable after a restart, `/resume`, `/fork` or `/reload`.
-   * Guarded: it also runs while the session is shutting down.
+   * The session this activation belongs to: its session file, or undefined for
+   * one kept in memory. Agents spawned here carry it as `ownerSession`; a
+   * background agent that outlives a session switch (session-handoff.ts)
+   * reports to its owner, not to whichever session is open.
    */
-  function appendRecordEntry(record: AgentRecord): void {
-    try {
-      pi.appendEntry("subagents:record", {
-        id: record.id, type: record.type, description: record.description,
-        status: record.status, result: record.result, error: record.error,
-        startedAt: record.startedAt, completedAt: record.completedAt,
-        resume: resumeStateOf(record),
-      });
-    } catch { /* a session already torn down cannot record anything */ }
+  let currentSession: string | undefined;
+  const ownedHere = (record: Pick<AgentRecord, "ownerSession">): boolean => record.ownerSession === currentSession;
+
+  /**
+   * Write a custom entry into the session `owner`: through `pi` while that is
+   * the session this instance has open (Pi keeps it in memory), otherwise by
+   * appending to the owner's file, which Pi reads when it is opened again.
+   * Guarded: it also runs while the session is shutting down, and after.
+   */
+  function writeEntry(owner: string | undefined, customType: string, data: unknown): boolean {
+    if (owner === currentSession) {
+      try {
+        pi.appendEntry(customType, data);
+        return true;
+      } catch { /* torn down: the session is no longer open, so its file is safe to append to */ }
+    }
+    return appendToSessionFile(owner, customType, data);
   }
 
-  const manager = new AgentManager((record) => {
+  // Background completion: route through group join or send individual nudge
+  /**
+   * Write a top-level agent's final record into the session it belongs to.
+   * `resume` carries what reopening it needs (session file, handle, model,
+   * directory, worktree, isolation, turn limit); `session_start` reads it back,
+   * so the agent stays resumable after a restart, `/resume`, `/fork` or
+   * `/reload`. `pending` marks a result its session has not been told about
+   * yet (it finished while another session was open); that session delivers it
+   * when it starts.
+   */
+  function appendRecordEntry(record: AgentRecord, pending = false): void {
+    writeEntry(record.ownerSession, RECORD_ENTRY_TYPE, recordEntryData(record, pending));
+  }
+
+  /**
+   * Write an owned child's resume state (a nested agent's, a workflow's) into
+   * the session it belongs to, so `session_start` can rebuild it after a
+   * restart, `/resume`, `/fork` or `/reload`: its owner can then reopen it from
+   * its session file — the parent agent's nested tools, or a workflow's
+   * `agent({ resume })`. Only the resume state, never the result: the owner
+   * already has that, and the entry stays small. Nothing for an agent without
+   * a session file.
+   */
+  function appendResumeEntry(record: AgentRecord): void {
+    const data = resumeEntryData(record);
+    if (data) writeEntry(record.ownerSession, RESUME_ENTRY_TYPE, data);
+  }
+
+  /**
+   * A top-level agent of another session finished while this one is open: its
+   * result belongs to that session. Record it there, marked for delivery; no
+   * notification, event or row here.
+   */
+  function completeForeignAgent(record: AgentRecord): void {
+    agentActivity.delete(record.id);
+    appendRecordEntry(record, !record.resultConsumed);
+  }
+
+  function onAgentComplete(record: AgentRecord): void {
     // After shutdown `pi` is stale, and the shutdown handler records the
     // agents it interrupted itself.
     if (disposed) return;
-    // Spend that landed after the parent's last subagent tool result.
-    flushPendingUsageIfIdle();
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
-    // notification, and UI channels.
-    if (!isTopLevelAgent(record)) return;
+    // notification, and UI channels. Their resume state is still recorded.
+    if (!isTopLevelAgent(record)) {
+      flushPendingUsageIfIdle();
+      appendResumeEntry(record);
+      return;
+    }
+    if (!ownedHere(record)) {
+      completeForeignAgent(record);
+      return;
+    }
+    // Spend that landed after the parent's last subagent tool result.
+    flushPendingUsageIfIdle();
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -743,8 +901,10 @@ export default function (pi: ExtensionAPI) {
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
-  }, undefined, (record) => {
-    if (disposed || !isTopLevelAgent(record)) return;
+  }
+
+  function onAgentStart(record: AgentRecord): void {
+    if (disposed || !isTopLevelAgent(record) || !ownedHere(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -759,8 +919,10 @@ export default function (pi: ExtensionAPI) {
       type: record.type,
       description: record.description,
     });
-  }, (record, info) => {
-    if (disposed || !isTopLevelAgent(record)) return;
+  }
+
+  function onAgentCompact(record: AgentRecord, info: CompactionInfo): void {
+    if (disposed || !isTopLevelAgent(record) || !ownedHere(record)) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -770,13 +932,30 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }
+
+  function onAgentUsage(record: AgentRecord, usage: LifetimeUsage): void {
     // Every assistant message from every agent — nested included, exactly once.
     // Parked here until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
-    // pool grows in a session that will never drain it.
-    if (reportUsage) pendingUsage.add(usage);
-  });
+    // pool grows in a session that will never drain it. Another session's
+    // agents bill that session, not this one.
+    if (reportUsage && ownedHere(record)) pendingUsage.add(usage);
+  }
+
+  const managerObservers: ManagerObservers = {
+    onComplete: onAgentComplete,
+    onStart: onAgentStart,
+    onCompact: onAgentCompact,
+    onUsage: onAgentUsage,
+  };
+
+  /**
+   * Replaced at `session_start` by a manager the previous session parked, so
+   * its background agents keep running (see session-handoff.ts). Everything
+   * reads it through this binding, never a copy.
+   */
+  let manager = new AgentManager(onAgentComplete, undefined, onAgentStart, onAgentCompact, onAgentUsage);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -848,6 +1027,14 @@ export default function (pi: ExtensionAPI) {
     delete safeOptions.reclaim;
     // Internal to a reopen, like `reclaim`: it seeds an agent's lifetime figures.
     delete safeOptions.carry;
+    // A caller's model and thinking level are per-call overrides, which
+    // `allowModelOverride` (off by default) refuses on every spawn path: the
+    // agent then runs on the parent's current model and level, or its agent
+    // file's.
+    if (!isModelOverrideAllowed()) {
+      delete safeOptions.model;
+      delete safeOptions.thinkingLevel;
+    }
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
@@ -864,7 +1051,8 @@ export default function (pi: ExtensionAPI) {
    */
   const resolveAgentRef = (ref: string): AgentRecord | undefined => {
     const byId = manager.getRecord(ref);
-    if (byId) return byId;
+    // Another session's agent is not this session's to read or steer.
+    if (byId) return manager.isVisible(byId) ? byId : undefined;
     const resolved = manager.resolveMention(ref);
     return resolved?.kind === "live" ? resolved.record : undefined;
   };
@@ -875,7 +1063,7 @@ export default function (pi: ExtensionAPI) {
     spawn: spawnTopLevel,
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
-      return record !== undefined && isTopLevelAgent(record) ? record : undefined;
+      return record !== undefined && isTopLevelAgent(record) && manager.isVisible(record) ? record : undefined;
     },
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
@@ -923,6 +1111,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     disposed = false;
     currentCtx = ctx;
+    currentSession = sessionFileOf(ctx);
+    // First: everything below works on `manager`, which this may replace.
+    adoptParkedAgents();
+    manager.setVisibleOwner(currentSession);
     syncProjectTrust(ctx);
     void tidyAgentWorktrees(ctx);
     if (ctx.hasUI) {
@@ -934,7 +1126,11 @@ export default function (pi: ExtensionAPI) {
     // Agents of this session from before a restart, `/resume`, `/fork` or
     // `/reload`: resumable again, by the model and by `@handle`. The branch,
     // not every entry: a fork keeps only the agents on its own path.
-    manager.restoreTombstones(resumeStatesFromEntries(ctx.sessionManager?.getBranch?.() ?? []));
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    manager.restoreTombstones(resumeStatesFromEntries(branch));
+    // Results of this session's agents that finished while another session
+    // was open, recorded here for delivery now.
+    deliverPendingResults(branch);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -945,7 +1141,10 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
-          getRecord: (id) => manager.getRecord(id),
+          getRecord: (id) => {
+            const record = manager.getRecord(id);
+            return record && manager.isVisible(record) ? record : undefined;
+          },
           // Unguarded on purpose: the stop handler now runs the top-level check
           // itself off `getRecord`, and reports the refusal instead of the
           // "Agent not found" a false from here used to be read as.
@@ -1241,9 +1440,123 @@ export default function (pi: ExtensionAPI) {
     // the current schedules and agent records intact until then.
   });
 
-  // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
-  pi.on("session_shutdown", async () => {
+  /**
+   * Take over the manager the previous session parked at its switch, if it was
+   * parked for this session by this same version: its background agents keep
+   * running and show here when they are this session's. Another version cannot
+   * share the manager's code, so it stops its agents itself, as a quit would.
+   * See session-handoff.ts.
+   */
+  function adoptParkedAgents(): void {
+    const parked = takeParkedSubagents(currentSession);
+    if (!parked) return;
+    if (!isCompatible(parked)) {
+      void parked.stop(writeEntry).catch(() => { /* best effort */ });
+      return;
+    }
+    const adopted = parked.manager as AgentManager;
+    const fresh = manager;
+    // New work runs with this instance's modules (agent registry, settings).
+    adopted.useServices(managerServices());
+    adopted.setObservers(managerObservers);
+    adopted.setMaxConcurrent(fresh.getMaxConcurrent());
+    adopted.setMaxConcurrentForeground(fresh.getMaxConcurrentForeground());
+    manager = adopted;
+    widget.setManager(adopted);
+    fleet.setManager(adopted);
+    for (const [id, state] of parked.activity) {
+      if (!agentActivity.has(id)) agentActivity.set(id, state as AgentActivity);
+    }
+    void fresh.dispose();
+    // Runs that settled between the two instances, handled as if just now —
+    // once this start has finished setting up.
+    const settled = parked.completed as AgentRecord[];
+    if (settled.length > 0) setTimeout(() => { for (const record of settled) onAgentComplete(record); }, 0);
+  }
+
+  /**
+   * At a session switch: leave the background agents running in a manager
+   * parked for the next instance (session-handoff.ts). Nothing parked here
+   * may touch this instance's `pi` or ctx, which Pi invalidates next: until
+   * adopted, completions are queued in the entry.
+   */
+  function parkAgents(reason: string, targetSessionFile: string | undefined): void {
+    const parkedManager = manager;
+    const entry: ParkedSubagents = {
+      protocol: HANDOFF_PROTOCOL,
+      version: PACKAGE_VERSION,
+      reason,
+      sessionFile: currentSession,
+      targetSessionFile,
+      manager: parkedManager,
+      activity: new Map(agentActivity),
+      completed: [],
+      stop: (write) => stopParkedAgents(parkedManager, entry, write),
+    };
+    parkedManager.setObservers({ onComplete: (record) => { entry.completed.push(record); } });
+    parkedManager.detachPendingContexts();
+    parkedManager.setVisibleOwner(null);
+    parkSubagents(entry, () => recordParkedAgentsAtExit(parkedManager, entry));
+  }
+
+  /**
+   * Notify this session of its agents that finished while another session was
+   * open (`pending` record entries), once, after this start: a turn follows,
+   * as for any background completion. Marked delivered at once, so a second
+   * start does not repeat it.
+   */
+  function deliverPendingResults(branch: readonly unknown[]): void {
+    const pending = pendingResultsFromEntries(branch);
+    if (pending.length === 0) return;
+    const ids = pending.map(r => r.id);
+    try {
+      pi.appendEntry(DELIVERED_ENTRY_TYPE, { ids });
+    } catch {
+      return;
+    }
+    // The record still in memory carries more (context, compactions) than its entry.
+    const records = pending.map(entry => {
+      const live = manager.getRecord(entry.id);
+      return live && manager.isVisible(live) ? live : entry;
+    });
+    // Through the completion outbox, like every other completion: delivered at
+    // this session's next boundary (a turn when idle), coalesced with anything
+    // else that finished, and cancelled per agent by get_subagent_result.
+    // An entry is all there is of an evicted agent, and get_subagent_result
+    // cannot fetch more, so its whole result goes in.
+    const maxLen = (r: AgentRecord) => (manager.getRecord(r.id) === r ? 500 : 20_000);
+    for (const r of records) {
+      agentActivity.delete(r.id);
+      widget.markFinished(r.id);
+      fleet.onAgentFinished(r.id);
+    }
+    const parts = records.flatMap(r => {
+      try {
+        return [{ id: r.id, text: formatTaskNotification(r, maxLen(r), showCost), details: buildNotificationDetails(r, 300) }];
+      } catch { return []; /* as in sendIndividualNudge */ }
+    });
+    if (parts.length > 0) {
+      outbox.add({
+        ids: parts.map(p => p.id),
+        build: (unreadIds) => {
+          const unread = parts.filter(p => unreadIds.includes(p.id));
+          const [first, ...rest] = unread;
+          const details = { ...first.details };
+          if (rest.length > 0) details.others = rest.map(p => p.details);
+          const label = unread.length === 1 ? "An agent" : `${unread.length} agents`;
+          return {
+            content: `${label} of this session finished while another session was open.\n\n${unread.map(p => p.text).join("\n\n")}`,
+            details,
+          };
+        },
+      });
+    }
+    widget.update();
+  }
+
+  // On shutdown: on a session switch, background agents keep running (parked
+  // for the next instance); on quit, every agent is stopped and recorded.
+  pi.on("session_shutdown", async (event) => {
     // Spend no tool result carried back yet: record it while the session can.
     flushPendingUsage();
     disposed = true;
@@ -1267,15 +1580,60 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
-    // Pi tears this extension instance down with the session, so agents still
-    // running cannot be kept alive across the switch. Stop them, and record
-    // each as stopped and resumable in the session it belongs to.
-    const interrupted = manager.listAgents().filter(r => isTopLevelAgent(r) && (r.status === "running" || r.status === "queued"));
-    manager.abortAll();
+
+    const live = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
+    // Pi says why (Pi >= 1.0): `new`, `resume`, `fork` and `reload` replace the
+    // session within this process; `quit` (also /quit and SIGTERM/SIGHUP) or no
+    // reason ends it. On a switch, a background agent whose session is on disk
+    // keeps running — its results can still be recorded there — along with
+    // the agents it owns. Foreground agents (Pi aborted their tool call before
+    // this), workflows and agents of a session kept in memory stop as before.
+    const { reason, targetSessionFile } = (event ?? {}) as { reason?: unknown; targetSessionFile?: string };
+    // The next instance finds the parked manager by the session it starts, so
+    // a switch must name it (Pi 1.0 does; `/reload` keeps this one).
+    const switching = isSessionSwitch(reason)
+      && (reason === "reload" ? currentSession !== undefined : typeof targetSessionFile === "string");
+    const kept = new Set(switching
+      ? live.filter(r => isTopLevelAgent(r) && r.isBackground !== false && isSessionOnDisk(r.ownerSession)).map(r => r.id)
+      : []);
+    const rootOf = (record: AgentRecord): string => {
+      let current = record;
+      for (let parent = current.parentAgentId; parent !== undefined; parent = current.parentAgentId) {
+        const next = manager.getRecord(parent);
+        if (!next) break;
+        current = next;
+      }
+      return current.id;
+    };
+    const interrupted = live.filter(r => !kept.has(rootOf(r)));
+    // Also worth keeping: another session's agents that finished while this
+    // one was open, so their session shows them in full when it is reopened.
+    const carried = switching && manager.listAllAgents().some(r =>
+      isTopLevelAgent(r) && !ownedHere(r) && !r.resultConsumed && !manager.isRunActive(r.id) && isSessionOnDisk(r.ownerSession));
+    const parking = kept.size > 0 || carried;
+    if (kept.size > 0) {
+      for (const record of interrupted) manager.abort(record.id);
+    } else {
+      manager.abortAll();
+    }
     // A stopped worktree agent still commits its changes to a branch while it
-    // settles; dispose() does not wait for that, and the process exits next.
-    await manager.awaitWorktreeCleanup(15_000);
-    for (const record of interrupted) appendRecordEntry(record);
+    // settles; dispose() does not wait for that, and the process may exit next.
+    await manager.awaitWorktreeCleanup(15_000, kept.size > 0 ? new Set(interrupted.map(r => r.id)) : undefined);
+    // Each recorded as stopped and resumable, in the session it belongs to.
+    for (const record of interrupted) {
+      if (isTopLevelAgent(record)) appendRecordEntry(record);
+      else appendResumeEntry(record);
+    }
+    if (parking) parkAgents(reason as string, targetSessionFile);
+
+    // Completions still waiting for this session's next boundary (a busy or
+    // interrupted parent): marked pending in the session they belong to, so
+    // its next start (a switch back, a restart) delivers them like any result
+    // that landed while another session was open.
+    for (const id of outbox.pendingIds()) {
+      const record = manager.getRecord(id);
+      if (record && isTopLevelAgent(record) && !record.resultConsumed && !manager.isRunActive(id)) appendRecordEntry(record, true);
+    }
     // Neither may fire into a torn-down instance (or hold `pi -p` open).
     outbox.dispose();
     groupJoin.dispose();
@@ -1290,6 +1648,8 @@ export default function (pi: ExtensionAPI) {
     // that is already gone.
     try { widget.dispose(); } catch { /* stale UI context at shutdown */ }
     refreshTicker.clear();
+    // A parked manager lives on, with its agents' sessions.
+    if (parking) return;
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
@@ -1742,6 +2102,7 @@ export default function (pi: ExtensionAPI) {
     setBackgroundByDefault,
     setSchedulingEnabled,
     setScopeModels: setScopeModelsEnabled,
+    setAllowModelOverride: setModelOverrideAllowed,
     setStrictAgentFiles: (b) => { strictAgentFiles = b; },
     setDisableDefaultAgents: setDisableDefaultAgents,
     setToolDescriptionMode: setToolDescriptionMode,
@@ -1836,6 +2197,28 @@ export default function (pi: ExtensionAPI) {
     ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
     : "";
 
+  // Same trade again, for `allowModelOverride`: with overrides off the `model`
+  // and `thinking` parameters are not in the schema, so the prose that teaches
+  // them goes too — a model told it may pick a model will keep trying.
+  const modelOverrideAllowed = isModelOverrideAllowed();
+  const modelGuideline = modelOverrideAllowed
+    ? `- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").\n- Use thinking to control extended thinking level.\n`
+    : "";
+  const modelParamShape = {
+    model: Type.Optional(
+      Type.String({
+        description:
+          'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+      }),
+    ),
+    thinking: Type.Optional(
+      Type.String({
+        description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+      }),
+    ),
+  };
+  const modelParams: Partial<typeof modelParamShape> = modelOverrideAllowed ? modelParamShape : {};
+
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
     ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
     : "";
@@ -1881,9 +2264,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
+${modelGuideline}- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1909,6 +2290,7 @@ Terse command-style prompts produce shallow, generic work.
       agentDir: getAgentDir,
       isolationGuideline: () => isolationGuideline,
       scheduleGuideline: () => scheduleGuideline,
+      modelGuideline: () => modelGuideline,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
     return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
@@ -1976,17 +2358,7 @@ Terse command-style prompts produce shallow, generic work.
       subagent_type: Type.String({
         description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
       }),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
-        }),
-      ),
+      ...modelParams,
       max_turns: Type.Optional(
         Type.Number({
           description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
@@ -2328,7 +2700,9 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            // Only when overrides are on: a job keeps the call's model choice
+            // for every later fire, which is exactly what the setting refuses.
+            model: isModelOverrideAllowed() ? (params as { model?: string }).model : undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2496,12 +2870,15 @@ Terse command-style prompts produce shallow, generic work.
         // The callback lazily reads record.outputFile (set right after spawn)
         // rather than closing over a value that doesn't exist yet.
         let id: string;
+        // Read now: a queued agent may start after a session switch, when this
+        // ctx is stale and every read of it throws.
+        const bgCwd = ctx.cwd;
         const origBgOnSession = bgCallbacks.onSessionCreated;
         bgCallbacks.onSessionCreated = (session: any) => {
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, bgCwd);
           }
         };
 
@@ -2890,7 +3267,7 @@ Terse command-style prompts produce shallow, generic work.
   const workflowTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.WORKFLOW,
     label: "SubagentWorkflow",
-    description: renderToolDescriptionTemplate(fullWorkflowToolDescription),
+    description: renderToolDescriptionTemplate(workflowToolDescription(isModelOverrideAllowed())),
     promptSnippet: "Run a deterministic script that orchestrates many subagents",
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
@@ -2977,7 +3354,19 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
-      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
+      // A run from before a restart, `/resume` or `/reload` is found by its
+      // files: its journal and saved script sit in this session's task dir.
+      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks, (id) => {
+        try {
+          const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId());
+          const journal = join(dir, `${id}.workflow.jsonl`);
+          if (!existsSync(journal)) return undefined;
+          const script = join(dir, `${id}.workflow.js`);
+          return { journalPath: journal, ...(existsSync(script) ? { scriptPath: script } : {}) };
+        } catch {
+          return undefined;
+        }
+      });
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
       // A resume with no source of its own re-runs what that run ran. The
@@ -3955,6 +4344,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      allowModelOverride: isModelOverrideAllowed(),
       strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
@@ -4098,6 +4488,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "allowModelOverride",
+          label: "Model override",
+          description:
+            "Let Agent calls, workflows and scheduled jobs pick a subagent's model and thinking level; "
+            + "off runs every subagent on your current model and thinking level unless its agent file sets one "
+            + "(the tool parameters change on next pi session)",
+          currentValue: isModelOverrideAllowed() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4296,6 +4696,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
         notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "allowModelOverride") {
+        const enabled = value === "on";
+        setModelOverrideAllowed(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Subagent calls may pick a model and thinking level. Tool spec change takes effect on next pi session."
+            : "Subagents run on your current model and thinking level. Tool spec change takes effect on next pi session.",
+        );
       } else if (id === "strictAgentFiles") {
         const enabled = value === "on";
         strictAgentFiles = enabled;

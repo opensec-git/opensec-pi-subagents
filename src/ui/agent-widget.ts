@@ -359,6 +359,12 @@ export class AgentWidget {
   }
 
   /** Set the UI context (grabbed from first tool execution). */
+  /** Read agents from this manager from now on: one adopted across a session switch (session-handoff.ts). */
+  setManager(manager: AgentManager): void {
+    this.manager = manager;
+    this.update();
+  }
+
   setUICtx(ctx: UICtx) {
     if (ctx !== this.uiCtx) {
       // UICtx changed — the widget registered on the old context is gone.

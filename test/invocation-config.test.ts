@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { resolveAgentInvocationConfig, resolveJoinMode } from "../src/invocation-config.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "../src/invocation-config.js";
 import type { AgentConfig } from "../src/types.js";
 
 function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -19,6 +19,9 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe("resolveAgentInvocationConfig", () => {
+  // Per-call model/thinking overrides are off by default (allowModelOverride).
+  beforeEach(() => { setModelOverrideAllowed(true); });
+  afterEach(() => { setModelOverrideAllowed(false); });
   it("prefers agent config over tool-call params for locked fields", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({
@@ -150,6 +153,9 @@ describe("resolveJoinMode", () => {
 });
 
 describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
+  // Per-call model/thinking overrides are off by default (allowModelOverride).
+  beforeEach(() => { setModelOverrideAllowed(true); });
+  afterEach(() => { setModelOverrideAllowed(false); });
   it("records the caller's values when the agent file outranks them", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({ model: "provider/config-model", thinking: "low" }),
@@ -189,5 +195,37 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
     );
 
     expect(resolved.overridden).toEqual({ thinking: "max", model: undefined });
+  });
+});
+
+describe("resolveAgentInvocationConfig — allowModelOverride off (the default)", () => {
+  it("ignores the call's model and thinking level, so the parent's apply", () => {
+    const resolved = resolveAgentInvocationConfig(undefined, { model: "provider/param-model", thinking: "minimal" });
+    expect(resolved.modelInput).toBeUndefined();
+    expect(resolved.modelFromParams).toBe(false);
+    expect(resolved.thinking).toBeUndefined();
+    expect(resolved.overridden).toBeUndefined();
+  });
+
+  it("still honours the agent file's model and thinking level, and discloses nothing", () => {
+    const resolved = resolveAgentInvocationConfig(
+      makeConfig({ model: "provider/config-model", thinking: "high" }),
+      { model: "provider/param-model", thinking: "minimal" },
+    );
+    expect(resolved.modelInput).toBe("provider/config-model");
+    expect(resolved.thinking).toBe("high");
+    expect(resolved.overridden).toBeUndefined();
+  });
+
+  it("honours the call's values when the option allows it explicitly", () => {
+    const resolved = resolveAgentInvocationConfig(undefined, { model: "p/m", thinking: "low" }, { allowModelOverride: true });
+    expect(resolved.modelInput).toBe("p/m");
+    expect(resolved.thinking).toBe("low");
+  });
+
+  it("ignores non-string values even when allowed", () => {
+    const resolved = resolveAgentInvocationConfig(undefined, { model: 42, thinking: {} }, { allowModelOverride: true });
+    expect(resolved.modelInput).toBeUndefined();
+    expect(resolved.thinking).toBeUndefined();
   });
 });

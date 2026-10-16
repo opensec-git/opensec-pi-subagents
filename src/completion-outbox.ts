@@ -78,6 +78,11 @@ export class CompletionOutbox {
     if (this.items.length > 0) this.arm();
   }
 
+  /** Ids of everything still waiting to be sent. */
+  pendingIds(): string[] {
+    return this.items.flatMap(item => item.ids);
+  }
+
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;

@@ -55,6 +55,9 @@ export function workflowRunId(): string {
   return `wf_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
 
+/** What {@link workflowRunId} produces, and nothing else: safe as a file name. */
+export const WORKFLOW_RUN_ID = /^wf_[0-9a-f]{12}$/;
+
 export interface WorkflowTask {
   /** Discriminator, alongside Claude Code's `local_agent` / `local_bash`. */
   type: "local_workflow";
@@ -265,10 +268,16 @@ export function workflowResultText(task: WorkflowTask): string {
  * nothing to replay — reporting that as "resumed" would be a lie the caller
  * could not see through. An unknown id is an error rather than a cold start,
  * because a caller that asked to resume is expecting not to pay.
+ *
+ * `persisted` finds a run that is no longer in memory — one from before a
+ * restart, `/resume` or `/reload`, or one past the in-memory cap — by its files
+ * in this session's task directory. Such a run cannot be running in this
+ * process: live runs are never dropped from `tasks`.
  */
 export function resolveResumeTarget(
   runId: string | undefined,
   tasks: ReadonlyMap<string, WorkflowTask>,
+  persisted?: (runId: string) => { journalPath: string; scriptPath?: string } | undefined,
 ):
   | undefined
   | { ok: true; runId: string; journalPath: string; scriptPath: string }
@@ -277,6 +286,11 @@ export function resolveResumeTarget(
   if (id === undefined || id === "") return undefined;
 
   const prior = tasks.get(id);
+  // Only an id of the shape `workflowRunId` makes: it becomes a file name.
+  const onDisk = prior === undefined && WORKFLOW_RUN_ID.test(id) ? persisted?.(id) : undefined;
+  if (onDisk !== undefined) {
+    return { ok: true, runId: id, journalPath: onDisk.journalPath, scriptPath: onDisk.scriptPath ?? "" };
+  }
   if (prior === undefined) {
     const known = [...tasks.keys()];
     return {

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import subagentsExtension from "../src/index.js";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 import { setWorktreeIsolationEnabled } from "../src/worktree.js";
 
 const EXAMPLE_TEMPLATE = fileURLToPath(new URL("../examples/agent-tool-description.md", import.meta.url));
@@ -83,6 +84,7 @@ describe("toolDescriptionMode", () => {
     // previous test left it. Reset it so each setup()'s settings decide, and
     // so the "default" assertions below really test the default.
     setWorktreeIsolationEnabled(true);
+    setModelOverrideAllowed(false);
     process.chdir(prevCwd);
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -156,8 +158,6 @@ describe("toolDescriptionMode", () => {
       "worktree",
       ".pi/agents/",
       "self-contained",
-      "model",
-      "thinking",
       "inherit_context",
     ]) {
       expect(visible).toContain(contract);
@@ -166,10 +166,29 @@ describe("toolDescriptionMode", () => {
 
   it("every strategy param carries a real description of its own", () => {
     const props = setup().get("Agent").parameters?.properties ?? {};
-    for (const name of ["run_in_background", "model", "thinking", "inherit_context"]) {
+    for (const name of ["run_in_background", "inherit_context"]) {
       // Long enough to be an explanation the model can act on, not a bare label.
       expect(props[name]?.description?.length ?? 0).toBeGreaterThan(40);
     }
+  });
+
+  it("offers no model or thinking parameter, and no prose about them, while allowModelOverride is off (the default)", () => {
+    const tool = setup().get("Agent");
+    const props = Object.keys(tool.parameters?.properties ?? {});
+    expect(props).not.toContain("model");
+    expect(props).not.toContain("thinking");
+    expect(tool.description).not.toContain("Use model to specify");
+    expect(tool.description).not.toContain("Use thinking to control");
+  });
+
+  it("allowModelOverride: true restores both parameters, described, and their usage notes", () => {
+    const tool = setup({ allowModelOverride: true }).get("Agent");
+    const props = tool.parameters?.properties ?? {};
+    for (const name of ["model", "thinking"]) {
+      expect(props[name]?.description?.length ?? 0).toBeGreaterThan(40);
+    }
+    expect(tool.description).toContain("Use model to specify a different model");
+    expect(tool.description).toContain("Use thinking to control extended thinking level.\n- Use inherit_context");
   });
 
   it("custom mode renders the project template with placeholders substituted", () => {

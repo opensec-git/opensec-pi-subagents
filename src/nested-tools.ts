@@ -16,7 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
+import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import {
@@ -208,8 +208,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
-      model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
-      thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
+      // Offered only under `allowModelOverride`; otherwise a nested child runs
+      // on its parent agent's model and thinking level, or its agent file's.
+      ...(isModelOverrideAllowed()
+        ? {
+            model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
+            thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
+          }
+        : {}),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
         Type.Boolean({

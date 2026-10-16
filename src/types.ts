@@ -170,6 +170,11 @@ export interface AgentResumeState {
   rootSessionId?: string;
   /** `provider/id` of the model the agent's session ran on. */
   model?: string;
+  /**
+   * Thinking level its session ran at. Informational: a reopened session
+   * restores the level saved in its own file.
+   */
+  thinking?: EffectiveThinkingLevel;
   /** Caller-supplied working directory, if any. */
   cwd?: string;
   /** The directory it ran from; for a worktree agent, the repo. */
@@ -337,6 +342,13 @@ export interface AgentRecord {
    * directory as their ancestors' instead of the child session's own id.
    */
   rootSessionId?: string;
+  /**
+   * The session this agent belongs to: the parent session's file when it was
+   * spawned (undefined for a session kept only in memory). Owned children
+   * inherit their root's. A background agent keeps running when the user
+   * switches sessions, and its results go to this session, not the open one.
+   */
+  ownerSession?: string;
 }
 
 /**

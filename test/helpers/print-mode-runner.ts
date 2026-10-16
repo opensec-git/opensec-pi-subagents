@@ -57,6 +57,7 @@ import {
   getCurrentTools,
   type Message,
   type Model,
+  type ThinkingLevel,
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
@@ -161,6 +162,16 @@ export interface RunPrintModeOptions {
    * the loader builds its own (trusted) manager.
    */
   projectTrusted?: boolean;
+  /** Faux mode: whether the faux model supports reasoning, so thinking levels are not clamped to "off". */
+  reasoning?: boolean;
+  /** The parent session's thinking level. Default: Pi's (from settings). */
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * The parent's session manager. Default: in memory. Pass a persisted one
+   * (`SessionManager.create` / `.open`) to keep the parent's entries on disk, so
+   * a second run can reopen the same session as after a restart.
+   */
+  sessionManager?: SessionManager;
 }
 
 export interface PrintModeRun {
@@ -340,7 +351,10 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     if (!options.steps && !options.respond) {
       throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
     }
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux = registerFauxProvider({
+      provider: "faux",
+      models: [{ id: "faux-1", contextWindow: 200_000, ...(options.reasoning ? { reasoning: true } : {}) }],
+    });
     model = faux.getModel();
     // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since
@@ -400,8 +414,9 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRegistry: modelRegistry as any,
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager: options.sessionManager ?? SessionManager.inMemory(cwd),
     settingsManager,
+    ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
   });
   session.setSessionName("print-mode-host");
 

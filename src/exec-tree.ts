@@ -139,8 +139,17 @@ export function execTree(command: string, args: string[], options: ExecTreeOptio
   });
 }
 
-/** The API objects whose commands run through {@link execTree}. */
-const treeKillingApis = new WeakSet<object>();
+/**
+ * The API objects whose commands run through {@link execTree}. Process-global:
+ * Pi loads a fresh copy of this module for every session, and a background
+ * agent that outlives its session (see session-handoff.ts) still runs git with
+ * the `pi` it was spawned with — stale by then, so its own `exec` throws, while
+ * this one does not need it.
+ */
+const TREE_KILLING_KEY = Symbol.for("pi-subagents:tree-killing-apis");
+const treeKillingGlobal = globalThis as Record<symbol, WeakSet<object> | undefined>;
+treeKillingGlobal[TREE_KILLING_KEY] ??= new WeakSet<object>();
+const treeKillingApis: WeakSet<object> = treeKillingGlobal[TREE_KILLING_KEY];
 
 /**
  * Run this API object's gate and git commands through {@link execTree}.

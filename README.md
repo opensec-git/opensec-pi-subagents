@@ -82,6 +82,9 @@ When a background agent (or workflow) finishes, the main session is notified, as
 - If you interrupt the parent (`Esc`), what was waiting is kept and delivered once the interrupted turn has stopped,
   starting a turn.
 - Reading a result with `get_subagent_result` (or the RPC `consume`) before the notification is sent suppresses it.
+- A result that lands while another session is open, or that is still waiting for its parent's boundary when you switch
+  away, is recorded in its own session and delivered the same way when you return there (see
+  [Switching sessions](#switching-sessions)).
 
 The join mode (`/agents → Settings → Join mode`, `defaultJoinMode`) decides whether a result waits for its siblings:
 
@@ -144,16 +147,52 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
   file, under the same id, for as long as that file exists. Sessions are saved by default (`rememberAgents`; turn it
   off and agents are resumable only for those ten minutes).
 - What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
-  stay resumable by the model and by `@handle`. Agents still running are stopped, as before, and recorded as stopped
-  and resumable. `/new` starts with none. Nested agents can be resumed by their parent while their parent's manager
-  lives; across a restart only top-level agents are rebuilt.
+  stay resumable by the model and by `@handle`. `/new` starts with none. Nested agents and workflow children are
+  rebuilt too (their resume state is written to the parent session as `subagents:resume` entries, one small entry per
+  settled child): a nested agent stays resumable by the agent that owns it, once that agent is resumed under its id.
 - In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
-  was evicted.
+  was evicted. `resumeFromRunId` finds a run of the same session after a restart or `/resume` by its files, and a child
+  it replays from the journal can still be continued with `agent({ resume })`: the journal records which agent
+  produced each answer.
+
+### Switching sessions
+
+Background agents keep running when you switch sessions with `/new`, `/resume`, `/fork` or `/reload`, as long as the
+session that started them is saved (it has a session file).
+
+- An agent belongs to the session that started it. While another session is open it does not show in that session's
+  widget, FleetView, `/agents` lists or `@` suggestions, and `get_subagent_result`, `steer_subagent` and `resume` there
+  do not find it. It still counts toward the background concurrency limit.
+- If it finishes while another session is open, its result is written into its own session (a `subagents:record`
+  entry marked `pending`) and nothing is sent to the open session. When you return to its session the result arrives as
+  the usual completion notification, and the main agent takes a turn on it. The same happens after a restart if the
+  result was recorded but not yet delivered.
+- Its nested agents keep running with it. Foreground agents (Pi interrupts their tool call; send one to the background
+  with `ctrl+b` first to keep it), workflows, `@mention` prompts in flight and agents of a session kept only in memory
+  stop at a switch, as before, and are recorded as stopped.
+- Quitting (`/quit`, Ctrl+D, SIGTERM, SIGHUP) stops every agent and saves worktrees, as before. If Pi exits while a
+  switch is still in progress, the agents are recorded as stopped; their worktrees are recovered at the next start.
+- After updating this package, the first `/reload` (or switch) loads the new version, which cannot take over the old
+  version's running agents: they are stopped and recorded as stopped and resumable.
+
+### Model and thinking level
+
+A subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent`
+tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. For a nested agent the
+parent is the agent that spawned it.
+
+- An agent file's own `model:` or `thinking:` is your configuration and always applies.
+- Per-call choices are ignored by default: the `Agent` tool and the nested tool do not offer `model` or `thinking`,
+  workflow `agent({ model, effort })` is ignored, and so are a scheduled job's and an RPC spawn's model and thinking
+  level. This keeps the main model from picking cheaper models or lower effort on its own.
+- A resumed agent keeps the model and thinking level it ran with.
+- `allowModelOverride: true` (project or global `subagents.json`, or `/agents → Settings → Model override`) restores the
+  per-call overrides and the tool parameters. The resolution changes at once; the tool parameters at the next session.
 
 ### Custom agents
 
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
-model and thinking level unless their definition or call overrides them.
+model and thinking level unless their definition sets one (see [Model and thinking level](#model-and-thinking-level)).
 
 `isolated: true` (on a call or in an agent file) removes extension and MCP tools, skills, `ext:` selectors and nested
 delegation. It is not a sandbox: the agent still inherits Pi's environment variables (including provider keys its
@@ -220,6 +259,7 @@ To have them follow Pi's project trust decision instead, set `"projectTrust": "p
 |---|---|---|
 | Background concurrency (`/agents → Settings`) | `10` | How many background agents run at once. |
 | `backgroundKey` (`subagents.json`) | `ctrl+b` | Key that sends running foreground `Agent` calls to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)); `"off"` disables it. |
+| Model override (`/agents → Settings`, `allowModelOverride`) | `false` | Whether a spawn's own `model` / `thinking` (Agent tool, nested tool, workflow `agent()`, scheduled jobs, RPC) may choose the subagent's model and thinking level. Off: subagents run on the parent's current model and level unless their agent file sets one, and the tools do not offer the parameters. |
 | Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call is killed at the limit and the agent sees the timeout; any other tool still running a minute later is stopped and the agent is told to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none; a timeout the main agent asks for is kept. |
 
 ## Notes

@@ -17,6 +17,7 @@ import {
   failWorkflowTask,
   formatWorkflowNotification,
   pauseWorkflowTask,
+  resolveResumeTarget,
   resumeWorkflowTask,
   type WorkflowTask,
 } from "../src/workflow/task.js";
@@ -145,5 +146,35 @@ describe("the completion notification", () => {
     const text = formatWorkflowNotification(task, 2_000);
     expect(text).toContain("<worktrees>\nfix: branch pi-agent-a\nport: branch pi-agent-b worktree kept at /wt/b\n</worktrees>");
     expect(text).not.toContain("read:");
+  });
+});
+
+describe("resolving resumeFromRunId", () => {
+  const persisted = vi.fn((id: string) => (id === "wf_0123456789ab" ? { journalPath: `/t/${id}.workflow.jsonl`, scriptPath: `/t/${id}.workflow.js` } : undefined));
+
+  it("finds a run from before a restart by its files", () => {
+    expect(resolveResumeTarget("wf_0123456789ab", new Map(), persisted)).toEqual({
+      ok: true,
+      runId: "wf_0123456789ab",
+      journalPath: "/t/wf_0123456789ab.workflow.jsonl",
+      scriptPath: "/t/wf_0123456789ab.workflow.js",
+    });
+  });
+
+  it("never turns an id of another shape into a file name", () => {
+    persisted.mockClear();
+    const result = resolveResumeTarget("../../etc/passwd", new Map(), persisted);
+    expect(result).toMatchObject({ ok: false });
+    expect(persisted).not.toHaveBeenCalled();
+  });
+
+  it("prefers the run in memory, which may still be running", () => {
+    const { task } = runningTask();
+    const result = resolveResumeTarget(task.id, new Map([[task.id, task]]), () => ({ journalPath: "/x" }));
+    expect(result).toMatchObject({ ok: false });
+  });
+
+  it("reports an unknown id when nothing is on disk either", () => {
+    expect(resolveResumeTarget("wf_ffffffffffff", new Map(), persisted)).toMatchObject({ ok: false });
   });
 });

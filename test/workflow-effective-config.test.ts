@@ -13,7 +13,8 @@
  * feeds it: the host reading the record's snapshot and handing it over.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -82,10 +83,14 @@ describe("the workflow host reports a child's effective configuration", () => {
   let manager: AgentManager;
 
   beforeEach(() => {
+    // Per-call model/thinking overrides are off by default (allowModelOverride).
+    setModelOverrideAllowed(true);
     vi.mocked(runAgent).mockReset();
     registerAgents(new Map());
     manager = new AgentManager();
   });
+
+  afterEach(() => { setModelOverrideAllowed(false); });
 
   it("hands over the model the session actually resolved to, not the script's spelling", async () => {
     // `name` too: resolveModel fuzzy-matches across id, name and provider/id.
