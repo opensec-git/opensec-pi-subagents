@@ -117,18 +117,37 @@ function resolvedInfo(record: AgentRecord | undefined) {
   };
 }
 
-function toSpawnResult(record: AgentRecord): WorkflowSpawnResult {
-  const tokens = getLifetimeTotal(record.lifetimeUsage);
+/** What a record had spent before a run, so a resumed run reports only its own. */
+interface SpendBaseline {
+  tokens: number;
+  outputTokens: number;
+  toolUses: number;
+}
+
+function spendOf(record: AgentRecord | undefined): SpendBaseline {
+  return {
+    tokens: record ? getLifetimeTotal(record.lifetimeUsage) : 0,
+    outputTokens: record?.lifetimeUsage?.output ?? 0,
+    toolUses: record?.toolUses ?? 0,
+  };
+}
+
+function toSpawnResult(record: AgentRecord, baseline?: SpendBaseline): WorkflowSpawnResult {
+  // The record's counters are lifetime figures — they accumulate across every
+  // run of the agent — so a resume subtracts what was spent before it; the
+  // runtime adds each call's figures to the run's totals and the budget.
+  const tokens = getLifetimeTotal(record.lifetimeUsage) - (baseline?.tokens ?? 0);
   // Reported separately from `tokens`, which is the lifetime total. The script's
   // `budget` counts *output* tokens, as Claude Code's does — billing the input
   // and cache reads a fan-out re-sends would over-report it by an order of
   // magnitude and make the documented guards useless.
-  const outputTokens = record.lifetimeUsage?.output ?? 0;
+  const outputTokens = (record.lifetimeUsage?.output ?? 0) - (baseline?.outputTokens ?? 0);
+  const toolCalls = record.toolUses - (baseline?.toolUses ?? 0);
   const cwd = childCwd(record);
   const common = {
     ...(tokens > 0 ? { tokens } : {}),
     ...(outputTokens > 0 ? { outputTokens } : {}),
-    ...(record.toolUses > 0 ? { toolCalls: record.toolUses } : {}),
+    ...(toolCalls > 0 ? { toolCalls } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
   };
 
@@ -394,6 +413,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
       let record: AgentRecord | undefined;
+      // Taken before the run: the record's counters are lifetime figures. A
+      // reopened (evicted) child starts a fresh record, so there is nothing to
+      // subtract.
+      const before = manager.getRecord(id);
+      const baseline = spendOf(before);
       try {
         // A child evicted after it finished is reopened from its session file.
         record = await manager.resume(id, prompt, deps.signal, { pi, ctx });
@@ -417,7 +441,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       onResolved?.({ recordId: id });
       const info = resolvedInfo(record);
       if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record);
+      return toSpawnResult(record, record === before ? baseline : undefined);
     },
 
     /**

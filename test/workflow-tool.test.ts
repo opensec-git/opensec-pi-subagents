@@ -71,7 +71,8 @@ function stubManager(
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
+  const getRecord = vi.fn(() => undefined);
+  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({

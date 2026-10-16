@@ -72,6 +72,7 @@ import {
 import { runInChildSessionContext } from "./child-context.js";
 import { agentMentionReminder } from "./mention.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { LifetimeUsage } from "./usage.js";
 
 export interface MentionCloneOptions {
   /** The MAIN session's context — what the spawn is attributed to, and the
@@ -85,6 +86,8 @@ export interface MentionCloneOptions {
   agentTool: ToolDefinition;
   /** Aborts the clone's turn — the session it belongs to is going away. */
   signal?: AbortSignal;
+  /** Called with each of the clone's assistant messages' usage: a real turn on the main model. */
+  onUsage?: (usage: LifetimeUsage) => void;
 }
 
 export interface MentionCloneResult {
@@ -100,7 +103,7 @@ export interface MentionCloneResult {
  * back to starting the agent directly.
  */
 export async function runMentionClone(opts: MentionCloneOptions): Promise<MentionCloneResult> {
-  const { ctx, type, message, agentTool, signal: stop } = opts;
+  const { ctx, type, message, agentTool, signal: stop, onUsage } = opts;
   if (stop?.aborted) return { spawned: false, error: "the session ended before the clone started" };
 
   let spawned = false;
@@ -201,6 +204,22 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     const restored = session.agent.state.messages.some((m: { role: string }) => m.role !== "system");
     if (!restored) session.agent.state.messages.push(...conversation.messages);
 
+    if (onUsage) {
+      session.subscribe((event) => {
+        if (event.type !== "message_end" || event.message.role !== "assistant") return;
+        const u = (event.message as { usage?: { input?: number; output?: number; cacheWrite?: number; cacheRead?: number; cost?: { total?: number } } }).usage;
+        if (!u) return;
+        try {
+          onUsage({
+            input: u.input ?? 0,
+            output: u.output ?? 0,
+            cacheWrite: u.cacheWrite ?? 0,
+            cacheRead: u.cacheRead ?? 0,
+            cost: u.cost?.total ?? 0,
+          });
+        } catch { /* accounting must not fail the clone */ }
+      });
+    }
     if (stop?.aborted) return { spawned, error: "the session ended before the clone ran" };
 
     // User text first, reminder after — the order Claude Code's attachment

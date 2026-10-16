@@ -500,6 +500,32 @@ export default function (pi: ExtensionAPI) {
   /** Off-screen mention clones in flight, aborted at shutdown so they stop spending. */
   const mentionClones = new Set<AbortController>();
 
+  /**
+   * Hand pending subagent spend to the parent session as a `usage` entry, which
+   * pi counts in `getSessionStats()` (footer, statusline, `/cost`) without
+   * putting it in the LLM context. For spend no subagent tool result will carry
+   * back: background and workflow agents that finish after the last such call,
+   * and the `@mention` clone's own turn. Pi < 1.0 has no `appendUsage`, and the
+   * spend then waits for the next tool result as before.
+   */
+  function flushPendingUsage(ctx: ExtensionContext | undefined = currentCtx): void {
+    if (!reportUsage || disposed || !ctx) return;
+    try {
+      type UsageWriter = { appendUsage?: (kind: string, provider: string, model: string, usage: unknown, note?: string) => unknown };
+      const sessionManager = ctx.sessionManager as unknown as UsageWriter;
+      if (typeof sessionManager.appendUsage !== "function") return;
+      const usage = pendingUsage.drain();
+      if (usage) sessionManager.appendUsage("subagents", "pi-subagents", "subagents", usage, "subagent spend");
+    } catch { /* a session going away cannot record anything */ }
+  }
+
+  /** Flush now if the parent is between turns; otherwise `agent_end` or the next tool result will. */
+  function flushPendingUsageIfIdle(): void {
+    try {
+      if (currentCtx?.isIdle()) flushPendingUsage();
+    } catch { /* stale ctx */ }
+  }
+
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
@@ -643,6 +669,8 @@ export default function (pi: ExtensionAPI) {
     // After shutdown `pi` is stale, and the shutdown handler records the
     // agents it interrupted itself.
     if (disposed) return;
+    // Spend that landed after the parent's last subagent tool result.
+    flushPendingUsageIfIdle();
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -1118,9 +1146,12 @@ export default function (pi: ExtensionAPI) {
         message: mention.message,
         agentTool: registeredAgentTool,
         signal: cloneStop.signal,
+        // The clone's turn is real spend on the main model.
+        onUsage: (usage) => { if (reportUsage && live()) pendingUsage.add(usage); },
       })
         .then(async (result) => {
           if (!live()) return;
+          flushPendingUsageIfIdle();
           if (result.spawned) return;
           // A clone that could not run must not swallow the mention: start the
           // agent the direct way rather than leaving the user with a toast and
@@ -1178,6 +1209,8 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    // Spend no tool result carried back yet: record it while the session can.
+    flushPendingUsage();
     disposed = true;
     sessionGeneration++;
     for (const stop of mentionClones) stop.abort();
@@ -1515,6 +1548,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event) => {
     if (event.toolName === "bash") boundBashTimeout(event.input, getToolTimeoutSeconds(), false);
     return undefined;
+  });
+
+  // The parent's turn is over: spend that arrived after its last subagent tool
+  // result (background agents, workflows) reaches the session stats now.
+  pi.on("agent_end", (_event, ctx) => {
+    flushPendingUsage(ctx);
   });
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
@@ -2605,6 +2644,7 @@ Terse command-style prompts produce shallow, generic work.
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
+    flushPendingUsageIfIdle();
     const result = workflowResultText(task);
     scheduleNudge(task.id, () => {
       pi.sendMessage<NotificationDetails>({
@@ -2955,6 +2995,7 @@ Terse command-style prompts produce shallow, generic work.
       }, { deliverAs: "nextTurn" });
       widget.update();
       fleet.update();
+      flushPendingUsageIfIdle();
     }).catch(() => { /* the session went away mid-flight */ });
   }
 
