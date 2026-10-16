@@ -122,6 +122,22 @@ tools into an allowlist. The built-in `Explore` and `Plan` agents get `read`, `g
 tools, so they cannot write files or run commands; a file named `Explore.md` or `Plan.md` replaces them if you want
 them to have more.
 
+Pi's built-in codemode and tool search (`builtin:codemode`, `builtin:tool-search`) load in subagents as in the main
+session: on with `extensions: true`, kept or dropped by `extensions:` and `exclude_extensions:` like any other
+extension (address them by the full `builtin:` name), and off for everyone with `-builtin:<name>` in Pi's `extensions`
+setting or `--no-extensions`. Pi's built-in MCP (`builtin:mcp`) is the exception: subagents do not load it, so no
+child starts its own set of `mcp.json` servers, unless the agent file names it, e.g. `extensions: ["*", builtin:mcp]`
+(`--no-mcp` still keeps it out). MCP tools are reached through codemode or `tool_search`, so an `ext:` allowlist must
+name that bridge too: `tools: "read, ext:builtin:codemode, ext:builtin:mcp/mcp__srv__search"`. A bare
+`mcp__<server>__<tool>` name in `tools:` is reported as an unknown built-in (`tools-error:`); name MCP tools with
+`ext:builtin:mcp/<tool>`.
+
+A subagent activates only the tools Pi itself would declare to the model: `direct` and `model-only` tools, minus those
+registered with `defaultActive: false` unless the agent names them (`ext:foo/bar`). `codemode` and `deferred` tools
+(Pi's MCP tools) stay undeclared until codemode or `tool_search` reaches them. Calls a tool makes through
+`ctx.executeTool()`, such as a codemode script calling another tool, go through the same scope check as the model's
+own calls; out-of-scope tools are blocked but can still appear in codemode's `searchTools()` and `tool_search` results.
+
 ### Project trust
 
 By default (`projectTrust: "full"`) subagents and this extension trust every project: a child session loads the

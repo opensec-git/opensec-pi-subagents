@@ -11,9 +11,13 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
+  type InlineExtension,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -83,6 +87,8 @@ export function extensionCanonicalName(extPath: string): string {
  * co-located file to `pi-subagents`.
  */
 function extensionPackageName(extPath: string): string | undefined {
+  // `builtin:<name>` names no file; climbing from it would read the process cwd's manifest.
+  if (extPath.startsWith("builtin:")) return undefined;
   const entry = resolve(extPath);
   let dir = dirname(extPath);
   for (;;) {
@@ -130,6 +136,39 @@ export function extensionCanonicalNames(extPath: string): string[] {
 /** Whether an `extensions:` entry names a file to load rather than an extension by name. */
 function isExtensionPathEntry(entry: string): boolean {
   return entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
+}
+
+/**
+ * Pi's built-in extensions, as its CLI hands them to the loader it builds. A
+ * subagent's loader is built here and would otherwise start with none, so a
+ * `builtin:<name>` entry matched nothing. Forwarded as `builtin:` resources they
+ * load as in the main session: default-on, disabled by `-builtin:<name>` in Pi's
+ * `extensions` setting, and filtered by the agent's `extensions:` like any other
+ * extension. Fresh factories per spawn: MCP state lives in the closure. Pi's
+ * `llama.cpp` built-in is CLI-only (not exported).
+ */
+const BUILTIN_EXTENSION_PATHS = new Set(["builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
+
+function builtinExtensionFactories(): InlineExtension[] {
+  return [
+    { name: "codemode", factory: createCodemodeExtension(), builtin: true, replaceable: true },
+    { name: "tool-search", factory: createToolSearchExtension(), builtin: true, replaceable: true },
+    { name: "mcp", factory: createMcpExtension(), builtin: true, replaceable: true },
+  ];
+}
+
+/**
+ * Built-ins a subagent must not load, whatever the settings say.
+ *
+ * Pi's MCP is off for subagents unless the agent asks for it by naming
+ * `builtin:mcp` in `extensions:`: with it on, every subagent would start its own
+ * set of `mcp.json` servers, one process tree per running child. Pi's CLI flags
+ * apply as in the main session: `--no-mcp` keeps MCP out even when asked for,
+ * and `--no-extensions` keeps all three out.
+ */
+export function disabledBuiltinExtensions(mcpRequested: boolean, argv: readonly string[] = process.argv): string[] | undefined {
+  if (argv.some((a) => a === "--no-extensions" || a === "-ne")) return ["codemode", "tool-search", "mcp"];
+  return mcpRequested && !argv.includes("--no-mcp") ? undefined : ["mcp"];
 }
 
 /**
@@ -331,10 +370,29 @@ export function installExtensionToolScope(
     return keep;
   };
 
+  // Names this agent selects explicitly: its built-ins, injected tools, and
+  // `ext:foo/bar` narrowings. Pi activates a named tool even when it is
+  // `defaultActive: false`, as `--tools` does.
+  const named = new Set([...toolNames, ...readmitToolNames, ...[...narrowing.values()].flatMap((s) => [...s])]);
+
+  // Activate what Pi itself would: only tools declared to the model (`direct`/
+  // `model-only` exposure), and of those only named ones or ones not opted out
+  // with `defaultActive: false`. `codemode`/`deferred` tools (Pi's MCP tools by
+  // default) stay undeclared until their extension or `tool_search` activates
+  // them — so an already-active in-scope tool is kept, or turn_end would undo that.
   const renarrow = () => {
     const allowed = inScope();
-    const next = session.getAllTools().map((t) => t.name).filter((n) => allowed.has(n));
     const current = session.getActiveToolNames();
+    const active = new Set(current);
+    const next = session
+      .getAllTools()
+      .filter(({ name, exposure = "direct" }) => {
+        if (!allowed.has(name)) return false;
+        if (active.has(name)) return true;
+        if (exposure !== "direct" && exposure !== "model-only") return false;
+        return named.has(name) || session.getToolDefinition(name)?.defaultActive !== false;
+      })
+      .map((t) => t.name);
     // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
     // the no-op that steady-state turns would otherwise pay for every turn.
     if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
@@ -987,7 +1045,11 @@ export async function runAgent(
     settingsManager,
     noExtensions,
     additionalExtensionPaths,
-    extensionFactories: toolScopeGuard ? [toolScopeGuard.extension] : undefined,
+    extensionFactories: [
+      ...builtinExtensionFactories(),
+      ...(toolScopeGuard ? [toolScopeGuard.extension] : []),
+    ],
+    disabledBuiltinExtensions: disabledBuiltinExtensions(keepNames.has("builtin:mcp")),
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -1035,7 +1097,8 @@ export async function runAgent(
   // flags path-like and "*" entries — excludes are plain names only.
   if (hasExcludes && discoveredNames) {
     for (const name of excludeNames) {
-      if (!discoveredNames.has(name)) {
+      // A disabled built-in (MCP, by default) is never discovered, and excluding it is still valid.
+      if (!discoveredNames.has(name) && !BUILTIN_EXTENSION_PATHS.has(name)) {
         options.onToolActivity?.({
           type: "end",
           toolName: `extension-error:exclude_extensions: "${name}" for agent "${type}" did not match any discovered extension`,
