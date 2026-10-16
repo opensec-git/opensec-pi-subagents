@@ -116,6 +116,24 @@ export function renderRunningAgentStatus(
   return container;
 }
 
+/**
+ * What a background spawn or resume tells the model about the result. The
+ * notification is the signal: get_subagent_result is for the full text after
+ * it, and calling it before only invites a polling loop.
+ */
+const BACKGROUND_FOLLOW_UP =
+  "You will be notified when this agent completes — continue with other work meanwhile, and do not poll it.\n" +
+  "After the notification, get_subagent_result returns its full result. steer_subagent sends it a message mid-run.";
+
+/** What get_subagent_result says of an agent whose run is not over yet. */
+function stillRunningText(state: "running" | "queued" | "stopping"): string {
+  const lead = state === "stopping"
+    ? "Agent was stopped and is still winding down."
+    : `Agent is still ${state}.`;
+  return `${lead} A completion notification will arrive on its own when it finishes — continue with other work ` +
+    "meanwhile, and do not call get_subagent_result for this agent again until that notification arrives.";
+}
+
 /** How long a foreground `Agent` call runs before its row offers the background key. */
 const BACKGROUND_HINT_DELAY_MS = 2000;
 
@@ -2766,7 +2784,7 @@ Terse command-style prompts produce shallow, generic work.
         if (live && (live.status === "running" || live.status === "queued")) {
           return errorResult(
             `Agent "${params.resume}" is still ${live.status} — it can only be resumed once its current run finishes.\n` +
-            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+            `Use steer_subagent to send it a message mid-run. A completion notification arrives on its own when the run finishes.`,
           );
         }
         const resumeTranscript = resumeWritesTranscript(target.type);
@@ -2795,8 +2813,7 @@ Terse command-style prompts produce shallow, generic work.
             `Type: ${record.type}\n` +
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-            `\nYou will be notified when this agent completes.\n` +
-            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            `\n${BACKGROUND_FOLLOW_UP}`,
             { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
           );
         }
@@ -2835,7 +2852,7 @@ Terse command-style prompts produce shallow, generic work.
         if (!record) {
           return errorResult(
             `Agent "${params.resume}" is still running — it can only be resumed once its current run finishes.\n` +
-            `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+            `Use steer_subagent to send it a message mid-run. A completion notification arrives on its own when the run finishes.`,
           );
         }
         // A foreground resume flushes its transcript itself: only a background
@@ -2877,8 +2894,7 @@ Terse command-style prompts produce shallow, generic work.
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `\n${BACKGROUND_FOLLOW_UP}\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
@@ -3649,15 +3665,19 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
-    promptSnippet: "Check status and retrieve results from a background agent",
+      "Retrieve a background agent's full result after its completion notification, which carries only a preview. " +
+      "You are notified automatically when a background agent finishes, so do not call this to check on one that is " +
+      "still running — continue with other work instead. Use the agent ID returned by Agent.",
+    promptSnippet: "Retrieve a finished background agent's full result",
     parameters: Type.Object({
       agent_id: Type.String({
         description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "If true, wait for the agent to complete before returning. Default: false.",
+          description:
+            "If true, block until the agent finishes. Only when there is nothing else to do until it does; " +
+            "otherwise keep working and let the completion notification arrive. Default: false.",
         }),
       ),
       verbose: Type.Optional(
@@ -3717,10 +3737,10 @@ Terse command-style prompts produce shallow, generic work.
         `Description: ${record.description}\n\n`;
 
       const active = manager.isRunActive(record.id);
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
+      if (record.status === "running" || record.status === "queued") {
+        output += stillRunningText(record.status);
       } else if (record.status === "stopped" && active) {
-        output += "Agent was stopped and is still winding down. Use wait: true or check back later.";
+        output += stillRunningText("stopping");
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}${sessionFileLine(record)}`;
       } else {
