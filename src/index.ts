@@ -1804,7 +1804,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       isolated: Type.Optional(
         Type.Boolean({
-          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
+          description: "If true, agent gets no extension/MCP tools, skills or nested agents — only built-in tools. It still inherits the environment variables, model access, Pi settings and, for append-mode agents, the parent's system prompt; it is not a sandbox.",
         }),
       ),
       inherit_context: Type.Optional(

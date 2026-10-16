@@ -103,6 +103,11 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
 model and thinking level unless their definition or call overrides them.
 
+`isolated: true` (on a call or in an agent file) removes extension and MCP tools, skills, `ext:` selectors and nested
+delegation. It is not a sandbox: the agent still inherits Pi's environment variables (including provider keys its
+`bash` can read), the parent's model registry and auth, global and trusted project settings (shell, command prefix,
+retry, compaction), and, for append-mode agents such as `general-purpose`, the parent's whole system prompt.
+
 `tools:` limits built-in tools only. Tools registered by extensions stay available unless the file sets
 `extensions: false` (or names the extensions to load), or lists `ext:` selectors in `tools:`, which turns extension
 tools into an allowlist. The built-in `Explore` and `Plan` agents get `read`, `grep`, `find` and `ls` and no extension
