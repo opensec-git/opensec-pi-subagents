@@ -23,7 +23,7 @@ import {
   WORKFLOW_ITEM_CAP,
   workflowConcurrency,
 } from "../src/workflow/runtime.js";
-import { fullWorkflowToolDescription } from "../src/workflow/tool-description.js";
+import { fullWorkflowToolDescription, workflowToolDescription } from "../src/workflow/tool-description.js";
 
 const description = fullWorkflowToolDescription;
 const workerSource = readFileSync(
@@ -154,5 +154,25 @@ describe("rendering", () => {
     expect(description).not.toContain("[object Object]");
     // biome-ignore lint/suspicious/noTemplateCurlyInString: the literal placeholder is the subject under test
     expect(description).toContain("${f.title}");
+  });
+});
+
+describe("with allowModelOverride off (the default)", () => {
+  const off = workflowToolDescription(false);
+
+  it("is the full description unchanged when overrides are on", () => {
+    expect(workflowToolDescription(true)).toBe(description);
+  });
+
+  it("still names every option the runtime accepts, so a script passing one is not surprised", () => {
+    for (const option of AGENT_OPTIONS) expect(off).toContain(option);
+  });
+
+  it("says model and effort are ignored instead of teaching how to pick them", () => {
+    expect(off).toContain("opts.model and opts.effort are ignored");
+    expect(off).not.toContain("opts.model overrides the model");
+    expect(off).not.toContain("opts.effort overrides the reasoning effort");
+    expect(off).not.toContain("specific model override");
+    expect(off).not.toMatch(/effort:\s*'/);
   });
 });

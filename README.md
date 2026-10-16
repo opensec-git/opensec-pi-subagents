@@ -32,8 +32,8 @@ Restart Pi or run `/reload` after installing. Update with `pi update --extension
 
 ### Requirements
 
-- Pi: this Node build loads and runs a real turn on Pi 0.87.1 and Pi 1.0.0 (both on Node). The peer-dependency
-  range is `>=0.84.0`; earlier versions were not re-tested.
+- Pi 1.1.0 or newer (peer range `>=1.1.0`, the test suite runs against Pi 1.1.0). `typebox` is a `"*"` peer that Pi
+  supplies; `@sinclair/typebox` is no longer used.
 - Install only one Subagents package at a time: the public and private packages expose the same tools.
 
 ## Features
@@ -72,6 +72,61 @@ Agent({ subagent_type: "Explore", prompt: "Find authentication code", descriptio
 | `/agents` | Inspect and manage agents: live conversations, settings, workflows, and scheduled jobs (`/agents → Scheduled jobs`). |
 | `@<agent> <message>` | With agent mentions enabled, sends a message to that agent, e.g. `@explore check the RPC path`. A finished agent is resumed (see [Resuming agents](#resuming-agents)). |
 
+### Background completions
+
+When a background agent (or workflow) finishes, the main session is notified, as in Claude Code:
+
+- A busy parent gets the notification after its current batch of tool calls, before its next model call; running tools
+  are not interrupted. Everything that finished during that batch arrives as one message.
+- An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window.
+- If you interrupt the parent (`Esc`), what was waiting is kept and delivered once the interrupted turn has stopped,
+  starting a turn.
+- Reading a result with `get_subagent_result` (or the RPC `consume`) before the notification is sent suppresses it.
+- A result that lands while another session is open, or that is still waiting for its parent's boundary when you switch
+  away, is recorded in its own session and delivered the same way when you return there (see
+  [Switching sessions](#switching-sessions)).
+
+The join mode (`/agents → Settings → Join mode`, `defaultJoinMode`) decides whether a result waits for its siblings:
+
+| Mode | Behaviour |
+|---|---|
+| `smart` (default) | No waiting: each result is delivered at the parent's next boundary. `async` is accepted as an older name for it. |
+| `group` | The background agents spawned in one parent turn report together, in one notification once all of them have finished (a lone spawn reports alone). A 30 s timeout after the first completion sends a partial notification; stragglers follow within 15 s. |
+
+### Sending a foreground agent to the background
+
+While a foreground `Agent` call runs (`run_in_background: false`), press `ctrl+b` at the prompt to hand it to the
+background, as in Claude Code. The same run keeps going (session, in-flight turn, transcript and worktree); the blocked
+call returns what a `run_in_background` spawn returns, and the result arrives later as the usual background
+notification. `ctrl+b` hands off every running foreground call at once; a dim `(ctrl+b to run in background)` hint
+appears under one of them after 2 s. In the conversation viewer (FleetView, `/agents`), `b` hands off just that agent.
+
+- The key is claimed only while a foreground call runs and the prompt editor has focus; otherwise `ctrl+b` keeps its
+  editor meaning (cursor left). Rebind it with `"backgroundKey"` in `subagents.json` (a Pi key id such as `alt+b`), or
+  turn it off with `"backgroundKey": "off"`.
+- After the handoff, `Esc` on the parent turn no longer stops the agent; `x` in the viewer and `/agents` still do. The
+  run moves from the foreground to the background concurrency pool, over the limit if the pool is full.
+- Nested agents, workflow agents, queued spawns and resumed runs cannot be handed off.
+
+### Fullscreen conversation observer
+
+In Pi's fullscreen mode (`/settings → TUI mode → fullscreen`, Pi's default), an agent opened from FleetView, `/agents`
+or the workflow inspector fills the terminal; regular mode keeps the floating viewer. Neither replaces the main session
+or pauses an agent, and `Esc` returns to the previous view (while composing, the first `Esc` cancels the draft).
+
+- Mouse-wheel scrolling. Scrolling up pauses following; reaching the bottom resumes it.
+- A one-column scrollbar in Pi's style that follows Pi's `/settings → Fullscreen scrollbar`: `auto` appears while
+  scrolling or hovering and hides after a second, `always` stays, `hidden` removes it and its mouse target. Drag the
+  thumb, or click the track to page. The column is kept free in `auto` mode too, so the bar never re-wraps the text.
+- Clickable footer controls (steer, send to background, stop with two clicks, Markdown mode, close).
+- While scrolled away, the divider above the footer shows `[ ↓ N new messages · Ctrl+End ]` (conversation messages,
+  not streaming updates); click it or press `Ctrl+End` to jump back and follow, without losing a steering draft.
+- Mouse events are consumed, so they never scroll, select or click the main view underneath. Text selection, copying
+  and switching agents without leaving the observer are not implemented.
+- Cost: built on the viewer's incremental transcript, so scrolling, wheel and drags reuse cached lines, a frame checks
+  only the transcript's last message and draws only the visible rows, and nothing ticks while it is idle. Without a JIT
+  (Pi-Bolt), a frame or a scroll step costs well under a millisecond whatever the transcript's length.
+
 ### Resuming agents
 
 Every agent result names the agent: `Agent ID: <id>` (foreground and background results alike). Pass it back to continue
@@ -92,27 +147,88 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
   file, under the same id, for as long as that file exists. Sessions are saved by default (`rememberAgents`; turn it
   off and agents are resumable only for those ten minutes).
 - What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
-  stay resumable by the model and by `@handle`. Agents still running are stopped, as before, and recorded as stopped
-  and resumable. `/new` starts with none. Nested agents can be resumed by their parent while their parent's manager
-  lives; across a restart only top-level agents are rebuilt.
+  stay resumable by the model and by `@handle`. `/new` starts with none. Nested agents and workflow children are
+  rebuilt too (their resume state is written to the parent session as `subagents:resume` entries, one small entry per
+  settled child): a nested agent stays resumable by the agent that owns it, once that agent is resumed under its id.
 - In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
-  was evicted.
+  was evicted. `resumeFromRunId` finds a run of the same session after a restart or `/resume` by its files, and a child
+  it replays from the journal can still be continued with `agent({ resume })`: the journal records which agent
+  produced each answer.
+
+### Switching sessions
+
+Background agents keep running when you switch sessions with `/new`, `/resume`, `/fork` or `/reload`, as long as the
+session that started them is saved (it has a session file).
+
+- An agent belongs to the session that started it. While another session is open it does not show in that session's
+  widget, FleetView, `/agents` lists or `@` suggestions, and `get_subagent_result`, `steer_subagent` and `resume` there
+  do not find it. It still counts toward the background concurrency limit.
+- If it finishes while another session is open, its result is written into its own session (a `subagents:record`
+  entry marked `pending`) and nothing is sent to the open session. When you return to its session the result arrives as
+  the usual completion notification, and the main agent takes a turn on it. The same happens after a restart if the
+  result was recorded but not yet delivered.
+- Its nested agents keep running with it. Foreground agents (Pi interrupts their tool call; send one to the background
+  with `ctrl+b` first to keep it), workflows, `@mention` prompts in flight and agents of a session kept only in memory
+  stop at a switch, as before, and are recorded as stopped.
+- Quitting (`/quit`, Ctrl+D, SIGTERM, SIGHUP) stops every agent and saves worktrees, as before. If Pi exits while a
+  switch is still in progress, the agents are recorded as stopped; their worktrees are recovered at the next start.
+- After updating this package, the first `/reload` (or switch) loads the new version, which cannot take over the old
+  version's running agents: they are stopped and recorded as stopped and resumable.
+
+### Model and thinking level
+
+A subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent`
+tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. For a nested agent the
+parent is the agent that spawned it.
+
+- An agent file's own `model:` or `thinking:` is your configuration and always applies.
+- Per-call choices are ignored by default: the `Agent` tool and the nested tool do not offer `model` or `thinking`,
+  workflow `agent({ model, effort })` is ignored, and so are a scheduled job's and an RPC spawn's model and thinking
+  level. This keeps the main model from picking cheaper models or lower effort on its own.
+- A resumed agent keeps the model and thinking level it ran with.
+- `allowModelOverride: true` (project or global `subagents.json`, or `/agents → Settings → Model override`) restores the
+  per-call overrides and the tool parameters. The resolution changes at once; the tool parameters at the next session.
 
 ### Custom agents
 
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
-model and thinking level unless their definition or call overrides them.
+model and thinking level unless their definition sets one (see [Model and thinking level](#model-and-thinking-level)).
 
 `isolated: true` (on a call or in an agent file) removes extension and MCP tools, skills, `ext:` selectors and nested
 delegation. It is not a sandbox: the agent still inherits Pi's environment variables (including provider keys its
 `bash` can read), the parent's model registry and auth, global and trusted project settings (shell, command prefix,
 retry, compaction), and, for append-mode agents such as `general-purpose`, the parent's whole system prompt.
 
+The agent file wins over the caller for `isolated:` and `isolation:`; a call's value applies only when the file leaves
+the field unset. This holds on every spawn path: the `Agent` tool, `@handle` mentions (direct mode and the fallback
+when a mention clone fails), cross-extension RPC and the manager registry. So
+`isolation: off` in a file refuses a caller's `isolation: "worktree"`, and an `isolation: worktree` file gets its
+worktree even when the caller asked for none; outside a git repository such an agent fails to start instead of running
+in the main checkout. Two exceptions: in a workflow, only the script's `agent()` option decides `isolation` (as in Claude
+Code; `isolated:` from the file still applies), and an agent reopened from its session file continues where it ran
+(its `isolated:` is read from the file again).
+
 `tools:` limits built-in tools only. Tools registered by extensions stay available unless the file sets
 `extensions: false` (or names the extensions to load), or lists `ext:` selectors in `tools:`, which turns extension
 tools into an allowlist. The built-in `Explore` and `Plan` agents get `read`, `grep`, `find` and `ls` and no extension
 tools, so they cannot write files or run commands; a file named `Explore.md` or `Plan.md` replaces them if you want
 them to have more.
+
+Pi's built-in codemode and tool search (`builtin:codemode`, `builtin:tool-search`) load in subagents as in the main
+session: on with `extensions: true`, kept or dropped by `extensions:` and `exclude_extensions:` like any other
+extension (address them by the full `builtin:` name), and off for everyone with `-builtin:<name>` in Pi's `extensions`
+setting or `--no-extensions`. Pi's built-in MCP (`builtin:mcp`) is the exception: subagents do not load it, so no
+child starts its own set of `mcp.json` servers, unless the agent file names it, e.g. `extensions: ["*", builtin:mcp]`
+(`--no-mcp` still keeps it out). MCP tools are reached through codemode or `tool_search`, so an `ext:` allowlist must
+name that bridge too: `tools: "read, ext:builtin:codemode, ext:builtin:mcp/mcp__srv__search"`. A bare
+`mcp__<server>__<tool>` name in `tools:` is reported as an unknown built-in (`tools-error:`); name MCP tools with
+`ext:builtin:mcp/<tool>`.
+
+A subagent activates only the tools Pi itself would declare to the model: `direct` and `model-only` tools, minus those
+registered with `defaultActive: false` unless the agent names them (`ext:foo/bar`). `codemode` and `deferred` tools
+(Pi's MCP tools) stay undeclared until codemode or `tool_search` reaches them. Calls a tool makes through
+`ctx.executeTool()`, such as a codemode script calling another tool, go through the same scope check as the model's
+own calls; out-of-scope tools are blocked but can still appear in codemode's `searchTools()` and `tool_search` results.
 
 ### Project trust
 
@@ -142,6 +258,8 @@ To have them follow Pi's project trust decision instead, set `"projectTrust": "p
 | Setting | Default | Meaning |
 |---|---|---|
 | Background concurrency (`/agents → Settings`) | `10` | How many background agents run at once. |
+| `backgroundKey` (`subagents.json`) | `ctrl+b` | Key that sends running foreground `Agent` calls to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)); `"off"` disables it. |
+| Model override (`/agents → Settings`, `allowModelOverride`) | `false` | Whether a spawn's own `model` / `thinking` (Agent tool, nested tool, workflow `agent()`, scheduled jobs, RPC) may choose the subagent's model and thinking level. Off: subagents run on the parent's current model and level unless their agent file sets one, and the tools do not offer the parameters. |
 | Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call is killed at the limit and the agent sees the timeout; any other tool still running a minute later is stopped and the agent is told to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none; a timeout the main agent asks for is kept. |
 
 ## Notes

@@ -76,6 +76,8 @@ export interface AgentDetails {
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
   spinnerFrame?: number;
+  /** Show the background-key hint on this running foreground call's row — one row per batch. */
+  backgroundHint?: boolean;
   /** Short label for the model the run used, e.g. "haiku 4.5". */
   modelName?: string;
   /** Notable config tags (e.g. ["thinking: high", "isolated"]). */
@@ -357,6 +359,12 @@ export class AgentWidget {
   }
 
   /** Set the UI context (grabbed from first tool execution). */
+  /** Read agents from this manager from now on: one adopted across a session switch (session-handoff.ts). */
+  setManager(manager: AgentManager): void {
+    this.manager = manager;
+    this.update();
+  }
+
   setUICtx(ctx: UICtx) {
     if (ctx !== this.uiCtx) {
       // UICtx changed — the widget registered on the old context is gone.

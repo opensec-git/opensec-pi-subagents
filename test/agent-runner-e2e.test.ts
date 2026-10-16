@@ -23,7 +23,7 @@
  * provider registers in a different `pi-ai` module instance than the one
  * pi-coding-agent streams through, which is brittle and orthogonal to gating.)
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +40,8 @@ import { registerFauxProvider } from "./helpers/pi-ai.js";
 vi.setConfig({ testTimeout: 30_000 });
 
 const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", import.meta.url)));
+const EXPOSURE_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-exposure-ext.mjs", import.meta.url)));
+const LAZY_MCP_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-lazy-mcp-ext.mjs", import.meta.url)));
 /** The fixture registers exactly this tool. */
 const EXT_TOOL = "e2e_probe";
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -68,6 +70,11 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
    * Register `cfg` as agent type "e2e", run it through the REAL runAgent, and
    * return the real session's active tool names captured at construction time.
    */
+  /** Every tool the last session registered, active or not — set by `activeToolsFor`. */
+  let registered: string[] = [];
+  /** The last session `activeToolsFor` built — set alongside `registered`. */
+  let lastSession: any;
+
   async function activeToolsFor(cfg: Partial<AgentConfig>): Promise<string[]> {
     registerAgents(
       new Map([
@@ -108,6 +115,8 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         model,
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
+          registered = s.getAllTools().map((t) => t.name);
+          lastSession = s;
         },
       });
     } catch {
@@ -157,5 +166,140 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     expect(active).toContain(EXT_TOOL); // selected → surfaces despite the flip
     expect(active).toContain("read");
     expect(active).not.toContain("bash"); // builtinToolNames: ["read"] only
+  });
+
+  it("activates only the tools pi would declare — codemode/deferred MCP tools stay off", async () => {
+    // pi's built-in MCP registers server tools as `mcp__<server>__<tool>` with
+    // `codemode` exposure: reachable from codemode scripts, never declared to the
+    // model. Activating every in-scope tool declared them all to the subagent.
+    const active = await activeToolsFor({ extensions: [EXPOSURE_FIXTURE] });
+    expect(active).toContain("exposure_direct");
+    expect(active).not.toContain("mcp__probe__codemode_only");
+    expect(active).not.toContain("mcp__probe__deferred");
+    expect(active).not.toContain("exposure_off_by_default");
+    for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("an ext:foo/bar narrowing activates a defaultActive: false tool, as --tools does", async () => {
+    const canon = extensionCanonicalName(EXPOSURE_FIXTURE);
+    const active = await activeToolsFor({
+      extensions: [EXPOSURE_FIXTURE],
+      extSelectors: [`ext:${canon}/exposure_off_by_default`],
+    });
+    expect(active).toContain("exposure_off_by_default");
+    expect(active).not.toContain("exposure_direct"); // narrowed away
+  });
+
+  // pi's built-in MCP starts each stdio server in `.pi/mcp.json` when a session
+  // starts, so a server whose command touches a marker file shows, on the real
+  // runtime, whether a subagent ran the MCP config.
+  describe.skipIf(process.platform === "win32")("pi built-ins", () => {
+    /** Run `fn` against an empty pi agent dir, so no real global config takes part. */
+    async function withEmptyAgentDir<T>(fn: () => Promise<T>): Promise<T> {
+      const agentDir = mkdtempSync(join(tmpdir(), "subagents-e2e-agent-"));
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        return await fn();
+      } finally {
+        if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prev;
+        rmSync(agentDir, { recursive: true, force: true });
+      }
+    }
+
+    /** Write `dir/.pi/mcp.json` with one stdio server; returns the marker it touches. */
+    function writeMcpConfig(dir: string): string {
+      const marker = join(dir, "mcp-server-started");
+      mkdirSync(join(dir, ".pi"), { recursive: true });
+      writeFileSync(
+        join(dir, ".pi", "mcp.json"),
+        JSON.stringify({ mcpServers: { probe: { command: "/bin/sh", args: ["-c", `touch '${marker}'`] } } }),
+      );
+      return marker;
+    }
+
+    /** Whether the server behind `marker` started; it starts in the background after session_start. */
+    async function started(marker: string): Promise<boolean> {
+      for (let i = 0; i < 30 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+      return existsSync(marker);
+    }
+
+    it("codemode and tool search load in a subagent with extensions: true", async () => {
+      await withEmptyAgentDir(() => activeToolsFor({ extensions: true }));
+      expect(registered).toContain("codemode");
+      expect(registered).toContain("tool_search");
+    });
+
+    it("pi's MCP stays off by default: no subagent starts the mcp.json servers", async () => {
+      const marker = writeMcpConfig(cwd);
+      await withEmptyAgentDir(() => activeToolsFor({ extensions: true }));
+      expect(await started(marker)).toBe(false);
+    });
+
+    it("an agent that names builtin:mcp starts the mcp.json servers", async () => {
+      // Positive control: proves the marker shows a started server, so the
+      // negative tests here can't pass just because nothing ever starts.
+      const marker = writeMcpConfig(cwd);
+      await withEmptyAgentDir(() => activeToolsFor({ extensions: ["*", "builtin:mcp"] }));
+      expect(await started(marker)).toBe(true);
+    });
+
+    it("starting pi with --no-mcp keeps MCP out even when the agent names it", async () => {
+      const marker = writeMcpConfig(cwd);
+      process.argv.push("--no-mcp");
+      try {
+        await withEmptyAgentDir(() => activeToolsFor({ extensions: ["*", "builtin:mcp"] }));
+      } finally {
+        process.argv.pop();
+      }
+      expect(await started(marker)).toBe(false);
+    });
+
+    it("starting pi with -ne keeps every built-in out of the subagent", async () => {
+      const marker = writeMcpConfig(cwd);
+      process.argv.push("-ne");
+      try {
+        await withEmptyAgentDir(() => activeToolsFor({ extensions: ["*", "builtin:mcp"] }));
+      } finally {
+        process.argv.pop();
+      }
+      expect(registered).not.toContain("codemode");
+      expect(registered).not.toContain("tool_search");
+      expect(await started(marker)).toBe(false);
+    });
+
+    it("extensions: [builtin:tool-search] loads only that built-in", async () => {
+      await withEmptyAgentDir(() => activeToolsFor({ extensions: ["builtin:tool-search"] }));
+      expect(registered).toContain("tool_search");
+      expect(registered).not.toContain("codemode");
+    });
+
+    it("ext:builtin:codemode beside a narrowed MCP tool keeps codemode active, as pi's --tools does", async () => {
+      // pi's MCP activates codemode at session_start, before its server tools
+      // register. Naming the bridge, as in `pi --tools read,codemode,'mcp__*'`,
+      // keeps it in scope from the start, so the scope never takes it back.
+      const canon = extensionCanonicalName(LAZY_MCP_FIXTURE);
+      const active = await withEmptyAgentDir(() =>
+        activeToolsFor({
+          extensions: ["*", LAZY_MCP_FIXTURE],
+          extSelectors: [`ext:${canon}/mcp__lazy__lookup`, "ext:builtin:codemode"],
+        }),
+      );
+      expect(active).toContain("codemode");
+      expect(registered).not.toContain("mcp__lazy__lookup"); // the server has not connected yet
+      (globalThis as { __lazyMcpConnect?: () => void }).__lazyMcpConnect?.();
+      expect(lastSession.getAllTools().map((t: { name: string }) => t.name)).toContain("mcp__lazy__lookup");
+      expect(lastSession.getActiveToolNames()).toContain("codemode");
+      expect(lastSession.getActiveToolNames()).not.toContain("tool_search");
+    });
+
+    it("an ext: allowlist that names no bridge keeps codemode out, as pi's --tools does", async () => {
+      const canon = extensionCanonicalName(LAZY_MCP_FIXTURE);
+      const active = await withEmptyAgentDir(() =>
+        activeToolsFor({ extensions: ["*", LAZY_MCP_FIXTURE], extSelectors: [`ext:${canon}/mcp__lazy__lookup`] }),
+      );
+      expect(active).not.toContain("codemode");
+    });
   });
 });

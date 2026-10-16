@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -121,6 +122,9 @@ afterEach(() => {
 });
 
 describe("Agent tool result — effective model", () => {
+  // Per-call model/thinking overrides are off by default (allowModelOverride).
+  beforeEach(() => { setModelOverrideAllowed(true); });
+  afterEach(() => { setModelOverrideAllowed(false); });
   it("names the model even when the child inherited the parent's", async () => {
     // The old rule was "show it only when it differs from the parent", which
     // left `thinking: high` attached to nothing on the common path.

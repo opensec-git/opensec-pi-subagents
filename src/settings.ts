@@ -97,6 +97,19 @@ export interface SubagentsSettings {
    */
   scopeModels?: boolean;
   /**
+   * Whether a spawn may choose its own model and thinking level: the Agent
+   * tool's `model` / `thinking` parameters, the nested tool's, workflow
+   * `agent({ model, effort })`, scheduled jobs and cross-extension RPC spawns.
+   * Defaults to `false`: every subagent runs on the parent's current model at
+   * the parent's current thinking level, unless its agent file sets `model:` or
+   * `thinking:`, and the parameters are not offered in the tool schemas, so the
+   * main model does not pick cheaper models or lower effort on its own. A
+   * resumed agent keeps the model and level it ran with either way. `true`
+   * restores the per-call overrides and the schema parameters (the schemas
+   * change at the next pi session).
+   */
+  allowModelOverride?: boolean;
+  /**
    * When true, an unreadable or unparseable agent `.md` aborts extension load
    * instead of being skipped with a warning — pi exits, naming the file.
    *
@@ -322,6 +335,17 @@ export interface SubagentsSettings {
    * `ViewerMarkdownMode` for the specific rewrites — so `all` is opt-in.
    */
   viewerMarkdown?: ViewerMarkdownMode;
+  /**
+   * The key that sends every running foreground `Agent` call to the background,
+   * as Claude Code's ctrl+b does. A pi key id (`ctrl+b`, `alt+b`, `ctrl+shift+b`,
+   * …); `"off"` disables it. Defaults to `ctrl+b`.
+   *
+   * Claimed only while a foreground call runs and the prompt editor has focus,
+   * so the rest of the time the key keeps its editor meaning (ctrl+b is pi's
+   * cursor-left). Pi's keybindings file only knows pi's own actions, so the
+   * extension's key lives here.
+   */
+  backgroundKey?: string;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -337,6 +361,7 @@ export interface SettingsAppliers {
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
+  setAllowModelOverride: (b: boolean) => void;
   setStrictAgentFiles: (b: boolean) => void;
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
@@ -353,6 +378,7 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
+  setBackgroundKey: (key: string) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -434,6 +460,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.scopeModels === "boolean") {
     out.scopeModels = r.scopeModels;
   }
+  if (typeof r.allowModelOverride === "boolean") {
+    out.allowModelOverride = r.allowModelOverride;
+  }
   if (typeof r.strictAgentFiles === "boolean") {
     out.strictAgentFiles = r.strictAgentFiles;
   }
@@ -479,6 +508,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
     out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
+  }
+  if (typeof r.backgroundKey === "string" && r.backgroundKey.trim()) {
+    out.backgroundKey = r.backgroundKey.trim().toLowerCase();
   }
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
@@ -570,6 +602,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);
+  if (typeof s.allowModelOverride === "boolean") appliers.setAllowModelOverride(s.allowModelOverride);
   if (typeof s.strictAgentFiles === "boolean") appliers.setStrictAgentFiles(s.strictAgentFiles);
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
@@ -583,6 +616,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
+  if (s.backgroundKey) appliers.setBackgroundKey(s.backgroundKey);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }
 

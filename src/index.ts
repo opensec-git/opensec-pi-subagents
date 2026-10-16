@@ -13,21 +13,22 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Container, isKeyRelease, Key, type KeyId, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
+import { AgentManager, type CompactionInfo, isTopLevelAgent, type ManagerObservers, managerServices, RECORD_ENTRY_TYPE, RESUME_ENTRY_TYPE, resumeStateOf, resumeStatesFromEntries } from "./agent-manager.js";
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { useTreeKillingExec } from "./exec-tree.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
@@ -37,6 +38,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
+import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
@@ -59,6 +61,7 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { RefreshTicker } from "./ui/refresh-ticker.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
@@ -76,7 +79,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { readWorkflowScriptFile } from "./workflow/script-file.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, pruneSettledWorkflowTasks, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
-import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
+import { workflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, MERGED_BRANCH_MAX_AGE_DAYS, pruneMergedAgentBranches, recoverLeftoverWorktrees, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
@@ -98,6 +101,12 @@ export function renderRunningAgentStatus(
   container.addChild(new Text(theme.fg("dim", `  ⎿  ${activity}`), 0, 0));
   return container;
 }
+
+/** How long a foreground `Agent` call runs before its row offers the background key. */
+const BACKGROUND_HINT_DELAY_MS = 2000;
+
+/** The `backgroundKey` default: Claude Code's ctrl+b (`task:background`). */
+const DEFAULT_BACKGROUND_KEY = "ctrl+b";
 
 /** Format an agent's lifetime token total, or "" when zero. */
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
@@ -250,6 +259,111 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
         : record.result
       : "No output.",
   };
+}
+
+/** Session entry marking `pending` results (see {@link recordEntryData}) as delivered. */
+const DELIVERED_ENTRY_TYPE = "subagents:delivered";
+
+/**
+ * A top-level agent's `subagents:record` entry. `pending`: its session has not
+ * been notified yet — it finished while another session was open — and
+ * delivers the notification when it starts; the extra figures let it render
+ * one from the entry alone.
+ */
+function recordEntryData(record: AgentRecord, pending = false): Record<string, unknown> {
+  return {
+    id: record.id, type: record.type, description: record.description,
+    status: record.status, result: record.result, error: record.error,
+    startedAt: record.startedAt, completedAt: record.completedAt,
+    resume: resumeStateOf(record),
+    ...(pending
+      ? { pending: true, toolUses: record.toolUses, lifetimeUsage: { ...record.lifetimeUsage }, outputFile: record.outputFile, toolCallId: record.toolCallId }
+      : {}),
+  };
+}
+
+/** An owned child's `subagents:resume` entry, or undefined without a session file to reopen. */
+function resumeEntryData(record: AgentRecord): { resume: ReturnType<typeof resumeStateOf> } | undefined {
+  const resume = resumeStateOf(record);
+  return resume ? { resume } : undefined;
+}
+
+/**
+ * The `pending` results among a session's entries that no later
+ * `subagents:delivered` entry covers, in order, as record-shaped objects a
+ * notification can be rendered from.
+ */
+export function pendingResultsFromEntries(entries: readonly unknown[]): AgentRecord[] {
+  const pending = new Map<string, AgentRecord>();
+  for (const entry of entries) {
+    const e = entry as { type?: unknown; customType?: unknown; data?: Record<string, unknown> } | null;
+    if (e?.type !== "custom" || !e.data) continue;
+    if (e.customType === RECORD_ENTRY_TYPE && e.data.pending === true && typeof e.data.id === "string") {
+      const d = e.data;
+      pending.set(d.id as string, {
+        id: d.id as string,
+        type: String(d.type ?? ""),
+        description: String(d.description ?? ""),
+        status: (d.status as AgentRecord["status"]) ?? "completed",
+        result: typeof d.result === "string" ? d.result : undefined,
+        error: typeof d.error === "string" ? d.error : undefined,
+        startedAt: typeof d.startedAt === "number" ? d.startedAt : 0,
+        completedAt: typeof d.completedAt === "number" ? d.completedAt : undefined,
+        toolUses: typeof d.toolUses === "number" ? d.toolUses : 0,
+        lifetimeUsage: (d.lifetimeUsage as LifetimeUsage | undefined) ?? { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        compactionCount: 0,
+        outputFile: typeof d.outputFile === "string" ? d.outputFile : undefined,
+        toolCallId: typeof d.toolCallId === "string" ? d.toolCallId : undefined,
+      });
+    } else if (e.customType === DELIVERED_ENTRY_TYPE && Array.isArray(e.data.ids)) {
+      for (const id of e.data.ids) if (typeof id === "string") pending.delete(id);
+    }
+  }
+  return [...pending.values()];
+}
+
+/**
+ * Stop a parked manager's agents with this (the parking instance's) code and
+ * record each in its own session, as a quit would. For an adopter of another
+ * version, or a parked manager something else replaced. Touches no instance
+ * state: the instance that parked it is gone.
+ */
+async function stopParkedAgents(manager: AgentManager, entry: ParkedSubagents, write?: EntryWriter): Promise<void> {
+  manager.setObservers({});
+  const put = (record: AgentRecord, pending: boolean): void => {
+    const [type, data] = isTopLevelAgent(record)
+      ? [RECORD_ENTRY_TYPE, recordEntryData(record, pending)]
+      : [RESUME_ENTRY_TYPE, resumeEntryData(record)];
+    if (!data) return;
+    if (!write?.(record.ownerSession, type, data)) appendToSessionFile(record.ownerSession, type, data);
+  };
+  for (const record of entry.completed.splice(0) as AgentRecord[]) put(record, isTopLevelAgent(record) && !record.resultConsumed);
+  const interrupted = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
+  manager.abortAll();
+  await manager.awaitWorktreeCleanup(15_000);
+  for (const record of interrupted) put(record, false);
+  await manager.dispose();
+}
+
+/**
+ * The process is exiting with a manager still parked (no instance took it
+ * over): record what can be recorded, synchronously — results that settled
+ * while parked, and the running agents as stopped. Worktrees cannot be
+ * committed this late; a later start recovers them (`recoverLeftoverWorktrees`).
+ */
+function recordParkedAgentsAtExit(manager: AgentManager, entry: ParkedSubagents): void {
+  manager.setObservers({});
+  const put = (record: AgentRecord, pending: boolean): void => {
+    const data = isTopLevelAgent(record) ? recordEntryData(record, pending) : resumeEntryData(record);
+    if (data) appendToSessionFile(record.ownerSession, isTopLevelAgent(record) ? RECORD_ENTRY_TYPE : RESUME_ENTRY_TYPE, data);
+  };
+  for (const record of entry.completed.splice(0) as AgentRecord[]) put(record, isTopLevelAgent(record) && !record.resultConsumed);
+  for (const record of manager.listAllAgents()) {
+    if (record.status !== "running" && record.status !== "queued") continue;
+    record.status = "stopped";
+    record.completedAt ??= Date.now();
+    put(record, false);
+  }
 }
 
 /**
@@ -489,6 +603,14 @@ export default function (pi: ExtensionAPI) {
   let viewerMarkdown: ViewerMarkdownMode = "assistant";
   function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
   function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
+  /** The `backgroundKey` setting as written; undefined means the default. Persisted as written. */
+  let backgroundKeySetting: string | undefined;
+  function setBackgroundKey(key: string): void { backgroundKeySetting = key; }
+  /** The key that hands foreground `Agent` calls to the background, or undefined when it is off. */
+  function getBackgroundKey(): string | undefined {
+    const key = backgroundKeySetting ?? DEFAULT_BACKGROUND_KEY;
+    return key === "off" ? undefined : key;
+  }
   /**
    * The viewer's `m` key, from either entry point: set the mode and persist it,
    * so the key and `/agents → Settings` stay one setting rather than one per
@@ -539,83 +661,84 @@ export default function (pi: ExtensionAPI) {
     } catch { /* stale ctx */ }
   }
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
-  const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  // ---- Completion delivery ----
+  // Every completion notification goes through the outbox, which sends what is
+  // pending as one message at the parent's next boundary (see
+  // completion-outbox.ts). Each is built when the agent finishes, and reading
+  // the result (get_subagent_result, rpc consume) cancels it before it is sent.
+  const outbox = new CompletionOutbox(
+    (message) => {
+      // A torn-down session cannot take a message (`pi` is stale).
+      if (disposed) return;
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: message.content,
+        display: true,
+        details: message.details,
+      }, { deliverAs: "steer", triggerTurn: true });
+    },
+    () => parentTurnActive(),
+  );
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
+  /** Whether the parent has a run in flight, so a `turn_end` is coming. A stale ctx has none. */
+  function parentTurnActive(): boolean {
+    try {
+      return currentCtx?.signal !== undefined;
+    } catch {
+      return false;
     }
   }
-
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500, showCost);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
-      customType: "subagent-notification",
-      content: notification + footer,
-      display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
-  }
+  // A queued result wait must observe completion before its held notification
+  // can fire, so successful waits can still suppress that redundant nudge.
+  const QUEUE_WAIT_POLL_MS = Math.floor(NOTIFICATION_HOLD_MS / 4);
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    // Built now, so a resume before the send cannot rewrite it. A record that
+    // cannot be formatted is skipped, as a failed send always was.
+    try {
+      const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+      const message = {
+        content: formatTaskNotification(record, 500, showCost) + footer,
+        details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      };
+      outbox.add({ ids: [record.id], build: () => message });
+    } catch { /* ignore stale completion side-effect errors */ }
     widget.update();
   }
 
-  // ---- Group join manager ----
+  // ---- Group join manager (`group` join mode only) ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
-
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+      const members = records.filter(r => !r.resultConsumed).flatMap(r => {
+        try {
+          return [{ id: r.id, text: formatTaskNotification(r, 300, showCost), details: buildNotificationDetails(r, 300, agentActivity.get(r.id)) }];
+        } catch { return []; /* as in sendIndividualNudge */ }
       });
+      if (members.length > 0) {
+        outbox.add({
+          ids: members.map(m => m.id),
+          build: (ids) => {
+            const unread = members.filter(m => ids.includes(m.id));
+            const notifications = unread.map(m => m.text).join('\n\n');
+            const label = partial
+              ? `${unread.length} agent(s) finished (partial — others still running)`
+              : `${unread.length} agent(s) finished`;
+
+            const [first, ...rest] = unread;
+            const details = first.details;
+            if (rest.length > 0) details.others = rest.map(m => m.details);
+            return {
+              content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+              details,
+            };
+          },
+        });
+      }
       widget.update();
     },
     30_000,
@@ -659,36 +782,88 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Background completion: route through group join or send individual nudge
   /**
-   * Write a top-level agent's final record into the parent session. `resume`
-   * carries what reopening it needs (session file, handle, model, directory,
-   * worktree, isolation, turn limit); `session_start` reads it back, so the
-   * agent stays resumable after a restart, `/resume`, `/fork` or `/reload`.
-   * Guarded: it also runs while the session is shutting down.
+   * The session this activation belongs to: its session file, or undefined for
+   * one kept in memory. Agents spawned here carry it as `ownerSession`; a
+   * background agent that outlives a session switch (session-handoff.ts)
+   * reports to its owner, not to whichever session is open.
    */
-  function appendRecordEntry(record: AgentRecord): void {
-    try {
-      pi.appendEntry("subagents:record", {
-        id: record.id, type: record.type, description: record.description,
-        status: record.status, result: record.result, error: record.error,
-        startedAt: record.startedAt, completedAt: record.completedAt,
-        resume: resumeStateOf(record),
-      });
-    } catch { /* a session already torn down cannot record anything */ }
+  let currentSession: string | undefined;
+  const ownedHere = (record: Pick<AgentRecord, "ownerSession">): boolean => record.ownerSession === currentSession;
+
+  /**
+   * Write a custom entry into the session `owner`: through `pi` while that is
+   * the session this instance has open (Pi keeps it in memory), otherwise by
+   * appending to the owner's file, which Pi reads when it is opened again.
+   * Guarded: it also runs while the session is shutting down, and after.
+   */
+  function writeEntry(owner: string | undefined, customType: string, data: unknown): boolean {
+    if (owner === currentSession) {
+      try {
+        pi.appendEntry(customType, data);
+        return true;
+      } catch { /* torn down: the session is no longer open, so its file is safe to append to */ }
+    }
+    return appendToSessionFile(owner, customType, data);
   }
 
-  const manager = new AgentManager((record) => {
+  // Background completion: route through group join or send individual nudge
+  /**
+   * Write a top-level agent's final record into the session it belongs to.
+   * `resume` carries what reopening it needs (session file, handle, model,
+   * directory, worktree, isolation, turn limit); `session_start` reads it back,
+   * so the agent stays resumable after a restart, `/resume`, `/fork` or
+   * `/reload`. `pending` marks a result its session has not been told about
+   * yet (it finished while another session was open); that session delivers it
+   * when it starts.
+   */
+  function appendRecordEntry(record: AgentRecord, pending = false): void {
+    writeEntry(record.ownerSession, RECORD_ENTRY_TYPE, recordEntryData(record, pending));
+  }
+
+  /**
+   * Write an owned child's resume state (a nested agent's, a workflow's) into
+   * the session it belongs to, so `session_start` can rebuild it after a
+   * restart, `/resume`, `/fork` or `/reload`: its owner can then reopen it from
+   * its session file — the parent agent's nested tools, or a workflow's
+   * `agent({ resume })`. Only the resume state, never the result: the owner
+   * already has that, and the entry stays small. Nothing for an agent without
+   * a session file.
+   */
+  function appendResumeEntry(record: AgentRecord): void {
+    const data = resumeEntryData(record);
+    if (data) writeEntry(record.ownerSession, RESUME_ENTRY_TYPE, data);
+  }
+
+  /**
+   * A top-level agent of another session finished while this one is open: its
+   * result belongs to that session. Record it there, marked for delivery; no
+   * notification, event or row here.
+   */
+  function completeForeignAgent(record: AgentRecord): void {
+    agentActivity.delete(record.id);
+    appendRecordEntry(record, !record.resultConsumed);
+  }
+
+  function onAgentComplete(record: AgentRecord): void {
     // After shutdown `pi` is stale, and the shutdown handler records the
     // agents it interrupted itself.
     if (disposed) return;
-    // Spend that landed after the parent's last subagent tool result.
-    flushPendingUsageIfIdle();
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
-    // notification, and UI channels.
-    if (!isTopLevelAgent(record)) return;
+    // notification, and UI channels. Their resume state is still recorded.
+    if (!isTopLevelAgent(record)) {
+      flushPendingUsageIfIdle();
+      appendResumeEntry(record);
+      return;
+    }
+    if (!ownedHere(record)) {
+      completeForeignAgent(record);
+      return;
+    }
+    // Spend that landed after the parent's last subagent tool result.
+    flushPendingUsageIfIdle();
 
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
@@ -712,9 +887,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    // A `group` spawn whose turn has not ended yet: its group is registered at
+    // that turn's end, which picks this completion up retroactively.
+    if (turnGroupSpawns.includes(record.id)) {
       widget.update();
       return;
     }
@@ -726,8 +901,10 @@ export default function (pi: ExtensionAPI) {
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
-  }, undefined, (record) => {
-    if (disposed || !isTopLevelAgent(record)) return;
+  }
+
+  function onAgentStart(record: AgentRecord): void {
+    if (disposed || !isTopLevelAgent(record) || !ownedHere(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
@@ -742,8 +919,10 @@ export default function (pi: ExtensionAPI) {
       type: record.type,
       description: record.description,
     });
-  }, (record, info) => {
-    if (disposed || !isTopLevelAgent(record)) return;
+  }
+
+  function onAgentCompact(record: AgentRecord, info: CompactionInfo): void {
+    if (disposed || !isTopLevelAgent(record) || !ownedHere(record)) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -753,13 +932,30 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }
+
+  function onAgentUsage(record: AgentRecord, usage: LifetimeUsage): void {
     // Every assistant message from every agent — nested included, exactly once.
     // Parked here until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
-    // pool grows in a session that will never drain it.
-    if (reportUsage) pendingUsage.add(usage);
-  });
+    // pool grows in a session that will never drain it. Another session's
+    // agents bill that session, not this one.
+    if (reportUsage && ownedHere(record)) pendingUsage.add(usage);
+  }
+
+  const managerObservers: ManagerObservers = {
+    onComplete: onAgentComplete,
+    onStart: onAgentStart,
+    onCompact: onAgentCompact,
+    onUsage: onAgentUsage,
+  };
+
+  /**
+   * Replaced at `session_start` by a manager the previous session parked, so
+   * its background agents keep running (see session-handoff.ts). Everything
+   * reads it through this binding, never a copy.
+   */
+  let manager = new AgentManager(onAgentComplete, undefined, onAgentStart, onAgentCompact, onAgentUsage);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -831,6 +1027,14 @@ export default function (pi: ExtensionAPI) {
     delete safeOptions.reclaim;
     // Internal to a reopen, like `reclaim`: it seeds an agent's lifetime figures.
     delete safeOptions.carry;
+    // A caller's model and thinking level are per-call overrides, which
+    // `allowModelOverride` (off by default) refuses on every spawn path: the
+    // agent then runs on the parent's current model and level, or its agent
+    // file's.
+    if (!isModelOverrideAllowed()) {
+      delete safeOptions.model;
+      delete safeOptions.thinkingLevel;
+    }
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
@@ -847,7 +1051,8 @@ export default function (pi: ExtensionAPI) {
    */
   const resolveAgentRef = (ref: string): AgentRecord | undefined => {
     const byId = manager.getRecord(ref);
-    if (byId) return byId;
+    // Another session's agent is not this session's to read or steer.
+    if (byId) return manager.isVisible(byId) ? byId : undefined;
     const resolved = manager.resolveMention(ref);
     return resolved?.kind === "live" ? resolved.record : undefined;
   };
@@ -858,7 +1063,7 @@ export default function (pi: ExtensionAPI) {
     spawn: spawnTopLevel,
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
-      return record !== undefined && isTopLevelAgent(record) ? record : undefined;
+      return record !== undefined && isTopLevelAgent(record) && manager.isVisible(record) ? record : undefined;
     },
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
@@ -906,17 +1111,26 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     disposed = false;
     currentCtx = ctx;
+    currentSession = sessionFileOf(ctx);
+    // First: everything below works on `manager`, which this may replace.
+    adoptParkedAgents();
+    manager.setVisibleOwner(currentSession);
     syncProjectTrust(ctx);
     void tidyAgentWorktrees(ctx);
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
+      watchHandoffKey(ctx.ui);
     }
     manager.clearCompleted(true);
     // Agents of this session from before a restart, `/resume`, `/fork` or
     // `/reload`: resumable again, by the model and by `@handle`. The branch,
     // not every entry: a fork keeps only the agents on its own path.
-    manager.restoreTombstones(resumeStatesFromEntries(ctx.sessionManager?.getBranch?.() ?? []));
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    manager.restoreTombstones(resumeStatesFromEntries(branch));
+    // Results of this session's agents that finished while another session
+    // was open, recorded here for delivery now.
+    deliverPendingResults(branch);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -927,7 +1141,10 @@ export default function (pi: ExtensionAPI) {
         manager: {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
-          getRecord: (id) => manager.getRecord(id),
+          getRecord: (id) => {
+            const record = manager.getRecord(id);
+            return record && manager.isVisible(record) ? record : undefined;
+          },
           // Unguarded on purpose: the stop handler now runs the top-level check
           // itself off `getRecord`, and reports the refusal instead of the
           // "Agent not found" a false from here used to be read as.
@@ -942,7 +1159,7 @@ export default function (pi: ExtensionAPI) {
             // has not landed yet.
             if (manager.isRunActive(record.id)) return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
+            outbox.cancel(record.id);
             return true;
           },
         },
@@ -1223,9 +1440,123 @@ export default function (pi: ExtensionAPI) {
     // the current schedules and agent records intact until then.
   });
 
-  // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
-  pi.on("session_shutdown", async () => {
+  /**
+   * Take over the manager the previous session parked at its switch, if it was
+   * parked for this session by this same version: its background agents keep
+   * running and show here when they are this session's. Another version cannot
+   * share the manager's code, so it stops its agents itself, as a quit would.
+   * See session-handoff.ts.
+   */
+  function adoptParkedAgents(): void {
+    const parked = takeParkedSubagents(currentSession);
+    if (!parked) return;
+    if (!isCompatible(parked)) {
+      void parked.stop(writeEntry).catch(() => { /* best effort */ });
+      return;
+    }
+    const adopted = parked.manager as AgentManager;
+    const fresh = manager;
+    // New work runs with this instance's modules (agent registry, settings).
+    adopted.useServices(managerServices());
+    adopted.setObservers(managerObservers);
+    adopted.setMaxConcurrent(fresh.getMaxConcurrent());
+    adopted.setMaxConcurrentForeground(fresh.getMaxConcurrentForeground());
+    manager = adopted;
+    widget.setManager(adopted);
+    fleet.setManager(adopted);
+    for (const [id, state] of parked.activity) {
+      if (!agentActivity.has(id)) agentActivity.set(id, state as AgentActivity);
+    }
+    void fresh.dispose();
+    // Runs that settled between the two instances, handled as if just now —
+    // once this start has finished setting up.
+    const settled = parked.completed as AgentRecord[];
+    if (settled.length > 0) setTimeout(() => { for (const record of settled) onAgentComplete(record); }, 0);
+  }
+
+  /**
+   * At a session switch: leave the background agents running in a manager
+   * parked for the next instance (session-handoff.ts). Nothing parked here
+   * may touch this instance's `pi` or ctx, which Pi invalidates next: until
+   * adopted, completions are queued in the entry.
+   */
+  function parkAgents(reason: string, targetSessionFile: string | undefined): void {
+    const parkedManager = manager;
+    const entry: ParkedSubagents = {
+      protocol: HANDOFF_PROTOCOL,
+      version: PACKAGE_VERSION,
+      reason,
+      sessionFile: currentSession,
+      targetSessionFile,
+      manager: parkedManager,
+      activity: new Map(agentActivity),
+      completed: [],
+      stop: (write) => stopParkedAgents(parkedManager, entry, write),
+    };
+    parkedManager.setObservers({ onComplete: (record) => { entry.completed.push(record); } });
+    parkedManager.detachPendingContexts();
+    parkedManager.setVisibleOwner(null);
+    parkSubagents(entry, () => recordParkedAgentsAtExit(parkedManager, entry));
+  }
+
+  /**
+   * Notify this session of its agents that finished while another session was
+   * open (`pending` record entries), once, after this start: a turn follows,
+   * as for any background completion. Marked delivered at once, so a second
+   * start does not repeat it.
+   */
+  function deliverPendingResults(branch: readonly unknown[]): void {
+    const pending = pendingResultsFromEntries(branch);
+    if (pending.length === 0) return;
+    const ids = pending.map(r => r.id);
+    try {
+      pi.appendEntry(DELIVERED_ENTRY_TYPE, { ids });
+    } catch {
+      return;
+    }
+    // The record still in memory carries more (context, compactions) than its entry.
+    const records = pending.map(entry => {
+      const live = manager.getRecord(entry.id);
+      return live && manager.isVisible(live) ? live : entry;
+    });
+    // Through the completion outbox, like every other completion: delivered at
+    // this session's next boundary (a turn when idle), coalesced with anything
+    // else that finished, and cancelled per agent by get_subagent_result.
+    // An entry is all there is of an evicted agent, and get_subagent_result
+    // cannot fetch more, so its whole result goes in.
+    const maxLen = (r: AgentRecord) => (manager.getRecord(r.id) === r ? 500 : 20_000);
+    for (const r of records) {
+      agentActivity.delete(r.id);
+      widget.markFinished(r.id);
+      fleet.onAgentFinished(r.id);
+    }
+    const parts = records.flatMap(r => {
+      try {
+        return [{ id: r.id, text: formatTaskNotification(r, maxLen(r), showCost), details: buildNotificationDetails(r, 300) }];
+      } catch { return []; /* as in sendIndividualNudge */ }
+    });
+    if (parts.length > 0) {
+      outbox.add({
+        ids: parts.map(p => p.id),
+        build: (unreadIds) => {
+          const unread = parts.filter(p => unreadIds.includes(p.id));
+          const [first, ...rest] = unread;
+          const details = { ...first.details };
+          if (rest.length > 0) details.others = rest.map(p => p.details);
+          const label = unread.length === 1 ? "An agent" : `${unread.length} agents`;
+          return {
+            content: `${label} of this session finished while another session was open.\n\n${unread.map(p => p.text).join("\n\n")}`,
+            details,
+          };
+        },
+      });
+    }
+    widget.update();
+  }
+
+  // On shutdown: on a session switch, background agents keep running (parked
+  // for the next instance); on quit, every agent is stopped and recorded.
+  pi.on("session_shutdown", async (event) => {
     // Spend no tool result carried back yet: record it while the session can.
     flushPendingUsage();
     disposed = true;
@@ -1249,28 +1580,76 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
-    // Pi tears this extension instance down with the session, so agents still
-    // running cannot be kept alive across the switch. Stop them, and record
-    // each as stopped and resumable in the session it belongs to.
-    const interrupted = manager.listAgents().filter(r => isTopLevelAgent(r) && (r.status === "running" || r.status === "queued"));
-    manager.abortAll();
+
+    const live = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
+    // Pi says why (Pi >= 1.0): `new`, `resume`, `fork` and `reload` replace the
+    // session within this process; `quit` (also /quit and SIGTERM/SIGHUP) or no
+    // reason ends it. On a switch, a background agent whose session is on disk
+    // keeps running — its results can still be recorded there — along with
+    // the agents it owns. Foreground agents (Pi aborted their tool call before
+    // this), workflows and agents of a session kept in memory stop as before.
+    const { reason, targetSessionFile } = (event ?? {}) as { reason?: unknown; targetSessionFile?: string };
+    // The next instance finds the parked manager by the session it starts, so
+    // a switch must name it (Pi 1.0 does; `/reload` keeps this one).
+    const switching = isSessionSwitch(reason)
+      && (reason === "reload" ? currentSession !== undefined : typeof targetSessionFile === "string");
+    const kept = new Set(switching
+      ? live.filter(r => isTopLevelAgent(r) && r.isBackground !== false && isSessionOnDisk(r.ownerSession)).map(r => r.id)
+      : []);
+    const rootOf = (record: AgentRecord): string => {
+      let current = record;
+      for (let parent = current.parentAgentId; parent !== undefined; parent = current.parentAgentId) {
+        const next = manager.getRecord(parent);
+        if (!next) break;
+        current = next;
+      }
+      return current.id;
+    };
+    const interrupted = live.filter(r => !kept.has(rootOf(r)));
+    // Also worth keeping: another session's agents that finished while this
+    // one was open, so their session shows them in full when it is reopened.
+    const carried = switching && manager.listAllAgents().some(r =>
+      isTopLevelAgent(r) && !ownedHere(r) && !r.resultConsumed && !manager.isRunActive(r.id) && isSessionOnDisk(r.ownerSession));
+    const parking = kept.size > 0 || carried;
+    if (kept.size > 0) {
+      for (const record of interrupted) manager.abort(record.id);
+    } else {
+      manager.abortAll();
+    }
     // A stopped worktree agent still commits its changes to a branch while it
-    // settles; dispose() does not wait for that, and the process exits next.
-    await manager.awaitWorktreeCleanup(15_000);
-    for (const record of interrupted) appendRecordEntry(record);
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    // settles; dispose() does not wait for that, and the process may exit next.
+    await manager.awaitWorktreeCleanup(15_000, kept.size > 0 ? new Set(interrupted.map(r => r.id)) : undefined);
+    // Each recorded as stopped and resumable, in the session it belongs to.
+    for (const record of interrupted) {
+      if (isTopLevelAgent(record)) appendRecordEntry(record);
+      else appendResumeEntry(record);
+    }
+    if (parking) parkAgents(reason as string, targetSessionFile);
+
+    // Completions still waiting for this session's next boundary (a busy or
+    // interrupted parent): marked pending in the session they belong to, so
+    // its next start (a switch back, a restart) delivers them like any result
+    // that landed while another session was open.
+    for (const id of outbox.pendingIds()) {
+      const record = manager.getRecord(id);
+      if (record && isTopLevelAgent(record) && !record.resultConsumed && !manager.isRunActive(id)) appendRecordEntry(record, true);
+    }
     // Neither may fire into a torn-down instance (or hold `pi -p` open).
+    outbox.dispose();
     groupJoin.dispose();
-    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-    batchFinalizeTimer = undefined;
-    currentBatchAgents = [];
+    turnGroupSpawns = [];
     fleet.dispose();
+    unsubHandoffKey?.();
+    unsubHandoffKey = undefined;
+    handoffKeyUi = undefined;
+    foregroundHandoffs.clear();
     // Its 80 ms refresh interval otherwise outlives the session across /reload.
     // The interval is cleared first; the UI calls after it may meet a context
     // that is already gone.
     try { widget.dispose(); } catch { /* stale UI context at shutdown */ }
     refreshTicker.clear();
+    // A parked manager lives on, with its agents' sessions.
+    if (parking) return;
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
@@ -1291,11 +1670,101 @@ export default function (pi: ExtensionAPI) {
   const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled, refreshTicker);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
+  /**
+   * Foreground `Agent` calls whose run can be handed to the background, by
+   * agent id. Each entry wakes its blocked tool call, which then returns as a
+   * background spawn would. Only the Agent tool registers here, so a spawn with
+   * no tool call to return — the agent generator, a workflow's agents, nested
+   * children — never offers the handoff.
+   */
+  const foregroundHandoffs = new Map<string, () => void>();
+
+  /** Hand these runs to the background and wake their tool calls; returns how many took. */
+  function sendForegroundToBackground(ids: Iterable<string>): number {
+    let sent = 0;
+    for (const id of [...ids]) {
+      const wake = foregroundHandoffs.get(id);
+      if (!wake || !manager.sendToBackground(id)) continue;
+      foregroundHandoffs.delete(id);
+      wake();
+      sent++;
+      // It is a background agent from here on, so announce it as one — as a
+      // detached resume re-announces an existing id.
+      const record = manager.getRecord(id);
+      if (record) {
+        pi.events.emit("subagents:created", {
+          id,
+          type: record.type,
+          description: record.description,
+          isBackground: true,
+        });
+      }
+    }
+    if (sent > 0) {
+      widget.ensureTimer();
+      widget.update();
+      fleet.ensureTimer();
+      fleet.update();
+    }
+    return sent;
+  }
+
+  /** The conversation viewer's `b`: hand just this run to the background. */
+  function backgroundActionFor(record: AgentRecord, notify: (message: string) => void): ViewerBackgroundAction {
+    return {
+      // Registered while the run is live, removed the moment its call returns.
+      available: () => foregroundHandoffs.has(record.id),
+      send: () => {
+        if (sendForegroundToBackground([record.id]) > 0) notify(`Sent "${record.description}" to the background.`);
+      },
+    };
+  }
+
+  // Claude Code's ctrl+b (`task:background`), configurable as `backgroundKey`:
+  // hand every running foreground `Agent` call to the background. Claimed only
+  // while one is pending and the prompt editor has focus, so the rest of the
+  // time the key keeps its editor meaning (ctrl+b is pi's cursor-left).
+  let handoffKeyUi: ExtensionContext["ui"] | undefined;
+  let unsubHandoffKey: (() => void) | undefined;
+  function watchHandoffKey(ui: ExtensionContext["ui"]): void {
+    if (ui === handoffKeyUi) return;
+    unsubHandoffKey?.();
+    handoffKeyUi = ui;
+    unsubHandoffKey = ui.onTerminalInput(data => {
+      // Cheapest checks first: this listener sees every key the user types.
+      if (foregroundHandoffs.size === 0) return undefined;
+      const key = getBackgroundKey();
+      // Kitty reports a release too, and matchesKey matches it — act on the
+      // press only, or a refused handoff would be retried by its own release.
+      if (key === undefined || isKeyRelease(data) || !matchesKey(data, key as KeyId)) return undefined;
+      // Listeners run before the focused component, so a dialog or the
+      // viewer's composer would lose the key. The viewer has its own `b`.
+      if (!fleet.editorHasFocus()) return undefined;
+      const sent = sendForegroundToBackground(foregroundHandoffs.keys());
+      if (sent > 0) ui.notify(`Sent ${sent === 1 ? "1 agent" : `${sent} agents`} to the background.`, "info");
+      return { consume: true };
+    });
+  }
+
+  /**
+   * Pi's fullscreen scrollbar preference, read from the main session's live,
+   * trust-aware settings and normalized as Pi's own `getFullscreenScrollbar()` does.
+   */
+  function getFullscreenScrollbar(): ScrollViewScrollbar {
+    try {
+      const mode = pi.getSettings().fullscreenScrollbar;
+      return mode === "always" || mode === "hidden" ? mode : "auto";
+    } catch {
+      return "auto";
+    }
+  }
+
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined), refreshTicker);
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined), refreshTicker,
+    backgroundActionFor, getFullscreenScrollbar);
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -1379,45 +1848,41 @@ export default function (pi: ExtensionAPI) {
   function getToolDescriptionMode(): ToolDescriptionMode { return toolDescriptionMode; }
   function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
-  // ---- Batch tracking for smart join mode ----
-  // Collects background agent IDs spawned in the current turn for smart grouping.
-  // Uses a debounced timer: each new agent resets the 100ms window so that all
-  // parallel tool calls (which may be dispatched across multiple microtasks by the
-  // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
-  let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
-  let batchCounter = 0;
+  // ---- Turn batches for `group` join mode ----
+  // Background spawns the parent made in its current turn. The turn's end is
+  // the batch boundary: every `Agent` call of the batch has returned by then,
+  // so a spawn whose startup failed has already thrown and was never recorded,
+  // and a slow worktree copy cannot split the batch.
+  let turnGroupSpawns: string[] = [];
+  let turnGroupCounter = 0;
 
-  /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
-  function finalizeBatch() {
-    batchFinalizeTimer = undefined;
-    const batchAgents = [...currentBatchAgents];
-    currentBatchAgents = [];
+  /** Record a `group`-mode spawn made inside a parent turn. */
+  function joinTurnGroup(id: string, joinMode: JoinMode | undefined) {
+    // Outside a parent turn (an `@handle` mention) no turn end is coming, and a
+    // group of one is delivered exactly like a single completion.
+    if (joinMode === 'group' && parentTurnActive()) turnGroupSpawns.push(id);
+  }
 
-    const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
-    if (smartAgents.length >= 2) {
-      const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
-        }
-      }
-    } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+  /** Register the ending turn's `group` spawns, two or more, as one group. */
+  function registerTurnGroup() {
+    const ids = turnGroupSpawns;
+    turnGroupSpawns = [];
+    // One spawn is no group: it reports like any single completion.
+    if (ids.length < 2) {
+      const record = ids.length === 1 ? manager.getRecord(ids[0]) : undefined;
+      if (record?.completedAt != null && !record.resultConsumed) sendIndividualNudge(record);
+      return;
+    }
+    const groupId = `turn-${++turnGroupCounter}`;
+    groupJoin.registerGroup(groupId, ids);
+    // Members that finished before their turn ended had their completion
+    // deferred (see the manager's onComplete); feed them in now.
+    for (const id of ids) {
+      const record = manager.getRecord(id);
+      if (!record) continue;
+      record.groupId = groupId;
+      if (record.completedAt != null && !record.resultConsumed) {
+        groupJoin.onAgentComplete(record);
       }
     }
   }
@@ -1527,11 +1992,8 @@ export default function (pi: ExtensionAPI) {
     });
     if (!record) return undefined;
 
-    if (joinMode != null && joinMode !== 'async') {
-      currentBatchAgents.push({ id, joinMode });
-      if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-      batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-    }
+    // Only a resume from an Agent call belongs to that call's turn.
+    if (opts.toolCallId !== undefined) joinTurnGroup(id, joinMode);
 
     agentActivity.set(id, bgState);
     // This agent already finished once, so the widget holds a finished-age
@@ -1571,12 +2033,22 @@ export default function (pi: ExtensionAPI) {
   // result (background agents, workflows) reaches the session stats now.
   pi.on("agent_end", (_event, ctx) => {
     flushPendingUsage(ctx);
+    outbox.onAgentEnd();
+  });
+  pi.on("agent_settled", () => outbox.onAgentEnd());
+
+  // The parent's tool batch is done and its next model call not yet made: the
+  // boundary where completions are delivered, as in Claude Code.
+  pi.on("turn_end", (event) => {
+    registerTurnGroup();
+    outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
   });
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
     widget.setUICtx(ctx.ui as UICtx);
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
+    watchHandoffKey(ctx.ui);
     widget.onTurnStart();
   });
 
@@ -1630,6 +2102,7 @@ export default function (pi: ExtensionAPI) {
     setBackgroundByDefault,
     setSchedulingEnabled,
     setScopeModels: setScopeModelsEnabled,
+    setAllowModelOverride: setModelOverrideAllowed,
     setStrictAgentFiles: (b) => { strictAgentFiles = b; },
     setDisableDefaultAgents: setDisableDefaultAgents,
     setToolDescriptionMode: setToolDescriptionMode,
@@ -1646,6 +2119,7 @@ export default function (pi: ExtensionAPI) {
     setShowCost,
     setShowModel,
     setViewerMarkdown,
+    setBackgroundKey,
   };
   applyAndEmitLoaded(settingsAppliers, (event, payload) => pi.events.emit(event, payload), process.cwd(), projectTrusted);
 
@@ -1723,6 +2197,28 @@ export default function (pi: ExtensionAPI) {
     ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
     : "";
 
+  // Same trade again, for `allowModelOverride`: with overrides off the `model`
+  // and `thinking` parameters are not in the schema, so the prose that teaches
+  // them goes too — a model told it may pick a model will keep trying.
+  const modelOverrideAllowed = isModelOverrideAllowed();
+  const modelGuideline = modelOverrideAllowed
+    ? `- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").\n- Use thinking to control extended thinking level.\n`
+    : "";
+  const modelParamShape = {
+    model: Type.Optional(
+      Type.String({
+        description:
+          'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+      }),
+    ),
+    thinking: Type.Optional(
+      Type.String({
+        description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+      }),
+    ),
+  };
+  const modelParams: Partial<typeof modelParamShape> = modelOverrideAllowed ? modelParamShape : {};
+
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
     ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
     : "";
@@ -1768,9 +2264,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
+${modelGuideline}- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1796,6 +2290,7 @@ Terse command-style prompts produce shallow, generic work.
       agentDir: getAgentDir,
       isolationGuideline: () => isolationGuideline,
       scheduleGuideline: () => scheduleGuideline,
+      modelGuideline: () => modelGuideline,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
     return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
@@ -1863,17 +2358,7 @@ Terse command-style prompts produce shallow, generic work.
       subagent_type: Type.String({
         description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
       }),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
-        }),
-      ),
+      ...modelParams,
       max_turns: Type.Optional(
         Type.Number({
           description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
@@ -1958,7 +2443,14 @@ Terse command-style prompts produce shallow, generic work.
       if (isPartial || details.status === "running") {
         const frame = SPINNER[details.spinnerFrame ?? 0];
         const s = stats(details);
-        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        const status = renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        // Claude Code's hint, after the same 2s: a call that finishes quickly
+        // never flashes it.
+        const backgroundKey = getBackgroundKey();
+        if (details.backgroundHint && backgroundKey && details.durationMs >= BACKGROUND_HINT_DELAY_MS) {
+          status.addChild(new Text(theme.fg("dim", `     (${backgroundKey} to run in background)`), 0, 0));
+        }
+        return status;
       }
 
       // ---- Background agent launched ----
@@ -2208,7 +2700,9 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            // Only when overrides are on: a job keeps the call's model choice
+            // for every later fire, which is exactly what the setting refuses.
+            model: isModelOverrideAllowed() ? (params as { model?: string }).model : undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2349,6 +2843,25 @@ Terse command-style prompts produce shallow, generic work.
         );
       }
 
+      // What the model sees for a run it no longer waits on — spawned in the
+      // background, or handed there mid-run (background key / viewer `b`). One
+      // text for both, as in Claude Code: from here on they are the same kind of agent.
+      const backgroundResult = (id: string, record: AgentRecord | undefined) => {
+        const isQueued = record?.status === "queued";
+        return textResult(
+          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
+          `Agent ID: ${id}\n` +
+          `Type: ${displayName}\n` +
+          `Description: ${params.description}\n` +
+          (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+          `\nYou will be notified when this agent completes.\n` +
+          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `Do not duplicate this agent's work.`,
+          { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+        );
+      };
+
       // Background execution
       if (runInBackground) {
         const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
@@ -2357,12 +2870,15 @@ Terse command-style prompts produce shallow, generic work.
         // The callback lazily reads record.outputFile (set right after spawn)
         // rather than closing over a value that doesn't exist yet.
         let id: string;
+        // Read now: a queued agent may start after a session switch, when this
+        // ctx is stale and every read of it throws.
+        const bgCwd = ctx.cwd;
         const origBgOnSession = bgCallbacks.onSessionCreated;
         bgCallbacks.onSessionCreated = (session: any) => {
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, bgCwd);
           }
         };
 
@@ -2400,16 +2916,7 @@ Terse command-style prompts produce shallow, generic work.
         // call instead of being reported as a subagent that ran (#179).
         await manager.awaitStartup(id);
 
-        if (joinMode == null || joinMode === 'async') {
-          // Foreground/no join mode or explicit async — not part of any batch
-        } else {
-          // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
-          // Debounce: reset timer on each new agent so parallel tool calls
-          // dispatched across multiple event loop ticks are captured together
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
+        joinTurnGroup(id, joinMode);
 
         agentActivity.set(id, bgState);
         widget.ensureTimer();
@@ -2425,31 +2932,27 @@ Terse command-style prompts produce shallow, generic work.
           isBackground: true,
         });
 
-        const isQueued = record?.status === "queued";
-        return textResult(
-          `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
-          `Agent ID: ${id}\n` +
-          `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
-          (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
-          `Do not duplicate this agent's work.`,
-          { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
-        );
+        return backgroundResult(id, record);
       }
 
       // Foreground (synchronous) execution — stream progress via onUpdate
       let spinnerFrame = 0;
       const startedAt = Date.now();
       let fgId: string | undefined;
+      // Set once the run is live and can be handed to the background — see
+      // `foregroundHandoffs`. Unset while queued: there is no run to hand over.
+      let handoffId: string | undefined;
+      // Set by the handoff. From then on `onUpdate` is a dead handle (pi drops
+      // updates once `execute` has returned), so `streamUpdate` stops building
+      // them; the tracker keeps `fgState` live for the widget and FleetView.
+      let backgrounded = false;
       // Set only while the spawn is parked on a foreground concurrency slot
       // (maxConcurrentForeground); undefined the rest of the time, including
       // always when the limit is unset.
       let queuedAhead: number | undefined;
 
       const streamUpdate = () => {
+        if (backgrounded) return;
         // Spend from the record, everything else from the live tracker. `fgId`
         // is set in onSessionCreated below, which fires before the first
         // assistant message — so nothing is spent while this reads zero.
@@ -2472,6 +2975,9 @@ Terse command-style prompts produce shallow, generic work.
             ? describeActivity(fgState.activeTools, fgState.responseText)
             : `queued — waiting for a foreground slot${queuedAhead > 0 ? ` (${queuedAhead} ahead)` : ""}`,
           spinnerFrame: spinnerFrame % SPINNER.length,
+          // One hint per batch, as in Claude Code: on the earliest call still
+          // pending (a Map iterates in insertion order). The key takes them all.
+          backgroundHint: handoffId !== undefined && foregroundHandoffs.keys().next().value === handoffId,
         };
         onUpdate?.({
           content: [{ type: "text", text: `${fgState.toolUses} tool uses...` }],
@@ -2525,9 +3031,18 @@ Terse command-style prompts produce shallow, generic work.
 
       streamUpdate();
 
-      let record: AgentRecord;
+      // The background key or the viewer's `b` wakes this with the run already
+      // handed over (`sendForegroundToBackground`), raced against the run
+      // below. The manager only accepts a handoff of a run that has not
+      // settled, and the wake-up resolves synchronously with it, so whichever
+      // promise wins is the truth: the result is never also delivered as a
+      // notification.
+      let wakeBackgrounded!: () => void;
+      const handedOff = new Promise<undefined>(resolve => { wakeBackgrounded = () => resolve(undefined); });
+
+      let fgResult: { record: AgentRecord } | undefined;
       try {
-        const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
+        fgResult = await Promise.race([manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
           name: params.name as string | undefined,
           model,
@@ -2549,19 +3064,43 @@ Terse command-style prompts produce shallow, generic work.
           // Set up the output file so streamToOutputFile can pick it up.
           const fgRec = manager.getRecord(fgAgentId);
           attachTranscript(fgRec, fgAgentId);
-        });
-        record = fgResult.record;
+          // Fires once the run promise exists, i.e. the agent is running. From
+          // here until this call returns, the run can be handed off.
+          handoffId = fgAgentId;
+          foregroundHandoffs.set(fgAgentId, () => {
+            // What a background spawn sets up front: the notification names
+            // this tool call, and it reports alone — its turn's batch is long
+            // closed.
+            if (fgRec) {
+              fgRec.toolCallId = toolCallId;
+              fgRec.joinMode = "async";
+            }
+            backgrounded = true;
+            wakeBackgrounded();
+          });
+        }), handedOff]);
       } finally {
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
         refreshTicker.delete(spinnerOwner);
-        if (fgId) {
+        if (handoffId !== undefined) foregroundHandoffs.delete(handoffId);
+        // A handed-off run is still working: its row stays, and the
+        // background settle in `onComplete` tears it down when it really ends.
+        if (fgId && !backgrounded) {
           agentActivity.delete(fgId);
           widget.markFinished(fgId);
           fleet.onAgentFinished(fgId);
         }
       }
+
+      if (fgResult === undefined) {
+        // Shown as a background agent from here on (the widget's default mode
+        // hides foreground rows).
+        widget.update();
+        return backgroundResult(handoffId!, manager.getRecord(handoffId!));
+      }
+      const record = fgResult.record;
 
       // Get final token count — from the record, like the cost below it, so the
       // two describe the same work when the agent delegated to nested children.
@@ -2696,33 +3235,30 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
+   * agent uses — the completion outbox, which delivers at the parent's next
+   * boundary — rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
     fleet.update();
     flushPendingUsageIfIdle();
     const result = workflowResultText(task);
-    scheduleNudge(task.id, () => {
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: formatWorkflowNotification(task),
-        display: true,
-        details: {
-          id: task.id,
-          description: `Workflow ${task.workflowName ?? task.id}`,
-          status: task.status === "completed" ? "completed" : task.status === "killed" ? "stopped" : "error",
-          toolUses: task.totalToolCalls,
-          // A workflow has agents, not turns; rendering "↻0" would be noise.
-          turnCount: 0,
-          totalTokens: task.totalTokens,
-          durationMs: elapsedMs(task, Date.now()),
-          error: task.error,
-          resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
-        },
-      }, { deliverAs: "followUp", triggerTurn: true });
-    });
+    const message = {
+      content: formatWorkflowNotification(task),
+      details: {
+        id: task.id,
+        description: `Workflow ${task.workflowName ?? task.id}`,
+        status: task.status === "completed" ? "completed" as const : task.status === "killed" ? "stopped" as const : "error" as const,
+        toolUses: task.totalToolCalls,
+        // A workflow has agents, not turns; rendering "↻0" would be noise.
+        turnCount: 0,
+        totalTokens: task.totalTokens,
+        durationMs: elapsedMs(task, Date.now()),
+        error: task.error,
+        resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+      },
+    };
+    outbox.add({ ids: [task.id], build: () => message });
   }
 
   // Defined unconditionally, registered only when the feature is on — the same
@@ -2731,7 +3267,7 @@ Terse command-style prompts produce shallow, generic work.
   const workflowTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.WORKFLOW,
     label: "SubagentWorkflow",
-    description: renderToolDescriptionTemplate(fullWorkflowToolDescription),
+    description: renderToolDescriptionTemplate(workflowToolDescription(isModelOverrideAllowed())),
     promptSnippet: "Run a deterministic script that orchestrates many subagents",
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
@@ -2818,7 +3354,19 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
-      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
+      // A run from before a restart, `/resume` or `/reload` is found by its
+      // files: its journal and saved script sit in this session's task dir.
+      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks, (id) => {
+        try {
+          const dir = sessionTaskDir(ctx.cwd, ctx.sessionManager.getSessionId());
+          const journal = join(dir, `${id}.workflow.jsonl`);
+          if (!existsSync(journal)) return undefined;
+          const script = join(dir, `${id}.workflow.js`);
+          return { journalPath: journal, ...(existsSync(script) ? { scriptPath: script } : {}) };
+        } catch {
+          return undefined;
+        }
+      });
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
       // A resume with no source of its own re-runs what that run ran. The
@@ -3146,7 +3694,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (!active) {
         record.resultConsumed = true;
-        cancelNudge(record.id);
+        outbox.cancel(record.id);
       }
 
       // Verbose: include full conversation
@@ -3407,21 +3955,23 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const { ConversationViewer, VIEWPORT_HEIGHT_PCT } = await import("./ui/conversation-viewer.js");
     const session = record.session;
     const activity = agentActivity.get(record.id);
+    let overlayOptions = getConversationOverlayOptions({ mode: "regular" });
 
     await ctx.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
+        overlayOptions = getConversationOverlayOptions(tui);
         return new ConversationViewer(tui, session, record, activity, theme, done, () => {
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx));
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx),
+        backgroundActionFor(record, message => ctx.ui.notify(message, "info")), getFullscreenScrollbar());
       },
       {
         overlay: true,
-        overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
+        overlayOptions: () => overlayOptions,
       },
     );
   }
@@ -3794,6 +4344,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      allowModelOverride: isModelOverrideAllowed(),
       strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
@@ -3821,6 +4372,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
+      // As written: undefined (the default) stays out of the file.
+      backgroundKey: backgroundKeySetting,
     } satisfies SubagentsSettings;
   }
 
@@ -3902,9 +4455,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "joinMode",
           label: "Join mode",
-          description: "Default join mode for background agents",
-          currentValue: getDefaultJoinMode(),
-          values: ["smart", "async", "group"],
+          description: "smart = each completion at the parent's next boundary, as in Claude Code; group = one notification per turn's batch",
+          // `async` is an older name for `smart`; settings files may still hold it.
+          currentValue: getDefaultJoinMode() === "group" ? "group" : "smart",
+          values: ["smart", "group"],
         },
         {
           id: "backgroundByDefault",
@@ -3934,6 +4488,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "allowModelOverride",
+          label: "Model override",
+          description:
+            "Let Agent calls, workflows and scheduled jobs pick a subagent's model and thinking level; "
+            + "off runs every subagent on your current model and thinking level unless its agent file sets one "
+            + "(the tool parameters change on next pi session)",
+          currentValue: isModelOverrideAllowed() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4132,6 +4696,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
         notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "allowModelOverride") {
+        const enabled = value === "on";
+        setModelOverrideAllowed(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Subagent calls may pick a model and thinking level. Tool spec change takes effect on next pi session."
+            : "Subagents run on your current model and thinking level. Tool spec change takes effect on next pi session.",
+        );
       } else if (id === "strictAgentFiles") {
         const enabled = value === "on";
         strictAgentFiles = enabled;

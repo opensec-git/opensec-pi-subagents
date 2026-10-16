@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentManager, resumeStateOf } from "../src/agent-manager.js";
+import { AgentManager, resumeStateOf, resumeStatesFromEntries } from "../src/agent-manager.js";
 import type { AgentResumeState } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -184,5 +184,37 @@ describe("resumeStateOf", () => {
       id, type: "Explore", sessionFile: join(dir, "s.jsonl"), model: "anthropic/claude-haiku",
       isolated: true, baseCwd: dir, maxTurns: 0, handle: "explore",
     });
+  });
+});
+
+describe("owned children's resume state (nested agents, workflow children)", () => {
+  it("is read back from subagents:resume entries as well as subagents:record ones", () => {
+    const nested = { ...state({ id: "child-1", handle: undefined, parentAgentId: "agent-1" }) };
+    const states = resumeStatesFromEntries([
+      { type: "custom", customType: "subagents:record", data: { resume: state() } },
+      { type: "custom", customType: "subagents:resume", data: { resume: nested } },
+      { type: "custom", customType: "other", data: { resume: state({ id: "x" }) } },
+    ]);
+    expect(states.map(s => s.id)).toEqual(["agent-1", "child-1"]);
+    expect(states[1].parentAgentId).toBe("agent-1");
+  });
+
+  it("keeps owned children and top-level agents under separate caps", () => {
+    const topLevel = Array.from({ length: 100 }, (_, i) => state({ id: `top-${i}`, handle: `explore-${i}`, completedAt: i }));
+    const owned = Array.from({ length: 250 }, (_, i) =>
+      state({ id: `wf-${i}`, handle: undefined, workflowId: "wf_1", completedAt: 1000 + i }));
+    manager.restoreTombstones([...topLevel, ...owned]);
+    // A big workflow does not push the session's own agents out...
+    expect(manager.findTombstone("top-0")).toBeDefined();
+    expect(manager.listTombstones()).toHaveLength(100);
+    // ...and its own oldest children go first.
+    expect(manager.findTombstone("wf-49")).toBeUndefined();
+    expect(manager.findTombstone("wf-50")).toBeDefined();
+    expect(manager.findTombstone("wf-249")).toBeDefined();
+  });
+
+  it("carries the thinking level the agent ran at", () => {
+    const record = { id: "a", type: "Explore", description: "d", sessionFile: "/s.jsonl", status: "completed", toolUses: 0, startedAt: 0, lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 }, compactionCount: 0, invocation: { modelId: "p/m", thinking: "high" } } as any;
+    expect(resumeStateOf(record)).toMatchObject({ model: "p/m", thinking: "high" });
   });
 });

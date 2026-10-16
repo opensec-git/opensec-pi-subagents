@@ -170,6 +170,11 @@ export interface AgentResumeState {
   rootSessionId?: string;
   /** `provider/id` of the model the agent's session ran on. */
   model?: string;
+  /**
+   * Thinking level its session ran at. Informational: a reopened session
+   * restores the level saved in its own file.
+   */
+  thinking?: EffectiveThinkingLevel;
   /** Caller-supplied working directory, if any. */
   cwd?: string;
   /** The directory it ran from; for a worktree agent, the repo. */
@@ -228,8 +233,17 @@ export interface AgentRecord {
    * which says only that the agent has an inline result surface: a detached
    * cross-extension RPC spawn is foreground by that measure and yet blocks
    * nobody, so it takes no slot.
+   *
+   * Cleared when the inline caller stops waiting: by `sendToBackground`, or
+   * when the run settles.
    */
   blocking?: boolean;
+  /**
+   * Removes the listener that stops this run when its caller's signal aborts.
+   * At most one is armed at a time — queueing arms one, starting replaces it,
+   * and `sendToBackground` takes it off.
+   */
+  detachParentAbort?: () => void;
   /**
    * Present only while the record is "queued": resolves when it leaves the
    * queue, started or aborted. `spawnAndWait` waits on this because a queued
@@ -279,8 +293,9 @@ export interface AgentRecord {
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
   /**
-   * Whether this agent was spawned to run in the background. Tri-state, set at
-   * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =
+   * Whether this agent runs in the background. Tri-state, initialized at spawn
+   * from `SpawnOptions.isBackground` and flipped `false` → `true` (once, never
+   * back) by `sendToBackground`: `true` = background, `false` =
    * foreground (has an inline Agent tool-result surface), `undefined` = the
    * caller never declared it (e.g. a cross-extension RPC spawn, which is detached
    * and has no inline surface). The widget's background-only filter keys off this
@@ -327,6 +342,13 @@ export interface AgentRecord {
    * directory as their ancestors' instead of the child session's own id.
    */
   rootSessionId?: string;
+  /**
+   * The session this agent belongs to: the parent session's file when it was
+   * spawned (undefined for a session kept only in memory). Owned children
+   * inherit their root's. A background agent keeps running when the user
+   * switches sessions, and its results go to this session, not the open one.
+   */
+  ownerSession?: string;
 }
 
 /**

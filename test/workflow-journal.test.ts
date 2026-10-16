@@ -273,6 +273,64 @@ describe("replay", () => {
     expect(two.replayedCount).toBe(0);
   });
 
+  describe("refs: continuing a replayed child (also after a restart)", () => {
+    /** A host that reports the record each child ran as, like the real one. */
+    function recordingHost() {
+      const resumed: Array<{ agentId: string; prompt: string; recordId?: string }> = [];
+      const host = {
+        async spawnAgent(request: WorkflowSpawnRequest) {
+          request.onResolved?.({ recordId: `rec-${request.index}` });
+          return { ok: true, text: `live:${request.prompt}` };
+        },
+        async resumeAgent(agentId: string, prompt: string, onResolved?: WorkflowSpawnRequest["onResolved"], recordId?: string) {
+          resumed.push({ agentId, prompt, recordId });
+          onResolved?.({ recordId: recordId ?? "rec-live" });
+          return { ok: true, text: `resumed:${prompt}` };
+        },
+        abortAgent() {},
+      };
+      return { host, resumed };
+    }
+
+    it("records the agent record behind each answer", async () => {
+      const journal = recorder();
+      await run('await agent("first", { label: "a" });\nreturn null;', { host: recordingHost().host, journal });
+      expect(journal.entries[0]).toMatchObject({ index: 0, ok: true, ref: "rec-0" });
+    });
+
+    it("continues a replayed child with resume, by the record it ran as", async () => {
+      const first = recorder();
+      await run('await agent("first", { label: "a" });\nreturn null;', { host: recordingHost().host, journal: first });
+
+      const second = recordingHost();
+      const result = await run(
+        'await agent("first", { label: "a" });\nreturn await agent("more", { resume: "a" });',
+        { host: second.host, journal: { entries: first.entries } },
+      );
+
+      expect(result.status).toBe("completed");
+      expect(result.value).toBe("resumed:more");
+      expect(result.replayedCount).toBe(1);
+      expect(second.resumed).toEqual([{ agentId: "wf-agent-0", prompt: "more", recordId: "rec-0" }]);
+    });
+
+    it("replays a run that used agent({ resume }) when its entries carry refs", async () => {
+      const body = 'await agent("first", { label: "a" });\nreturn await agent("follow up", { resume: "a" });';
+      const first = recorder();
+      await run(body, { host: recordingHost().host, journal: first });
+      expect(first.entries[1]).toMatchObject({ resumed: true, ref: "rec-0" });
+
+      const second = recordingHost();
+      const replayed = recorder();
+      const two = await run(body, { host: second.host, journal: { entries: first.entries, append: replayed.append } });
+      expect(two.value).toBe("resumed:follow up");
+      expect(two.replayedCount).toBe(2);
+      expect(second.resumed).toEqual([]);
+      // Re-recorded with its ref and resume mark, so the next resume can replay it too.
+      expect(replayed.entries).toEqual(first.entries);
+    });
+  });
+
   it("blames the replay, not the script, when an added resume has no live target", async () => {
     // An edited script can add a `resume` over a journal that has none. The
     // prefix is intact, so the target really was replayed — and the reader

@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
 // These tests pin `projectTrust: "pi"` (follow Pi's trust decision); the default, "full", trusts every project.
 vi.mock("../src/settings.js", async (importOriginal) => ({
@@ -104,7 +105,10 @@ const execResult = (overrides: Partial<{ stdout: string; stderr: string; code: n
  * ------------------------------------------------------------------------- */
 
 describe("createWorkflowHost — spawn mapping", () => {
+  afterEach(() => { setModelOverrideAllowed(false); });
   beforeEach(() => {
+    // Per-call model/thinking overrides are off by default (allowModelOverride).
+    setModelOverrideAllowed(true);
     // The host resolves agent types through the process-wide registry, the same
     // one the Agent tool uses. Seed it with the shipped defaults.
     registerAgents(new Map());
@@ -382,6 +386,8 @@ describe("createWorkflowHost — scopeModels", () => {
     });
 
   beforeEach(() => {
+    // Per-call model/thinking overrides are off by default (allowModelOverride).
+    setModelOverrideAllowed(true);
     // `resolveEnabledModels` memoizes on the patterns plus the mtime/size of
     // both settings files, so one case's allowlist would otherwise be served to
     // the next — a fresh project dir per test is what invalidates it. Same
@@ -412,6 +418,7 @@ describe("createWorkflowHost — scopeModels", () => {
   });
 
   afterEach(() => {
+    setModelOverrideAllowed(false);
     setScopeModelsEnabled(prevEnabled); // module-global — restore for other suites
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -593,6 +600,31 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     const resumed = await host.resumeAgent?.("wf-agent-9", "continue");
 
     expect(resumed?.ok).toBe(false);
+    expect(stub.resume).not.toHaveBeenCalled();
+  });
+
+  it("resumes a child replayed from the journal by the record it ran as — a workflow child only", async () => {
+    const stub = stubManager();
+    const tombstones: Record<string, { workflowId?: string; parentAgentId?: string }> = {
+      "wf-child": { workflowId: "wf_old" },
+      "top-level": {},
+      nested: { parentAgentId: "agent-1" },
+    };
+    (stub.manager as any).findTombstone = (id: string) => tombstones[id];
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    // A workflow's own child, known only as a tombstone after a restart.
+    expect(await host.resumeAgent?.("wf-agent-0", "continue", undefined, "wf-child")).toMatchObject({ ok: true });
+    expect(stub.resume).toHaveBeenCalledWith("wf-child", "continue", undefined, expect.anything());
+    // Mapped for the rest of the run, like a child it spawned.
+    host.abortAgent("wf-agent-0");
+    expect(stub.abort).toHaveBeenCalledWith("wf-child");
+
+    // A journal cannot reach the session's own agents or a nested agent's.
+    stub.resume.mockClear();
+    expect((await host.resumeAgent?.("wf-agent-1", "x", undefined, "top-level"))?.ok).toBe(false);
+    expect((await host.resumeAgent?.("wf-agent-2", "x", undefined, "nested"))?.ok).toBe(false);
+    expect((await host.resumeAgent?.("wf-agent-3", "x", undefined, "unknown"))?.ok).toBe(false);
     expect(stub.resume).not.toHaveBeenCalled();
   });
 
@@ -1037,7 +1069,7 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 
     const sent = booted.pi.sendMessage.mock.calls.find((c: any[]) => String(c[0]?.content).includes(taskId!))!;
     expect(sent[0].customType).toBe("subagent-notification");
-    expect(sent[1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[1]).toMatchObject({ deliverAs: "steer", triggerTurn: true });
     expect(String(sent[0].content)).toContain("<result>done here</result>");
 
     // …and the inline card follows the background run rather than freezing at
@@ -1489,6 +1521,26 @@ describe("collisions with another extension", () => {
     expect(booted.pi.getActiveTools()).toContain("Agent");
     expect(warnings(context).some(m => /already provides a "Workflow" tool/.test(m))).toBe(true);
     expect(warnings(context).some(m => /other-ext/.test(m))).toBe(true);
+  });
+
+  it("withdraws its tool when another extension provides a lowercase `workflow` tool", async () => {
+    // #283: `@quintinshaw/pi-dynamic-workflows` registers its tool as lowercase
+    // `workflow`. The match is exact, so the name has to be listed by hand;
+    // without it neither orchestrator stands down and the model is offered
+    // both, with no warning that it happened.
+    const booted = bootAuto();
+    booted.pi.getAllTools.mockReturnValue([
+      foreign("workflow", "pi-dynamic-workflows"),
+      foreign("workflow_control", "pi-dynamic-workflows"),
+    ]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(booted.pi.getActiveTools()).not.toContain("SubagentWorkflow");
+    expect(booted.pi.getActiveTools()).toContain("Agent");
+    expect(warnings(context).some(m => /already provides a "workflow" tool/.test(m))).toBe(true);
+    expect(warnings(context).some(m => /pi-dynamic-workflows/.test(m))).toBe(true);
   });
 
   it("names the setting that keeps both", async () => {

@@ -141,5 +141,16 @@ describe("tool veto reachability against real pi-mono", () => {
     await expect(
       session.agent.beforeToolCall({ toolCall: { name: "alpha_read" }, args: {} }),
     ).resolves.toSatisfy((r: any) => !r?.block);
+
+    // Calls a tool makes through `ctx.executeTool()` (codemode scripts) never
+    // reach `agent.beforeToolCall`: pi runs them past the session's own
+    // `_beforeToolCall`, i.e. extensions' `tool_call` handlers. The inline scope
+    // guard must veto there too, or a codemode script reaches out-of-scope tools.
+    await expect(
+      session._beforeToolCall({ toolCall: { name: "beta_tool", id: "n1" }, args: {} }, "parent-call"),
+    ).resolves.toMatchObject({ block: true, reason: expect.any(String) });
+    await expect(
+      session._beforeToolCall({ toolCall: { name: "alpha_read", id: "n2" }, args: {} }, "parent-call"),
+    ).resolves.toSatisfy((r: any) => !r?.block);
   });
 });

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
+import { registerAgents } from "../src/agent-types.js";
 import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -20,7 +21,7 @@ vi.mock("../src/worktree.js", () => ({
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { addUsage } from "../src/usage.js";
-import { isWorktreeIsolationEnabled } from "../src/worktree.js";
+import { createWorktree, isWorktreeIsolationEnabled } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -2534,4 +2535,116 @@ describe("AgentManager — resume after a stop", () => {
       expect(onComplete).toHaveBeenCalledTimes(2);
     });
   }
+});
+
+// Frontmatter is authoritative (README "Frontmatter is authoritative"): the
+// agent file's `isolation:` must hold on every spawn path. Only the Agent tool
+// and nested tools resolve it before calling the manager; `@handle` mentions
+// pass none, and RPC spawns forward only their caller's value. Workflow
+// children follow Claude Code instead: only the script's option decides.
+describe("AgentManager — the agent file's `isolation` wins over the spawn option", () => {
+  let manager: AgentManager;
+  const wt = { path: "/wt/a", branch: "pi-agent-a", baseSha: "abc", workPath: "/wt/a" };
+
+  function spawnAs(
+    fileIsolation: "worktree" | "off" | undefined,
+    optionIsolation: "worktree" | undefined,
+    { type = "walled", workflowId, resumeSessionFile }: { type?: string; workflowId?: string; resumeSessionFile?: string } = {},
+  ) {
+    registerAgents(new Map([["walled", { name: "walled", isolation: fileIsolation } as any]]));
+    vi.mocked(createWorktree).mockReset();
+    vi.mocked(createWorktree).mockResolvedValue(wt as never);
+    resolvedRun();
+    manager = new AgentManager();
+    return manager.spawn(mockPi, mockCtx, type, "go", {
+      description: "go",
+      isBackground: true,
+      ...(optionIsolation !== undefined ? { isolation: optionIsolation } : {}),
+      ...(workflowId !== undefined ? { workflowId } : {}),
+      ...(resumeSessionFile !== undefined ? { resumeSessionFile } : {}),
+    });
+  }
+
+  afterEach(() => {
+    manager?.dispose();
+    registerAgents(new Map());
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(true);
+  });
+
+  it("isolation: worktree in the file applies when the spawn omits it, and tags the record", async () => {
+    const id = spawnAs("worktree", undefined);
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)!.worktree).toEqual(wt);
+    // The widget's "worktree" tag reads the invocation snapshot, which only
+    // the Agent tool used to seed.
+    expect(manager.getRecord(id)!.invocation?.isolation).toBe("worktree");
+  });
+
+  it("isolation: off in the file refuses a spawn's isolation: worktree", async () => {
+    const id = spawnAs("off", "worktree");
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)!.worktree).toBeUndefined();
+  });
+
+  it("the spawn option decides when the file leaves isolation unset", async () => {
+    const id = spawnAs(undefined, "worktree");
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("the project switch still refuses a file's isolation: worktree", async () => {
+    vi.mocked(isWorktreeIsolationEnabled).mockReturnValue(false);
+    const id = spawnAs("worktree", undefined);
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("an unregistered type keeps the spawn option", async () => {
+    const id = spawnAs("off", "worktree", { type: "not-registered" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("an isolation: worktree file fails to start outside a git repo", async () => {
+    registerAgents(new Map([["walled", { name: "walled", isolation: "worktree" } as any]]));
+    vi.mocked(createWorktree).mockReset();
+    vi.mocked(createWorktree).mockResolvedValue(undefined as never);
+    resolvedRun();
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "walled", "go", { description: "go", isBackground: true });
+
+    await expect(manager.awaitStartup(id)).rejects.toThrow(/isolation: "worktree"/);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  // Claude Code's workflow agent() reads only the script's `isolation`.
+  it("a workflow child ignores the file's isolation: worktree when the script omits it", async () => {
+    const id = spawnAs("worktree", undefined, { workflowId: "wf-1" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("a workflow child gets the script's isolation: worktree despite the file's isolation: off", async () => {
+    const id = spawnAs("off", "worktree", { workflowId: "wf-1" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  // Fork-specific: a reopened agent continues in the place it ran.
+  it("an agent reopened from its session file does not get a fresh worktree from the file", async () => {
+    const id = spawnAs("worktree", undefined, { resumeSessionFile: "/tmp/agent.jsonl" });
+    await manager.awaitStartup(id);
+
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
 });

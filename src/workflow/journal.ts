@@ -23,14 +23,16 @@
  *
  * ## Runs that use `agent({ resume })`
  *
- * Those are not replayed at all. A replayed agent is text from a file, not a
- * live child, so there is no conversation in this run for a later `resume` to
- * continue — and the id map that would find one belongs to the run that did
- * the spawning. Rather than replay a prefix that strands the first `resume`
- * call, a journal carrying one declines the whole cache and the run pays in
- * full. Coarse on purpose: the alternative is tracking which label each entry
- * ran under and capping the prefix below the earliest one that gets resumed,
- * which is a second key concept for a case that costs one run.
+ * A replayed agent is text from a file, not a live child of this run. What
+ * lets a later `resume` continue it anyway is `ref`: the id of the agent that
+ * produced the entry. Its conversation is in its own session file, and the
+ * parent session records its resume state, so the host reopens it from there —
+ * in the same process or after a restart.
+ *
+ * An entry without a `ref` (written before it existed, or by an agent with no
+ * saved session) cannot be continued. A journal whose `resume` calls lack one
+ * declines the whole cache, as before: rather than replay a prefix that strands
+ * the first `resume` call, the run pays in full.
  *
  * ## Ordering under concurrency
  *
@@ -67,6 +69,12 @@ export interface WorkflowJournalEntry {
    * partway through, which is why the flag is on the journal and not derived.
    */
   resumed?: true;
+  /**
+   * Id of the agent record that produced this entry, so a later run can
+   * continue it with `agent({ resume })` after replaying it: the host reopens
+   * that agent from its session file. Absent in older journals.
+   */
+  ref?: string;
 }
 
 /**
@@ -159,6 +167,7 @@ function isEntry(value: unknown): value is WorkflowJournalEntry {
     typeof entry.key === "string" &&
     typeof entry.ok === "boolean" &&
     (entry.text === undefined || typeof entry.text === "string") &&
-    (entry.resumed === undefined || entry.resumed === true)
+    (entry.resumed === undefined || entry.resumed === true) &&
+    (entry.ref === undefined || typeof entry.ref === "string")
   );
 }

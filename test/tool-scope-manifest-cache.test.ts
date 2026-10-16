@@ -35,6 +35,7 @@ function setup() {
   let active: string[] = [];
   const session: any = {
     getAllTools: () => ["read", "ext_tool", "other_tool"].map(name => ({ name })),
+    getToolDefinition: () => undefined,
     getActiveToolNames: () => active,
     setActiveToolsByName: (names: string[]) => { active = names; },
     subscribe: (l: (e: { type: string }) => void) => { listeners.push(l); return () => {}; },

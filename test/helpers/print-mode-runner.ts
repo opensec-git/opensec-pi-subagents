@@ -57,6 +57,7 @@ import {
   getCurrentTools,
   type Message,
   type Model,
+  type ThinkingLevel,
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
@@ -135,6 +136,10 @@ export interface RunPrintModeOptions {
   timeoutMs?: number;
   /** Abort the parent (and forwarded children) externally. */
   signal?: AbortSignal;
+  /** Additional extension paths loaded only for this test run. */
+  extensionPaths?: string[];
+  /** Called once after the real parent session is created and extensions are bound. */
+  onParentSession?: (session: AgentSession, manager: ManagerHandle | undefined) => void;
   /**
    * Force live mode against a specific provider/model (overrides PI_E2E_LIVE).
    * When omitted, live mode is on iff `PI_E2E_LIVE` is truthy. In live mode, if
@@ -157,6 +162,16 @@ export interface RunPrintModeOptions {
    * the loader builds its own (trusted) manager.
    */
   projectTrusted?: boolean;
+  /** Faux mode: whether the faux model supports reasoning, so thinking levels are not clamped to "off". */
+  reasoning?: boolean;
+  /** The parent session's thinking level. Default: Pi's (from settings). */
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * The parent's session manager. Default: in memory. Pass a persisted one
+   * (`SessionManager.create` / `.open`) to keep the parent's entries on disk, so
+   * a second run can reopen the same session as after a restart.
+   */
+  sessionManager?: SessionManager;
 }
 
 export interface PrintModeRun {
@@ -336,7 +351,10 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     if (!options.steps && !options.respond) {
       throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
     }
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux = registerFauxProvider({
+      provider: "faux",
+      models: [{ id: "faux-1", contextWindow: 200_000, ...(options.reasoning ? { reasoning: true } : {}) }],
+    });
     model = faux.getModel();
     // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since
@@ -375,7 +393,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     cwd,
     agentDir,
     ...(trust ? { settingsManager } : {}),
-    additionalExtensionPaths: [EXTENSION_PATH],
+    additionalExtensionPaths: [EXTENSION_PATH, ...(options.extensionPaths ?? [])],
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
     noPromptTemplates: true,
@@ -396,8 +414,9 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     modelRegistry: modelRegistry as any,
     modelRuntime: modelRuntime as any,
     resourceLoader: loader,
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager: options.sessionManager ?? SessionManager.inMemory(cwd),
     settingsManager,
+    ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
   });
   session.setSessionName("print-mode-host");
 
@@ -408,6 +427,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const manager = (globalThis as Record<symbol, unknown>)[MANAGER_KEY] as
     | ManagerHandle
     | undefined;
+  options.onParentSession?.(session, manager);
 
   // --- subagent hold condition (the pi-chonky-step monkey-patch) ---
   // Block the parent agent loop while background subagents are still running, so

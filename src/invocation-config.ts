@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
@@ -54,9 +54,34 @@ export function isolationParam(enabled: boolean): Partial<typeof isolationParamS
   return enabled ? isolationParamShape : {};
 }
 
+/**
+ * Whether a spawn's own `model` / `thinking` (the Agent tool's parameters, the
+ * nested tool's, workflow `agent({ model, effort })`, a scheduled job's, a
+ * cross-extension RPC spawn's) may choose the subagent's model and thinking
+ * level. Off by default: a subagent then runs on the parent's current model at
+ * the parent's current thinking level, unless its agent file names a `model:`
+ * or `thinking:` — the user's own configuration, which is always honoured.
+ *
+ * Off by default because the main model reads per-call parameters as an
+ * invitation: it picks cheaper models or lower effort for work the user
+ * expected to run on the model they chose. With it off, the parameters are not
+ * offered in the tool schemas either. Set from `subagents.json`
+ * (`allowModelOverride`); the schemas follow it at the next session, the
+ * resolution here at once.
+ */
+let allowModelOverride = false;
+
+export function isModelOverrideAllowed(): boolean { return allowModelOverride; }
+export function setModelOverrideAllowed(b: boolean): void { allowModelOverride = b; }
+
 interface AgentInvocationParams {
-  model?: string;
-  thinking?: string;
+  /**
+   * Untyped like `isolation` below: the tool schemas offer these only under
+   * `allowModelOverride`, which erases the inferred type, and RPC payloads
+   * arrive unvalidated. Narrowed to strings below.
+   */
+  model?: unknown;
+  thinking?: unknown;
   max_turns?: number;
   run_in_background?: boolean;
   inherit_context?: boolean;
@@ -91,11 +116,16 @@ interface ResolveOptions {
    * a caller that supplies no options at all, which in-tree means tests.
    */
   defaultRunInBackground?: boolean;
+  /**
+   * Whether the call's own `model` / `thinking` count. Default: the
+   * `allowModelOverride` setting. When false they are ignored as if absent.
+   */
+  allowModelOverride?: boolean;
 }
 
 export function resolveAgentInvocationConfig(
   agentConfig: AgentConfig | undefined,
-  params: AgentInvocationParams,
+  rawParams: AgentInvocationParams,
   opts?: ResolveOptions,
 ): {
   modelInput?: string;
@@ -117,6 +147,16 @@ export function resolveAgentInvocationConfig(
    */
   overridden?: { thinking?: ThinkingLevel; model?: string };
 } {
+  // Ignored outright, not merely outranked: with overrides off the parameters
+  // are not offered, and one that arrives anyway (a stale schema, a script, a
+  // forwarded payload) must not choose the model or disclose an "(asked X)".
+  const overridesAllowed = opts?.allowModelOverride ?? allowModelOverride;
+  const params = {
+    ...rawParams,
+    model: overridesAllowed && typeof rawParams.model === "string" ? rawParams.model : undefined,
+    thinking: overridesAllowed && typeof rawParams.thinking === "string" ? rawParams.thinking : undefined,
+  };
+
   // Precedence first, collapse second — reversing these loses the veto, since
   // an agent file's "off" only outranks a caller's "worktree" while it is still
   // a value. Everything downstream then sees "worktree" or nothing at all.

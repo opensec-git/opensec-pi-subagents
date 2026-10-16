@@ -11,13 +11,13 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
-import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./conversation-viewer.js";
 import { RefreshTicker } from "./refresh-ticker.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -150,6 +150,14 @@ export class FleetList {
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
     /** Shared with the widget by the extension, so both redraw on one frame. */
     private ticker: RefreshTicker = new RefreshTicker(),
+    /**
+     * The viewer's `b` for this row's run, supplied by the extension: only it
+     * knows which runs have a tool call waiting to be released, and it owns the
+     * widget this list shares with. Omitted → no `b` affordance.
+     */
+    private backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction,
+    /** Pi's `fullscreenScrollbar` preference, read when a viewer opens. */
+    private scrollbarMode: () => ScrollViewScrollbar = () => "auto",
   ) {}
 
   // ---- Lifecycle ----
@@ -162,6 +170,12 @@ export class FleetList {
   }
 
   /** Capture the UI context and (re)register the global input handler. */
+  /** Read agents from this manager from now on: one adopted across a session switch (session-handoff.ts). */
+  setManager(manager: AgentManager): void {
+    this.manager = manager;
+    this.update();
+  }
+
   setUICtx(ui: FleetUICtx): void {
     if (ui === this.ui) return;
     this.inputUnsub?.();
@@ -386,16 +400,19 @@ export class FleetList {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard. pi's editor is an `Editor`
-   * subclass (CustomEditor) while every dialog/selector is not, and the loader
-   * aliases pi-tui to pi's own copy, so `instanceof` is a reliable identity
-   * check. `focusedComponent` is TUI-private (no public accessor), hence the
-   * best-effort peek: unknowable focus (no tui seen yet, nothing focused)
-   * counts as the editor so activation keeps working.
+   * True when pi's prompt editor owns the keyboard. The editor is pluggable
+   * (ui.setEditorComponent) and need not extend `Editor` (#374), so match pi-tui's
+   * `EditorComponent` contract instead: `getText` + `setText`, which pi calls on
+   * every editor and none of pi's dialogs, selectors or overlays implement.
+   * `focusedComponent` is TUI-private (no public accessor), hence the best-effort
+   * peek: unknowable focus (no tui seen yet, nothing focused) counts as the
+   * editor so activation keeps working.
    */
-  private editorHasFocus(): boolean {
+  editorHasFocus(): boolean {
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    if (focused == null) return true;
+    const c = focused as { getText?: unknown; setText?: unknown };
+    return typeof c.getText === "function" && typeof c.setText === "function";
   }
 
   private deactivate(): void {
@@ -431,9 +448,11 @@ export class FleetList {
     const session = record.session;
     const activity = this.agentActivity.get(record.id);
     this.viewingAgentId = record.id;
+    let overlayOptions = getConversationOverlayOptions({ mode: "regular" });
 
     void this.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
+        overlayOptions = getConversationOverlayOptions(tui);
         this.viewerClose = () => done(undefined);
         return new ConversationViewer(
           tui,
@@ -450,11 +469,13 @@ export class FleetList {
           this.showCost(),
           this.viewerMarkdown,
           this.onViewerMarkdown,
+          this.backgroundAction?.(record, message => this.ui?.notify(message, "info")),
+          this.scrollbarMode(),
         );
       },
       {
         overlay: true,
-        overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
+        overlayOptions: () => overlayOptions,
       },
     ).then(() => this.clearViewer(), () => this.clearViewer());
   }
@@ -513,6 +534,8 @@ export class FleetList {
       );
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
+    // pi stacks below-editor widgets directly on its footer with no spacer (#351).
+    lines.push("");
 
     return lines;
   }

@@ -11,9 +11,13 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
+  type InlineExtension,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -83,6 +87,8 @@ export function extensionCanonicalName(extPath: string): string {
  * co-located file to `pi-subagents`.
  */
 function extensionPackageName(extPath: string): string | undefined {
+  // `builtin:<name>` names no file; climbing from it would read the process cwd's manifest.
+  if (extPath.startsWith("builtin:")) return undefined;
   const entry = resolve(extPath);
   let dir = dirname(extPath);
   for (;;) {
@@ -130,6 +136,39 @@ export function extensionCanonicalNames(extPath: string): string[] {
 /** Whether an `extensions:` entry names a file to load rather than an extension by name. */
 function isExtensionPathEntry(entry: string): boolean {
   return entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
+}
+
+/**
+ * Pi's built-in extensions, as its CLI hands them to the loader it builds. A
+ * subagent's loader is built here and would otherwise start with none, so a
+ * `builtin:<name>` entry matched nothing. Forwarded as `builtin:` resources they
+ * load as in the main session: default-on, disabled by `-builtin:<name>` in Pi's
+ * `extensions` setting, and filtered by the agent's `extensions:` like any other
+ * extension. Fresh factories per spawn: MCP state lives in the closure. Pi's
+ * `llama.cpp` built-in is CLI-only (not exported).
+ */
+const BUILTIN_EXTENSION_PATHS = new Set(["builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
+
+function builtinExtensionFactories(): InlineExtension[] {
+  return [
+    { name: "codemode", factory: createCodemodeExtension(), builtin: true, replaceable: true },
+    { name: "tool-search", factory: createToolSearchExtension(), builtin: true, replaceable: true },
+    { name: "mcp", factory: createMcpExtension(), builtin: true, replaceable: true },
+  ];
+}
+
+/**
+ * Built-ins a subagent must not load, whatever the settings say.
+ *
+ * Pi's MCP is off for subagents unless the agent asks for it by naming
+ * `builtin:mcp` in `extensions:`: with it on, every subagent would start its own
+ * set of `mcp.json` servers, one process tree per running child. Pi's CLI flags
+ * apply as in the main session: `--no-mcp` keeps MCP out even when asked for,
+ * and `--no-extensions` keeps all three out.
+ */
+export function disabledBuiltinExtensions(mcpRequested: boolean, argv: readonly string[] = process.argv): string[] | undefined {
+  if (argv.some((a) => a === "--no-extensions" || a === "-ne")) return ["codemode", "tool-search", "mcp"];
+  return mcpRequested && !argv.includes("--no-mcp") ? undefined : ["mcp"];
 }
 
 /**
@@ -331,10 +370,29 @@ export function installExtensionToolScope(
     return keep;
   };
 
+  // Names this agent selects explicitly: its built-ins, injected tools, and
+  // `ext:foo/bar` narrowings. Pi activates a named tool even when it is
+  // `defaultActive: false`, as `--tools` does.
+  const named = new Set([...toolNames, ...readmitToolNames, ...[...narrowing.values()].flatMap((s) => [...s])]);
+
+  // Activate what Pi itself would: only tools declared to the model (`direct`/
+  // `model-only` exposure), and of those only named ones or ones not opted out
+  // with `defaultActive: false`. `codemode`/`deferred` tools (Pi's MCP tools by
+  // default) stay undeclared until their extension or `tool_search` activates
+  // them — so an already-active in-scope tool is kept, or turn_end would undo that.
   const renarrow = () => {
     const allowed = inScope();
-    const next = session.getAllTools().map((t) => t.name).filter((n) => allowed.has(n));
     const current = session.getActiveToolNames();
+    const active = new Set(current);
+    const next = session
+      .getAllTools()
+      .filter(({ name, exposure = "direct" }) => {
+        if (!allowed.has(name)) return false;
+        if (active.has(name)) return true;
+        if (exposure !== "direct" && exposure !== "model-only") return false;
+        return named.has(name) || session.getToolDefinition(name)?.defaultActive !== false;
+      })
+      .map((t) => t.name);
     // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
     // the no-op that steady-state turns would otherwise pay for every turn.
     if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
@@ -599,6 +657,7 @@ export interface RunOptions {
   model?: Model<any>;
   maxTurns?: number;
   signal?: AbortSignal;
+  /** Applies only when the agent file leaves `isolated:` unset — frontmatter is authoritative. */
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -819,29 +878,47 @@ export async function runAgent(
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
+  // Everything this run needs from the parent's context, read before the first
+  // await: a background agent keeps running across a session switch, and Pi
+  // invalidates the old session's ctx then (every read throws). The values are
+  // the parent's as of the spawn — its current model and thinking level.
+  const parent = {
+    cwd: ctx.cwd,
+    projectTrusted: isProjectTrustedBy(ctx),
+    systemPrompt: ctx.getSystemPrompt(),
+    model: ctx.model,
+    modelRegistry: ctx.modelRegistry,
+    thinkingLevel: ctx.thinkingLevel,
+    sessionFile: ctx.sessionManager?.getSessionFile?.(),
+    conversation: options.inheritContext ? buildParentContext(ctx) : "",
+  };
+
   // Resolve working directory: worktree override > parent cwd
-  const effectiveCwd = options.cwd ?? ctx.cwd;
+  const effectiveCwd = options.cwd ?? parent.cwd;
   // Filesystem work happens in effectiveCwd; config discovery in configCwd.
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
-  const projectTrusted = isProjectTrustedBy(ctx);
+  const projectTrusted = parent.projectTrusted;
 
   // Get parent system prompt for append-mode agents
-  const parentSystemPrompt = ctx.getSystemPrompt();
+  const parentSystemPrompt = parent.systemPrompt;
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
 
+  // Resolved here, not by each caller: mention and RPC spawns pass no `isolated`,
+  // and the agent file's value must hold on every path.
+  const isolated = agentConfig?.isolated ?? options.isolated;
   // Resolve extensions/skills: isolated overrides to false
-  const extensions = options.isolated ? false : config.extensions;
+  const extensions = isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
   // isolation is an intentional override, not a misconfiguration.
-  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-  const skills = options.isolated ? false : config.skills;
+  const excludeExtensions = isolated ? undefined : config.excludeExtensions;
+  const skills = isolated ? false : config.skills;
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
@@ -913,7 +990,7 @@ export async function runAgent(
   // which extensions load. `ext:foo` against an extension that `extensions:` excluded
   // is an orphan and warns after reload. `isolated` means no extension tools at all.
   const { extNames, narrowing } = parseExtSelectors(
-    options.isolated ? [] : (agentConfig?.extSelectors ?? []),
+    isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
   const noExtensions = extensions === false;
 
@@ -983,7 +1060,11 @@ export async function runAgent(
     settingsManager,
     noExtensions,
     additionalExtensionPaths,
-    extensionFactories: toolScopeGuard ? [toolScopeGuard.extension] : undefined,
+    extensionFactories: [
+      ...builtinExtensionFactories(),
+      ...(toolScopeGuard ? [toolScopeGuard.extension] : []),
+    ],
+    disabledBuiltinExtensions: disabledBuiltinExtensions(keepNames.has("builtin:mcp")),
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -1031,7 +1112,8 @@ export async function runAgent(
   // flags path-like and "*" entries — excludes are plain names only.
   if (hasExcludes && discoveredNames) {
     for (const name of excludeNames) {
-      if (!discoveredNames.has(name)) {
+      // A disabled built-in (MCP, by default) is never discovered, and excluding it is still valid.
+      if (!discoveredNames.has(name) && !BUILTIN_EXTENSION_PATHS.has(name)) {
         options.onToolActivity?.({
           type: "end",
           toolName: `extension-error:exclude_extensions: "${name}" for agent "${type}" did not match any discovered extension`,
@@ -1065,7 +1147,7 @@ export async function runAgent(
 
   // Resolve model: explicit option > config.model > parent model
   const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
+    parent.model, parent.modelRegistry, agentConfig?.model,
   );
 
   // Omitting this SDK option uses saved settings, not the live parent's effort.
@@ -1073,7 +1155,7 @@ export async function runAgent(
   // unless explicitly overridden: neither the parent's current level nor the
   // type's frontmatter (which may have changed since) replaces it.
   const thinkingLevel = options.thinkingLevel
-    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? ctx.thinkingLevel);
+    ?? (options.resumeSessionFile ? undefined : agentConfig?.thinking ?? parent.thinkingLevel);
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -1091,7 +1173,7 @@ export async function runAgent(
   const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
     ? options.nestedRuntime
     : undefined;
-  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !isolated
     ? createNestedSubagentTools({
         manager: nestedRuntime.manager,
         pi: options.pi,
@@ -1210,14 +1292,14 @@ export async function runAgent(
           // `persist_session: true` agent; now it runs for every spawn, so a
           // context without a session manager (a bare programmatic ctx) must
           // still persist rather than take the whole spawn down.
-          parentSession: ctx.sessionManager?.getSessionFile?.(),
+          parentSession: parent.sessionFile,
         })
       : SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
-  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
+  const parentModelRuntime = (parent.modelRegistry as unknown as { runtime?: unknown }).runtime;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
     modelRuntime?: unknown;
@@ -1226,7 +1308,7 @@ export async function runAgent(
     agentDir,
     sessionManager,
     settingsManager,
-    modelRegistry: ctx.modelRegistry,
+    modelRegistry: parent.modelRegistry,
     // `as never` is what keeps this assignable across the supported Pi range:
     // pre-0.80.8 the field exists only via the `modelRuntime?: unknown` shim
     // above, while newer Pi types it as `ModelRuntime` — a shape an opaque
@@ -1286,11 +1368,8 @@ export async function runAgent(
 
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
+  if (options.inheritContext && parent.conversation) {
+    effectivePrompt = parent.conversation + prompt;
   }
 
   let structuredRetried = false;

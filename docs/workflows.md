@@ -70,7 +70,7 @@ A **card in the transcript**, updating as the run goes:
 
 A **`workflow` row in FleetView**, above the agents, carrying its agent counts where a description would go. `⏎` on it opens the inspector rather than a conversation overlay.
 
-Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
+Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited. By default (`allowModelOverride` off) a script's `model` and `effort` are ignored and every child runs on the main session's current model and thinking level, unless its agent definition sets its own.
 
 The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
@@ -105,10 +105,10 @@ Every run journals each settled `agent()` call beside its script as `<run id>.wo
 
 Four things it will not do:
 
-- **Cross sessions.** The journal is keyed to the session that wrote it. Restart pi and the run id is dead — you get `No workflow run "<id>" in this session.`
+- **Cross sessions.** The journal is keyed to the session that wrote it; another session gets `No workflow run "<id>" in this session.` A restart, `/resume` or `/reload` of the same session keeps it: the run is found by its journal and saved script in the session's task directory.
 - **Resume a live run.** Stop it from `/agents → Workflows` first; while it is running you get `Workflow "<id>" is still running.`
 - **Replay a failure.** A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. That is the point.
-- **Replay a run that used `agent({ resume })` at all.** A replayed agent is text from a file rather than a live child, so there would be no conversation left for a later `resume` to continue.
+- **Replay a run whose `agent({ resume })` calls cannot be continued.** A replayed agent is text from a file rather than a live child. Each journal entry records the agent that produced it (`ref`), and the parent session records that agent's resume state, so a later `resume` of a replayed child reopens its conversation from its session file — also after a restart. A journal written before `ref` existed is declined whole if it used `resume`.
 
 Replayed rows are annotated `from resume journal` on the card and in the inspector, and the completion notification counts them — a resume never quietly looks like a run that was simply fast. Passing only `resumeFromRunId`, with no script of its own, re-runs that run's own script.
 
@@ -243,7 +243,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent. The child's branch (and its worktree, when kept) is listed under `<worktrees>` in the run's completion notification, for schema'd and failed children too; a failed child's error names it as well |
+| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent. Only this option decides, as in Claude Code — an agent file's `isolation:` does not apply to workflow children (its `isolated:` does). The child's branch (and its worktree, when kept) is listed under `<worktrees>` in the run's completion notification, for schema'd and failed children too; a failed child's error names it as well |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error. With `isolation: "worktree"` it runs in the agent's worktree after its changes are committed, and what the command itself changes is discarded |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
