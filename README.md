@@ -98,10 +98,24 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
 - In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
   was evicted.
 
+### Model and thinking level
+
+A subagent runs on the parent's current model at the parent's current thinking level, on every spawn path: the `Agent`
+tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. For a nested agent the
+parent is the agent that spawned it.
+
+- An agent file's own `model:` or `thinking:` is your configuration and always applies.
+- Per-call choices are ignored by default: the `Agent` tool and the nested tool do not offer `model` or `thinking`,
+  workflow `agent({ model, effort })` is ignored, and so are a scheduled job's and an RPC spawn's model and thinking
+  level. This keeps the main model from picking cheaper models or lower effort on its own.
+- A resumed agent keeps the model and thinking level it ran with.
+- `allowModelOverride: true` (project or global `subagents.json`, or `/agents → Settings → Model override`) restores the
+  per-call overrides and the tool parameters. The resolution changes at once; the tool parameters at the next session.
+
 ### Custom agents
 
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
-model and thinking level unless their definition or call overrides them.
+model and thinking level unless their definition sets one (see [Model and thinking level](#model-and-thinking-level)).
 
 `isolated: true` (on a call or in an agent file) removes extension and MCP tools, skills, `ext:` selectors and nested
 delegation. It is not a sandbox: the agent still inherits Pi's environment variables (including provider keys its
@@ -142,6 +156,7 @@ To have them follow Pi's project trust decision instead, set `"projectTrust": "p
 | Setting | Default | Meaning |
 |---|---|---|
 | Background concurrency (`/agents → Settings`) | `10` | How many background agents run at once. |
+| Model override (`/agents → Settings`, `allowModelOverride`) | `false` | Whether a spawn's own `model` / `thinking` (Agent tool, nested tool, workflow `agent()`, scheduled jobs, RPC) may choose the subagent's model and thinking level. Off: subagents run on the parent's current model and level unless their agent file sets one, and the tools do not offer the parameters. |
 | Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call is killed at the limit and the agent sees the timeout; any other tool still running a minute later is stopped and the agent is told to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none; a timeout the main agent asks for is kept. |
 
 ## Notes

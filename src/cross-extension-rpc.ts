@@ -14,6 +14,7 @@
  */
 
 import { isTopLevelAgent } from "./agent-manager.js";
+import { isModelOverrideAllowed } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
@@ -113,6 +114,13 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // agent's auth lookup doesn't crash with "No API key found for
       // undefined".
       let normalizedOptions = options ?? {};
+      // Per-call model and thinking choices are refused unless the user turned
+      // on `allowModelOverride`: the agent runs on the parent's current model
+      // and level (or its agent file's), on this path as on every other.
+      if (!isModelOverrideAllowed()) {
+        const { model: _model, thinkingLevel: _thinking, ...rest } = normalizedOptions;
+        normalizedOptions = rest;
+      }
       // `!= null` on purpose: a JSON-forwarding caller can serialize an unset
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.

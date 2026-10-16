@@ -200,3 +200,29 @@ Use this tool for multi-step orchestration where control flow should be determin
 ## Resume
 
 The tool result includes a runId. To resume after a pause, kill, or script edit, relaunch with SubagentWorkflow({scriptPath, resumeFromRunId}) — the longest unchanged prefix of agent() calls returns cached results instantly; the first edited/new call and everything after it runs live. Same script + same args → 100% cache hit. It is a prefix and not a lookup: a later call that still matches is not reused once an earlier one has changed. A journaled failure ends the prefix, so resuming a run that died at agent 5 retries exactly agent 5. Same session only, and the run must have finished — stop it from /agents → Workflows first. Before diagnosing why a completed workflow returned an empty or unexpected result, Read the run's \`<run id>.workflow.jsonl\` beside its script — it records each agent's actual return value; do not assume cached results are non-empty. Date.now()/Math.random()/new Date() are unavailable in scripts (they would break this) — stamp results after the workflow returns, or pass timestamps via args.`;
+
+/** The clauses that teach `opts.model` / `opts.effort`, replaced when overrides are off. */
+const MODEL_SENTENCE =
+  "opts.model overrides the model for this agent call. Default to omitting it — the agent inherits the main-loop model (the resolved session model), which is almost always correct. Only set it when you're highly confident a different tier fits the task; when unsure, omit.";
+const EFFORT_SENTENCE =
+  "opts.effort overrides the reasoning effort for this agent call ('minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') — omit to inherit the agent definition's own level, then the parent's; use 'low' for cheap mechanical stages and higher tiers only for the hardest verify/judge stages.";
+const PHASE_MODEL_SENTENCE = " Add `model` to a phase entry when that phase uses a specific model override.";
+
+/**
+ * The description for the current `allowModelOverride` setting. With overrides
+ * on it is {@link fullWorkflowToolDescription} unchanged. With them off (the
+ * default) the host ignores `opts.model` and `opts.effort`, so the text says so
+ * instead of teaching the model to pick tiers, and its example stops passing
+ * an effort.
+ */
+export function workflowToolDescription(allowModelOverride: boolean): string {
+  if (allowModelOverride) return fullWorkflowToolDescription;
+  return fullWorkflowToolDescription
+    .replace(
+      MODEL_SENTENCE,
+      "opts.model and opts.effort are ignored in this project: every agent runs on the main session's current model and reasoning effort, unless its agent definition sets its own — omit both.",
+    )
+    .replace(` ${EFFORT_SENTENCE}`, "")
+    .replace(PHASE_MODEL_SENTENCE, "")
+    .replace("gate: 'npm test', effort: 'low'}", "gate: 'npm test'}");
+}

@@ -27,7 +27,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { useTreeKillingExec } from "./exec-tree.js";
 import { GroupJoinManager } from "./group-join.js";
-import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { isModelOverrideAllowed, isolationParam, resolveAgentInvocationConfig, resolveJoinMode, setModelOverrideAllowed } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
@@ -76,7 +76,7 @@ import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { readWorkflowScriptFile } from "./workflow/script-file.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, pruneSettledWorkflowTasks, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
-import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
+import { workflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, MERGED_BRANCH_MAX_AGE_DAYS, pruneMergedAgentBranches, recoverLeftoverWorktrees, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
@@ -831,6 +831,14 @@ export default function (pi: ExtensionAPI) {
     delete safeOptions.reclaim;
     // Internal to a reopen, like `reclaim`: it seeds an agent's lifetime figures.
     delete safeOptions.carry;
+    // A caller's model and thinking level are per-call overrides, which
+    // `allowModelOverride` (off by default) refuses on every spawn path: the
+    // agent then runs on the parent's current model and level, or its agent
+    // file's.
+    if (!isModelOverrideAllowed()) {
+      delete safeOptions.model;
+      delete safeOptions.thinkingLevel;
+    }
     // Every spawn through here is DETACHED — the caller gets an id back and
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
@@ -1630,6 +1638,7 @@ export default function (pi: ExtensionAPI) {
     setBackgroundByDefault,
     setSchedulingEnabled,
     setScopeModels: setScopeModelsEnabled,
+    setAllowModelOverride: setModelOverrideAllowed,
     setStrictAgentFiles: (b) => { strictAgentFiles = b; },
     setDisableDefaultAgents: setDisableDefaultAgents,
     setToolDescriptionMode: setToolDescriptionMode,
@@ -1723,6 +1732,28 @@ export default function (pi: ExtensionAPI) {
     ? `\n- Use isolation: "worktree" to give the agent its own git worktree (safe parallel file modifications); leave it unset, or pass "off", for none. The worktree is removed when the agent finishes; if it made changes, they are committed to a branch and the branch is named in the result.`
     : "";
 
+  // Same trade again, for `allowModelOverride`: with overrides off the `model`
+  // and `thinking` parameters are not in the schema, so the prose that teaches
+  // them goes too — a model told it may pick a model will keep trying.
+  const modelOverrideAllowed = isModelOverrideAllowed();
+  const modelGuideline = modelOverrideAllowed
+    ? `- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").\n- Use thinking to control extended thinking level.\n`
+    : "";
+  const modelParamShape = {
+    model: Type.Optional(
+      Type.String({
+        description:
+          'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+      }),
+    ),
+    thinking: Type.Optional(
+      Type.String({
+        description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+      }),
+    ),
+  };
+  const modelParams: Partial<typeof modelParamShape> = modelOverrideAllowed ? modelParamShape : {};
+
   const isolationCompactGuideline = isWorktreeIsolationEnabled()
     ? `\n- isolation: "worktree" gives the agent its own git worktree (removed on completion); changes land on a branch named in the result.`
     : "";
@@ -1768,9 +1799,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
+${modelGuideline}- Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -1796,6 +1825,7 @@ Terse command-style prompts produce shallow, generic work.
       agentDir: getAgentDir,
       isolationGuideline: () => isolationGuideline,
       scheduleGuideline: () => scheduleGuideline,
+      modelGuideline: () => modelGuideline,
     };
     // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
     return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
@@ -1863,17 +1893,7 @@ Terse command-style prompts produce shallow, generic work.
       subagent_type: Type.String({
         description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
       }),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
-        }),
-      ),
+      ...modelParams,
       max_turns: Type.Optional(
         Type.Number({
           description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
@@ -2208,7 +2228,9 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            // Only when overrides are on: a job keeps the call's model choice
+            // for every later fire, which is exactly what the setting refuses.
+            model: isModelOverrideAllowed() ? (params as { model?: string }).model : undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -2731,7 +2753,7 @@ Terse command-style prompts produce shallow, generic work.
   const workflowTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.WORKFLOW,
     label: "SubagentWorkflow",
-    description: renderToolDescriptionTemplate(fullWorkflowToolDescription),
+    description: renderToolDescriptionTemplate(workflowToolDescription(isModelOverrideAllowed())),
     promptSnippet: "Run a deterministic script that orchestrates many subagents",
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
@@ -3794,6 +3816,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
+      allowModelOverride: isModelOverrideAllowed(),
       strictAgentFiles,
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
@@ -3934,6 +3957,16 @@ Write the file using the write tool. Only write the file, nothing else.`;
           label: "Scope models",
           description: "Validate subagent models against scoped models (/scoped-models)",
           currentValue: isScopeModelsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "allowModelOverride",
+          label: "Model override",
+          description:
+            "Let Agent calls, workflows and scheduled jobs pick a subagent's model and thinking level; "
+            + "off runs every subagent on your current model and thinking level unless its agent file sets one "
+            + "(the tool parameters change on next pi session)",
+          currentValue: isModelOverrideAllowed() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -4132,6 +4165,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
         notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
+      } else if (id === "allowModelOverride") {
+        const enabled = value === "on";
+        setModelOverrideAllowed(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Subagent calls may pick a model and thinking level. Tool spec change takes effect on next pi session."
+            : "Subagents run on your current model and thinking level. Tool spec change takes effect on next pi session.",
+        );
       } else if (id === "strictAgentFiles") {
         const enabled = value === "on";
         strictAgentFiles = enabled;

@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 import { SubagentScheduler } from "../src/schedule.js";
 import { ScheduleStore } from "../src/schedule-store.js";
 
@@ -350,22 +351,43 @@ describe("SubagentScheduler — fire path", () => {
     // A scheduled run has no tool call to build one, so without this the
     // conversation viewer can say nothing about how the job was configured.
     // The model is left out on purpose: agent-manager fills in the effective one
-    // once the session reports it.
+    // once the session reports it. The job's level counts only under
+    // allowModelOverride.
+    setModelOverrideAllowed(true);
+    try {
+      scheduler.addJob({
+        name: "every-1m", description: "x", schedule: "1m",
+        subagent_type: "general-purpose", prompt: "x",
+        thinking: "high", max_turns: 12, isolated: true,
+      });
+
+      vi.advanceTimersByTime(60_000);
+      const optsArg = manager.spawn.mock.calls[0][4];
+      expect(optsArg.thinkingLevel).toBe("high");
+      expect(optsArg.invocation).toEqual({
+        thinking: "high",
+        maxTurns: 12,
+        isolated: true,
+        runInBackground: true,
+        isolation: undefined,
+      });
+    } finally {
+      setModelOverrideAllowed(false);
+    }
+  });
+
+  it("fire ignores a job's model and thinking level while overrides are off (the default)", () => {
     scheduler.addJob({
       name: "every-1m", description: "x", schedule: "1m",
       subagent_type: "general-purpose", prompt: "x",
-      thinking: "high", max_turns: 12, isolated: true,
+      model: "anthropic/claude-haiku", thinking: "high",
     });
 
     vi.advanceTimersByTime(60_000);
     const optsArg = manager.spawn.mock.calls[0][4];
-    expect(optsArg.invocation).toEqual({
-      thinking: "high",
-      maxTurns: 12,
-      isolated: true,
-      runInBackground: true,
-      isolation: undefined,
-    });
+    expect(optsArg.model).toBeUndefined();
+    expect(optsArg.thinkingLevel).toBeUndefined();
+    expect(optsArg.invocation.thinking).toBeUndefined();
   });
 
   it("fire normalizes an unlimited turn budget out of the snapshot", () => {

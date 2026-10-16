@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
 // These tests pin `projectTrust: "pi"` (follow Pi's trust decision); the default, "full", trusts every project.
 vi.mock("../src/settings.js", async (importOriginal) => ({
@@ -104,7 +105,10 @@ const execResult = (overrides: Partial<{ stdout: string; stderr: string; code: n
  * ------------------------------------------------------------------------- */
 
 describe("createWorkflowHost — spawn mapping", () => {
+  afterEach(() => { setModelOverrideAllowed(false); });
   beforeEach(() => {
+    // Per-call model/thinking overrides are off by default (allowModelOverride).
+    setModelOverrideAllowed(true);
     // The host resolves agent types through the process-wide registry, the same
     // one the Agent tool uses. Seed it with the shipped defaults.
     registerAgents(new Map());
@@ -382,6 +386,8 @@ describe("createWorkflowHost — scopeModels", () => {
     });
 
   beforeEach(() => {
+    // Per-call model/thinking overrides are off by default (allowModelOverride).
+    setModelOverrideAllowed(true);
     // `resolveEnabledModels` memoizes on the patterns plus the mtime/size of
     // both settings files, so one case's allowlist would otherwise be served to
     // the next — a fresh project dir per test is what invalidates it. Same
@@ -412,6 +418,7 @@ describe("createWorkflowHost — scopeModels", () => {
   });
 
   afterEach(() => {
+    setModelOverrideAllowed(false);
     setScopeModelsEnabled(prevEnabled); // module-global — restore for other suites
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;

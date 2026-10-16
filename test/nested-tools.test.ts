@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
@@ -86,6 +87,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setScopeModelsEnabled(false);
+  setModelOverrideAllowed(false);
   rmSync(cwd, { recursive: true, force: true });
 });
 
@@ -186,6 +188,8 @@ describe("child-safe nested Agent tools", () => {
       JSON.stringify({ enabledModels: ["anthropic/allowed"] }),
     );
     setScopeModelsEnabled(true);
+    // A caller-supplied model is honoured only under allowModelOverride.
+    setModelOverrideAllowed(true);
     const [agent] = tools();
 
     const blocked = await execute(agent, {
@@ -205,6 +209,26 @@ describe("child-safe nested Agent tools", () => {
       model: "anthropic/allowed",
     });
     expect(inScope.isError).toBe(false);
+  });
+
+  it("offers no model or thinking parameter and ignores both while overrides are off (the default)", async () => {
+    const [agent] = tools();
+    expect(Object.keys(agent.parameters.properties)).not.toContain("model");
+    expect(Object.keys(agent.parameters.properties)).not.toContain("thinking");
+
+    const parentModel = MODELS[0];
+    const result = await agent.execute(
+      "call-1",
+      { subagent_type: "scout", description: "find files", prompt: "Find them", model: "anthropic/blocked", thinking: "minimal" },
+      undefined,
+      undefined,
+      { ...ctx(), model: parentModel },
+    );
+    expect(result.isError).toBe(false);
+    const options = spawnAndWait.mock.calls[0][4];
+    // The parent agent's own model (its ctx's); no level, so the runner uses the parent's.
+    expect(options.model).toBe(parentModel);
+    expect(options.thinkingLevel).toBeUndefined();
   });
 
   it("queues a steer for an owned child whose session is not ready yet", async () => {

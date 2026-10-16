@@ -21,6 +21,7 @@ import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
 import { normalizeMaxTurns } from "./agent-runner.js";
 import { resolveSpawnType } from "./agent-types.js";
+import { isModelOverrideAllowed } from "./invocation-config.js";
 import { type LongTimer, setLongTimeout } from "./long-timer.js";
 import { resolveModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
@@ -311,7 +312,12 @@ export class SubagentScheduler {
     // job was created (auth added/removed). Fall back silently to spawn-default
     // if resolution fails; the spawn path handles undefined model gracefully.
     let resolvedModel: any | undefined;
-    if (job.model) {
+    // A job's model and thinking level came from the call that scheduled it,
+    // so they count only while `allowModelOverride` is on; otherwise each fire
+    // runs on the parent's current model and level, like any other spawn.
+    const overridesAllowed = isModelOverrideAllowed();
+    const thinking = overridesAllowed ? job.thinking : undefined;
+    if (job.model && overridesAllowed) {
       const r = resolveModel(job.model, ctx.modelRegistry);
       if (typeof r !== "string") resolvedModel = r;
     }
@@ -333,7 +339,7 @@ export class SubagentScheduler {
         model: resolvedModel,
         maxTurns: job.max_turns,
         isolated: job.isolated,
-        thinkingLevel: job.thinking,
+        thinkingLevel: thinking,
         isolation: job.isolation,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
@@ -341,7 +347,7 @@ export class SubagentScheduler {
         // one when the session reports it, and naming the pre-session pick here
         // would only be right until then.
         invocation: {
-          thinking: job.thinking,
+          thinking,
           // Normalized like the Agent tool's own snapshot: `0` means unlimited,
           // and rendering it as "max turns: 0" would read as a limit of none.
           maxTurns: normalizeMaxTurns(job.max_turns),

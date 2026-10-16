@@ -97,6 +97,19 @@ export interface SubagentsSettings {
    */
   scopeModels?: boolean;
   /**
+   * Whether a spawn may choose its own model and thinking level: the Agent
+   * tool's `model` / `thinking` parameters, the nested tool's, workflow
+   * `agent({ model, effort })`, scheduled jobs and cross-extension RPC spawns.
+   * Defaults to `false`: every subagent runs on the parent's current model at
+   * the parent's current thinking level, unless its agent file sets `model:` or
+   * `thinking:`, and the parameters are not offered in the tool schemas, so the
+   * main model does not pick cheaper models or lower effort on its own. A
+   * resumed agent keeps the model and level it ran with either way. `true`
+   * restores the per-call overrides and the schema parameters (the schemas
+   * change at the next pi session).
+   */
+  allowModelOverride?: boolean;
+  /**
    * When true, an unreadable or unparseable agent `.md` aborts extension load
    * instead of being skipped with a warning — pi exits, naming the file.
    *
@@ -337,6 +350,7 @@ export interface SettingsAppliers {
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
+  setAllowModelOverride: (b: boolean) => void;
   setStrictAgentFiles: (b: boolean) => void;
   setDisableDefaultAgents: (b: boolean) => void;
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
@@ -433,6 +447,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.scopeModels === "boolean") {
     out.scopeModels = r.scopeModels;
+  }
+  if (typeof r.allowModelOverride === "boolean") {
+    out.allowModelOverride = r.allowModelOverride;
   }
   if (typeof r.strictAgentFiles === "boolean") {
     out.strictAgentFiles = r.strictAgentFiles;
@@ -570,6 +587,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);
+  if (typeof s.allowModelOverride === "boolean") appliers.setAllowModelOverride(s.allowModelOverride);
   if (typeof s.strictAgentFiles === "boolean") appliers.setStrictAgentFiles(s.strictAgentFiles);
   if (typeof s.disableDefaultAgents === "boolean") appliers.setDisableDefaultAgents(s.disableDefaultAgents);
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);

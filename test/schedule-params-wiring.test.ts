@@ -14,6 +14,7 @@
  * `addJob`, so the assertion covers persistence too.
  */
 import { describe, expect, it, vi } from "vitest";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -67,18 +68,38 @@ async function scheduleAndReadBack(
 
 describe("Agent tool → persisted scheduled job", () => {
   it("persists the run-shaping params the job will fire with", async () => {
+    // The call's thinking level is kept only under allowModelOverride.
+    setModelOverrideAllowed(true);
+    try {
+      const { job, restore } = await scheduleAndReadBack({
+        subagent_type: "general-purpose",
+        thinking: "high",
+        isolated: true,
+        isolation: "worktree",
+      });
+      try {
+        expect(job.thinking).toBe("high");
+        expect(job.isolated).toBe(true);
+        expect(job.isolation).toBe("worktree");
+        expect(job.prompt).toBe("do the thing");
+        expect(job.enabled).toBe(true);
+      } finally {
+        restore();
+      }
+    } finally {
+      setModelOverrideAllowed(false);
+    }
+  });
+
+  it("does not persist the call's model or thinking level while overrides are off (the default)", async () => {
     const { job, restore } = await scheduleAndReadBack({
       subagent_type: "general-purpose",
       thinking: "high",
-      isolated: true,
-      isolation: "worktree",
+      model: "anthropic/claude-haiku",
     });
     try {
-      expect(job.thinking).toBe("high");
-      expect(job.isolated).toBe(true);
-      expect(job.isolation).toBe("worktree");
-      expect(job.prompt).toBe("do the thing");
-      expect(job.enabled).toBe(true);
+      expect(job.thinking).toBeUndefined();
+      expect(job.model).toBeUndefined();
     } finally {
       restore();
     }

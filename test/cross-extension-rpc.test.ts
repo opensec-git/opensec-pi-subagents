@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+import { setModelOverrideAllowed } from "../src/invocation-config.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "../src/model-scope.js";
 
 /** Simple in-process event bus for testing. */
@@ -368,8 +369,30 @@ describe("cross-extension RPC", () => {
     };
 
     beforeEach(() => {
+      // Per-call model overrides are off by default (allowModelOverride).
+      setModelOverrideAllowed(true);
       ctx = { session: true, modelRegistry: registry };
       deps = { events, pi: { events }, getCtx: () => ctx, manager };
+    });
+
+    afterEach(() => { setModelOverrideAllowed(false); });
+
+    it("ignores a model and thinking level on the payload while overrides are off (the default)", async () => {
+      setModelOverrideAllowed(false);
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-off", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-off", type: "general-purpose", prompt: "x",
+        // Unresolvable on purpose: with overrides off it is never looked up.
+        options: { model: "nope/unknown", thinkingLevel: "minimal", description: "d" },
+      });
+      await new Promise(r => setTimeout(r, 10));
+      expect(reply).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+      const options = vi.mocked(manager.spawn).mock.calls[0][4];
+      expect(options).not.toHaveProperty("model");
+      expect(options).not.toHaveProperty("thinkingLevel");
+      expect(options).toMatchObject({ description: "d" });
     });
 
     it("resolves a string model to a Model instance before manager.spawn", async () => {
@@ -492,11 +515,13 @@ describe("cross-extension RPC", () => {
         JSON.stringify({ enabledModels: ["openai-codex/gpt-5.5"] }),
       );
       setScopeModelsEnabled(true);
+      setModelOverrideAllowed(true);
       ctx = { session: true, cwd: projectDir, modelRegistry: registry };
       deps = { events, pi: { events }, getCtx: () => ctx, manager };
     });
 
     afterEach(() => {
+      setModelOverrideAllowed(false);
       setScopeModelsEnabled(prevEnabled); // module-global — restore for other suites
       if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
