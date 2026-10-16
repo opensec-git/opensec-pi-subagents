@@ -38,6 +38,7 @@ import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
+import { isProjectCodeTrusted, isProjectTrustedBy } from "../project-trust.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
@@ -410,7 +411,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
      * comes back is a workflow; this only finds it.
      */
     loadWorkflow(ref) {
-      return resolveWorkflowSource(ref, ctx.cwd);
+      return resolveWorkflowSource(ref, ctx.cwd, isProjectCodeTrusted(isProjectTrustedBy(ctx), ctx.cwd));
     },
 
     // Reached only for a gate the spawn did not already run — a child with no

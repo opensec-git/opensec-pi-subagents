@@ -24,6 +24,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { DEFAULT_AGENTS } from "./default-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -32,9 +33,10 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -432,13 +434,19 @@ export default function (pi: ExtensionAPI) {
       "Use the `=` form — the space form consumes the next argument, which would swallow a following prompt.",
   });
 
+  // Whether this extension may read the project's own files (agents, skills,
+  // workflows, subagents.json). The extension activates before Pi has asked the
+  // user about trust, so startup goes by Pi's predicted decision and
+  // session_start replaces it with the real one (`syncProjectTrust`).
+  let projectTrusted = predictProjectTrust(process.cwd());
+
   // Read directly rather than waiting for applyAndEmitLoaded below: this decides
   // the initial load, which happens hundreds of lines before settings are applied.
-  let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
+  let strictAgentFiles = loadSettings(process.cwd(), projectTrusted).strictAgentFiles === true;
 
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
-    const userAgents = loadCustomAgents(process.cwd(), strict);
+    const userAgents = loadCustomAgents(process.cwd(), strict, { project: projectTrusted });
     registerAgents(userAgents);
   };
 
@@ -847,6 +855,7 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    syncProjectTrust(ctx);
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1485,9 +1494,13 @@ export default function (pi: ExtensionAPI) {
       const cfg = getAgentConfig(name);
       const modelSuffix = cfg?.model ? ` (${getModelLabelFromConfig(cfg.model)})` : "";
       const toolsSuffix = ` (Tools: ${formatToolsSuffix(cfg)})`;
-      return `- ${name}: ${cfg?.description ?? name}${modelSuffix}${toolsSuffix}`;
+      return `- ${name}: ${cfg?.description ?? name}${modelSuffix}${toolsSuffix}${overrideSuffix(name, cfg)}`;
     }).join("\n");
   };
+
+  /** Marks a project agent file that took over a built-in type, so the swap is visible where types are listed. */
+  const overrideSuffix = (name: string, cfg: AgentConfig | undefined): string =>
+    cfg?.source === "project" && DEFAULT_AGENTS.has(name) ? " (defined by this project, replacing the built-in)" : "";
 
   /** First sentence of an agent description — for the compact type list. */
   const firstSentence = (text: string): string => {
@@ -1499,7 +1512,7 @@ export default function (pi: ExtensionAPI) {
   const buildCompactTypeListText = () =>
     getAvailableTypes().map((name) => {
       const cfg = getAgentConfig(name);
-      return `- ${name}: ${firstSentence(cfg?.description ?? name)} (Tools: ${formatToolsSuffix(cfg)})`;
+      return `- ${name}: ${firstSentence(cfg?.description ?? name)} (Tools: ${formatToolsSuffix(cfg)})${overrideSuffix(name, cfg)}`;
     }).join("\n");
 
   /** Derive a short model label from a model string. */
@@ -1513,36 +1526,54 @@ export default function (pi: ExtensionAPI) {
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
-  applyAndEmitLoaded(
-    {
-      setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
-      setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
-      setDefaultMaxTurns,
-      setGraceTurns,
-      setToolTimeoutSeconds,
-      setDefaultJoinMode,
-      setBackgroundByDefault,
-      setSchedulingEnabled,
-      setScopeModels: setScopeModelsEnabled,
-      setStrictAgentFiles: (b) => { strictAgentFiles = b; },
-      setDisableDefaultAgents: setDisableDefaultAgents,
-      setToolDescriptionMode: setToolDescriptionMode,
-      setFleetView: setFleetViewEnabled,
-      setAgentMentions: setAgentMentionMode,
-      setRememberAgents,
-      setWidgetMode: setWidgetMode,
-      setOutputTranscript: setOutputTranscriptDefault,
-      setWorktreeIsolation: setWorktreeIsolationEnabled,
-      setWorkflowsEnabled: setWorkflowsEnabled,
-      setMaxSubagentDepth: setMaxSubagentDepth,
-      setFallbackSubagent: setFallbackSubagent,
-      setReportUsage,
-      setShowCost,
-      setShowModel,
-      setViewerMarkdown,
-    },
-    (event, payload) => pi.events.emit(event, payload),
-  );
+  const settingsAppliers: SettingsAppliers = {
+    setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
+    setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
+    setDefaultMaxTurns,
+    setGraceTurns,
+    setToolTimeoutSeconds,
+    setDefaultJoinMode,
+    setBackgroundByDefault,
+    setSchedulingEnabled,
+    setScopeModels: setScopeModelsEnabled,
+    setStrictAgentFiles: (b) => { strictAgentFiles = b; },
+    setDisableDefaultAgents: setDisableDefaultAgents,
+    setToolDescriptionMode: setToolDescriptionMode,
+    setFleetView: setFleetViewEnabled,
+    setAgentMentions: setAgentMentionMode,
+    setRememberAgents,
+    setWidgetMode: setWidgetMode,
+    setOutputTranscript: setOutputTranscriptDefault,
+    setWorktreeIsolation: setWorktreeIsolationEnabled,
+    setWorkflowsEnabled: setWorkflowsEnabled,
+    setMaxSubagentDepth: setMaxSubagentDepth,
+    setFallbackSubagent: setFallbackSubagent,
+    setReportUsage,
+    setShowCost,
+    setShowModel,
+    setViewerMarkdown,
+  };
+  applyAndEmitLoaded(settingsAppliers, (event, payload) => pi.events.emit(event, payload), process.cwd(), projectTrusted);
+
+  /**
+   * Replace the startup prediction with the session's real trust decision.
+   * A folder the user trusted at Pi's prompt gets its project agents and
+   * settings now; one Pi reports untrusted loses its project agents, and
+   * settings already applied from it stay until the next session.
+   */
+  function syncProjectTrust(ctx: ExtensionContext): void {
+    const trusted = isProjectTrustedBy(ctx);
+    if (trusted === projectTrusted) return;
+    projectTrusted = trusted;
+    if (trusted) applySettings(loadSettings(process.cwd()), settingsAppliers);
+    reloadCustomAgents();
+    if (!trusted && existsSync(join(process.cwd(), ".pi", "subagents.json"))) {
+      const message = "pi-subagents applied this project's .pi/subagents.json before Pi reported the folder as untrusted. " +
+        "Restart pi to drop those settings.";
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.warn(`[pi-subagents] ${message}`);
+    }
+  }
 
   // ---- Agent tool ----
 
@@ -1663,7 +1694,7 @@ Terse command-style prompts produce shallow, generic work.
 
   const loadCustomToolDescription = (): string | undefined => {
     for (const path of [
-      join(process.cwd(), ".pi", "agent-tool-description.md"),
+      ...(projectTrusted ? [join(process.cwd(), ".pi", "agent-tool-description.md")] : []),
       join(getAgentDir(), "agent-tool-description.md"),
     ]) {
       try {
@@ -2685,6 +2716,7 @@ Terse command-style prompts produce shallow, generic work.
           ? { scriptPath: resumeFrom.scriptPath }
           : params,
         ctx.cwd,
+        isProjectCodeTrusted(isProjectTrustedBy(ctx), ctx.cwd),
       );
       if (!resolved.ok) return textResult(resolved.message);
 

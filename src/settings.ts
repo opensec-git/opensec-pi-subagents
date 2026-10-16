@@ -509,9 +509,13 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
-/** Load merged settings: global provides defaults, project overrides. */
-export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
-  return { ...readSettingsFile(globalPath()), ...readSettingsFile(projectPath(cwd)) };
+/**
+ * Load merged settings: global provides defaults, project overrides.
+ * `project: false` reads the global file only — the project is not trusted,
+ * and Pi ignores its `.pi/settings.json` too.
+ */
+export function loadSettings(cwd: string = process.cwd(), project = true): SubagentsSettings {
+  return { ...readSettingsFile(globalPath()), ...(project ? readSettingsFile(projectPath(cwd)) : {}) };
 }
 
 /**
@@ -584,8 +588,9 @@ export function applyAndEmitLoaded(
   appliers: SettingsAppliers,
   emit: SettingsEmit,
   cwd: string = process.cwd(),
+  project = true,
 ): SubagentsSettings {
-  const settings = loadSettings(cwd);
+  const settings = loadSettings(cwd, project);
   applySettings(settings, appliers);
   emit("subagents:settings_loaded", { settings });
   return settings;

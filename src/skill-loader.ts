@@ -30,17 +30,26 @@ export interface PreloadedSkill {
   content: string;
 }
 
-export function preloadSkills(skillNames: string[], cwd: string): PreloadedSkill[] {
-  return skillNames.map((name) => ({ name, content: loadSkillContent(name, cwd) }));
+/**
+ * `project: false` skips the two project roots — the parent session does not
+ * trust the project, and Pi loads no project skills there either.
+ */
+export function preloadSkills(skillNames: string[], cwd: string, options: { project?: boolean } = {}): PreloadedSkill[] {
+  const project = options.project !== false;
+  return skillNames.map((name) => ({ name, content: loadSkillContent(name, cwd, project) }));
 }
 
-function loadSkillContent(name: string, cwd: string): string {
+function loadSkillContent(name: string, cwd: string, project: boolean): string {
   if (isUnsafeName(name)) {
     return `(Skill "${name}" skipped: name contains path traversal characters)`;
   }
   const roots = [
-    join(cwd, ".pi", "skills"), // project — Pi standard
-    join(cwd, ".agents", "skills"), // project — Agent Skills spec
+    ...(project
+      ? [
+          join(cwd, ".pi", "skills"), // project — Pi standard
+          join(cwd, ".agents", "skills"), // project — Agent Skills spec
+        ]
+      : []),
     join(getAgentDir(), "skills"), // user — Pi standard
     join(homedir(), ".agents", "skills"), // user — Agent Skills spec
     join(homedir(), ".pi", "skills"), // legacy global, pre-Pi
@@ -49,7 +58,9 @@ function loadSkillContent(name: string, cwd: string): string {
     const content = findInRoot(root, name);
     if (content !== undefined) return content;
   }
-  return `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`;
+  return project
+    ? `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`
+    : `(Skill "${name}" not found in global skill locations; project skills are not loaded because this project is not trusted)`;
 }
 
 function findInRoot(root: string, name: string): string | undefined {

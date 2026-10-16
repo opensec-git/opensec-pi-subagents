@@ -5,7 +5,8 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, isDefaultsDisabled } from "./agent-types.js";
+import { DEFAULT_AGENTS } from "./default-agents.js";
 import { createDiscoveryCache } from "./discovery-cache.js";
 import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
 
@@ -50,15 +51,34 @@ const readParsedAgent = createDiscoveryCache(
  * files can claim the same one; the later load wins, as it always has for a
  * filename clash, and `warnSkippedOverride` reports the substitution.
  */
-export function loadCustomAgents(cwd: string, strict = false): Map<string, AgentConfig> {
+export function loadCustomAgents(
+  cwd: string,
+  strict = false,
+  options: { project?: boolean } = {},
+): Map<string, AgentConfig> {
   const globalDir = join(getAgentDir(), "agents");
   const workspaceProjectDir = join(cwd, ".agents", "agents");
   const projectDir = join(cwd, ".pi", "agents");
 
   const agents = new Map<string, AgentConfig>();
   loadFromDir(globalDir, agents, "global", strict);            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
-  loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  // Project files only from a trusted project: Pi keeps the folder's own
+  // settings and extensions off until the user trusts it, and an agent file can
+  // set a prompt, tools, a model and extension paths just as well.
+  if (options.project !== false) {
+    loadFromDir(workspaceProjectDir, agents, "project", strict); // shared workspace
+    loadFromDir(projectDir, agents, "project", strict);          // highest priority (overwrites)
+  }
+
+  // A project file named like a built-in silently changes every default spawn
+  // of that type — say so, once per file.
+  if (!isDefaultsDisabled()) {
+    for (const [name, config] of agents) {
+      if (config.source === "project" && DEFAULT_AGENTS.has(name)) {
+        warnIfNew(`Project agent file ${config.sourcePath} replaces the built-in "${name}" agent`);
+      }
+    }
+  }
 
   warnedLastLoad = warnedThisLoad;
   warnedThisLoad = new Set();

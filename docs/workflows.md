@@ -124,6 +124,8 @@ A script you will run more than once belongs somewhere durable. Copy it out of t
 
 First hit wins, in that order, so a project file shadows a same-named global one.
 
+The two project locations are used only when Pi trusts the project to run its own code: the folder was trusted at Pi's prompt (or by `defaultProjectTrust`, or a CLI flag), or `/trust` recorded it. Pi trusts a folder without asking when it holds nothing Pi gates, and `.pi/workflows` is not gated, so a cloned repo that ships only workflows does not get them run by name until you run `/trust`. A refused name says so and runs nothing.
+
 The file must carry an `export const meta = { name, description }` declaration. Those are ordinary directories that may hold anything, so that declaration is what marks a file as a workflow — name something else and you are told it is not a workflow rather than getting a parse error from halfway through it. Nothing in the file is executed to decide that.
 
 Then invoke it by name: *"run the auth-audit workflow"*. The model passes `name: "auth-audit"` and the run reports that file back as its `Script:`, so the edit-and-re-run loop still works on it.
@@ -286,7 +288,7 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 |---|---|
 | An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
-| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
+| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins (project locations only in a project trusted to run its code) |
 
 The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only the third is durable, and copying a script there is a manual step.
 

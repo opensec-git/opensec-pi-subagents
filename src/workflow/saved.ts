@@ -14,6 +14,9 @@
  *   2. <cwd>/.agents/workflows/<name>.js
  *   3. getAgentDir()/workflows/<name>.js   (default ~/.pi/agent/workflows)
  *
+ * 1 and 2 are searched only when the project is trusted to run its own code
+ * (`isProjectCodeTrusted`): a saved workflow runs with full host access.
+ *
  * Precedence is expressed as first-hit-wins here, not last-write-wins as in the
  * agent loader, because a name resolves to one file — there is no map to
  * overwrite.
@@ -38,7 +41,7 @@
  */
 
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isSymlink, isUnsafeName, safeReadFile } from "../memory.js";
 import { hasMetaDeclaration } from "./meta.js";
@@ -47,13 +50,27 @@ import { MAX_SCRIPT_LENGTH, readWorkflowScriptFile } from "./script-file.js";
 /** Extension a saved workflow file carries. */
 const WORKFLOW_EXTENSION = ".js";
 
-/** The roots a `name` is looked up in, highest priority first. */
-export function savedWorkflowRoots(cwd: string): string[] {
-  return [
-    join(cwd, ".pi", "workflows"),
-    join(cwd, ".agents", "workflows"),
-    join(getAgentDir(), "workflows"),
-  ];
+/** The project's own roots, highest priority first. */
+function projectWorkflowRoots(cwd: string): string[] {
+  return [join(cwd, ".pi", "workflows"), join(cwd, ".agents", "workflows")];
+}
+
+/**
+ * The roots a `name` is looked up in, highest priority first.
+ *
+ * `project: false` leaves out the project's roots: a saved workflow runs with
+ * full host access, so a project's own scripts are used only once the project
+ * is trusted to run its code (see `isProjectCodeTrusted`).
+ */
+export function savedWorkflowRoots(cwd: string, project = true): string[] {
+  return [...(project ? projectWorkflowRoots(cwd) : []), join(getAgentDir(), "workflows")];
+}
+
+/** The project workflow `name` would have resolved to, had the project been trusted. */
+function untrustedProjectWorkflow(name: string, cwd: string): string | undefined {
+  return projectWorkflowRoots(cwd)
+    .map(root => join(root, `${name}${WORKFLOW_EXTENSION}`))
+    .find(path => !isSymlink(dirname(path)) && isReadableScript(path));
 }
 
 export type SavedWorkflow =
@@ -67,7 +84,7 @@ export type SavedWorkflow =
  * names that do exist — a model that guessed the name can correct itself from
  * the error instead of spending a turn asking.
  */
-export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
+export function readSavedWorkflow(name: string, cwd: string, project = true): SavedWorkflow {
   const trimmed = name.trim();
   if (isUnsafeName(trimmed)) {
     return {
@@ -78,7 +95,7 @@ export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
     };
   }
 
-  const roots = savedWorkflowRoots(cwd);
+  const roots = savedWorkflowRoots(cwd, project);
   for (const root of roots) {
     if (isSymlink(root)) continue; // reject a symlinked root entirely, as skill-loader does
     const path = join(root, `${trimmed}${WORKFLOW_EXTENSION}`);
@@ -98,7 +115,16 @@ export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
     return { ok: true, script, path };
   }
 
-  const known = listSavedWorkflows(cwd);
+  const blocked = project ? undefined : untrustedProjectWorkflow(trimmed, cwd);
+  if (blocked !== undefined) {
+    return {
+      ok: false,
+      message:
+        `"${blocked}" was not run: workflows saved in a project run only once the project is trusted to run its ` +
+        "own code. The user can trust it with /trust in pi. Nothing was run.",
+    };
+  }
+  const known = listSavedWorkflows(cwd, project);
   return {
     ok: false,
     message:
@@ -119,6 +145,7 @@ export function readSavedWorkflow(name: string, cwd: string): SavedWorkflow {
 export function resolveWorkflowSource(
   ref: { name?: string; scriptPath?: string },
   cwd: string,
+  project = true,
 ): SavedWorkflow {
   const path = ref.scriptPath?.trim();
   if (path !== undefined && path !== "") {
@@ -133,14 +160,14 @@ export function resolveWorkflowSource(
     }
   }
   const name = ref.name?.trim();
-  if (name !== undefined && name !== "") return readSavedWorkflow(name, cwd);
+  if (name !== undefined && name !== "") return readSavedWorkflow(name, cwd, project);
   return { ok: false, message: "A workflow reference needs a `name` or a `scriptPath`." };
 }
 
 /** Every saved workflow name, de-duplicated across roots and sorted. */
-export function listSavedWorkflows(cwd: string): string[] {
+export function listSavedWorkflows(cwd: string, project = true): string[] {
   const names = new Set<string>();
-  for (const root of savedWorkflowRoots(cwd)) {
+  for (const root of savedWorkflowRoots(cwd, project)) {
     if (!existsSync(root) || isSymlink(root)) continue;
     let entries: string[];
     try {
@@ -193,6 +220,7 @@ function isWorkflowFile(path: string): boolean {
 export function resolveWorkflowScript(
   params: { script?: string; scriptPath?: string; name?: string },
   cwd: string,
+  project = true,
 ): { ok: true; script: string; scriptPath?: string } | { ok: false; message: string } {
   const path = params.scriptPath?.trim();
   if (path !== undefined && path !== "") {
@@ -209,11 +237,11 @@ export function resolveWorkflowScript(
   // reference means.
   const name = params.name?.trim();
   if (name !== undefined && name !== "") {
-    const saved = resolveWorkflowSource({ name }, cwd);
+    const saved = resolveWorkflowSource({ name }, cwd, project);
     return saved.ok ? { ok: true, script: saved.script, scriptPath: saved.path } : saved;
   }
 
-  const known = listSavedWorkflows(cwd);
+  const known = listSavedWorkflows(cwd, project);
   return {
     ok: false,
     message:

@@ -635,14 +635,55 @@ const fileScript = 'export const meta = { name: "from-file", description: "file 
 /** Plain theme, so a rendered component can be asserted as text. */
 const plainTheme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
+describe("SubagentWorkflow tool — saved project workflows need a trusted project", () => {
+  let hermetic: Hermetic;
+  let tools: Map<string, any>;
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+  });
+
+  function boot(opts: { trusted?: boolean; untrustedSession?: boolean }) {
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: opts.trusted });
+    mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
+    writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
+    const booted = makePi();
+    subagentsExtension(booted.pi);
+    tools = booted.tools;
+    return ctx({ cwd: hermetic.dir, ...(opts.untrustedSession ? { isProjectTrusted: () => false } : {}) });
+  }
+
+  it("does not run a project workflow in a folder Pi trusted without a decision", async () => {
+    const sessionCtx = boot({});
+    const result = await tools.get("SubagentWorkflow").execute("tc-u1", { name: "nightly" }, undefined, undefined, sessionCtx);
+    const text = textOf(result);
+    expect(text).toMatch(/was not run/);
+    expect(text).not.toMatch(/started/);
+  });
+
+  it("does not run a project workflow when the session does not trust the project", async () => {
+    const sessionCtx = boot({ trusted: true, untrustedSession: true });
+    const result = await tools.get("SubagentWorkflow").execute("tc-u2", { name: "nightly" }, undefined, undefined, sessionCtx);
+    expect(textOf(result)).toMatch(/was not run/);
+  });
+
+  it("runs it once the project is recorded as trusted", async () => {
+    const sessionCtx = boot({ trusted: true });
+    const result = await tools.get("SubagentWorkflow").execute("tc-u3", { name: "nightly" }, undefined, undefined, sessionCtx);
+    expect(textOf(result)).toMatch(/Workflow "from-file" started/);
+  });
+});
+
 describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
   let hermetic: Hermetic;
   let booted: ReturnType<typeof makePi>;
   let tools: Map<string, any>;
 
   beforeEach(() => {
-    // Hermetic dir first — settings and agent files are read at boot.
-    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
+    // Hermetic dir first — settings and agent files are read at boot. Trusted:
+    // the saved workflows these tests run live in the project.
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: true });
     booted = makePi();
     subagentsExtension(booted.pi);
     tools = booted.tools;

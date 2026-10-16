@@ -103,6 +103,24 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
 Put custom definitions in `.pi/agents/<name>.md` or the global Pi agents directory. Agents inherit the current parent's
 model and thinking level unless their definition or call overrides them.
 
+### Project trust
+
+Subagents follow Pi's project trust decision for the parent session.
+
+- In a folder Pi does not trust, subagents load none of the project's `.pi/extensions`, `.pi/settings.json` (for
+  example `shellCommandPrefix`), skills or prompts, exactly like the parent. This extension also ignores the project's
+  `.pi/agents`, `.agents/agents`, `.pi/skills`, `.agents/skills`, `.pi/subagents.json`,
+  `.pi/agent-tool-description.md` and saved workflows there. A trusted project behaves as before.
+- Code the project ships for this extension needs a recorded decision: saved workflows in `.pi/workflows` or
+  `.agents/workflows`, and path entries in a project agent's `extensions:`. Pi trusts a folder without asking when
+  it holds nothing Pi gates (agent and workflow folders are not gated), so these run only when the folder was trusted
+  at Pi's prompt, by `defaultProjectTrust` or a CLI flag, or recorded with `/trust`. Otherwise the workflow is refused
+  and the extension path is skipped with a warning; the rest of the agent file still applies.
+- A project agent file named `general-purpose`, `Explore` or `Plan` replaces the built-in agent. A warning names the
+  file, and the `Agent` tool's type list marks the type as defined by the project.
+- The extension starts before Pi asks about trust. A folder you trust at the prompt gets its project agents and settings
+  for that session, but the `Agent` tool's description, built at startup, lists them from the next session on.
+
 ## Configuration
 
 | Setting | Default | Meaning |

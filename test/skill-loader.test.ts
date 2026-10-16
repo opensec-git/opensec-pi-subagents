@@ -37,6 +37,17 @@ describe("preloadSkills", () => {
     writeFileSync(join(dir, "SKILL.md"), content);
   }
 
+  it("skips project skill roots when the project is not trusted", () => {
+    writeFlat(projectRoot(), "shared", "project version");
+    writeFlat(globalRoot(), "shared", "global version");
+    writeFlat(join(tmpDir, ".agents", "skills"), "only-project", "workspace version");
+
+    const [shared, onlyProject] = preloadSkills(["shared", "only-project"], tmpDir, { project: false });
+    expect(shared.content).toBe("global version");
+    expect(onlyProject.content).toMatch(/not trusted/);
+    expect(preloadSkills(["shared"], tmpDir)[0].content).toBe("project version");
+  });
+
   it("returns empty array for empty skill list", () => {
     expect(preloadSkills([], tmpDir)).toEqual([]);
   });

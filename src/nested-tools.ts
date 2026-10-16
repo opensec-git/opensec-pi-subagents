@@ -109,6 +109,12 @@ export interface NestedToolContext {
   allowedSubagents: "all" | string[];
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
+  /**
+   * Whether the session this branch descends from trusts its project. False
+   * keeps the project's agent files out of the registry, as at the top level.
+   * Omitted counts as trusted.
+   */
+  projectTrusted?: boolean;
 }
 
 function textResult(text: string, isError = false) {
@@ -155,7 +161,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  const loadRegistry = () =>
+    buildAgentRegistry(loadCustomAgents(context.configCwd, false, { project: context.projectTrusted !== false }));
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined

@@ -24,7 +24,7 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
-import { isProjectTrustedBy } from "./project-trust.js";
+import { isProjectCodeTrusted, isProjectTrustedBy } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
@@ -127,6 +127,11 @@ export function extensionCanonicalNames(extPath: string): string[] {
   return pkg && pkg !== canonical ? [canonical, pkg] : [canonical];
 }
 
+/** Whether an `extensions:` entry names a file to load rather than an extension by name. */
+function isExtensionPathEntry(entry: string): boolean {
+  return entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
+}
+
 /**
  * Classify `extensions: string[]` frontmatter entries for the loader-level filter.
  *
@@ -151,8 +156,7 @@ export function parseExtensionsSpec(
       wildcard = true;
       continue;
     }
-    const isPathEntry = entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
-    if (!isPathEntry) {
+    if (!isExtensionPathEntry(entry)) {
       names.add(entry.toLowerCase());
       continue;
     }
@@ -796,6 +800,7 @@ export async function runAgent(
   const configCwd = options.configCwd ?? effectiveCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
+  const projectTrusted = isProjectTrustedBy(ctx);
 
   // Get parent system prompt for append-mode agents
   const parentSystemPrompt = ctx.getSystemPrompt();
@@ -814,7 +819,7 @@ export async function runAgent(
 
   // Skill preloading: when skills is string[], preload their content into prompt
   if (Array.isArray(skills)) {
-    const loaded = preloadSkills(skills, configCwd);
+    const loaded = preloadSkills(skills, configCwd, { project: projectTrusted });
     if (loaded.length > 0) {
       extras.skillBlocks = loaded;
     }
@@ -883,9 +888,24 @@ export async function runAgent(
   );
   const noExtensions = extensions === false;
 
-  const extensionsSpec = Array.isArray(extensions)
-    ? parseExtensionsSpec(extensions, configCwd)
-    : undefined;
+  // A path entry loads that file as code, even where Pi itself would load no
+  // project extension. From a project agent file it is therefore honoured only
+  // when the project is trusted to run its own code; otherwise it is dropped
+  // with a warning and the agent runs without it.
+  let extensionEntries = Array.isArray(extensions) ? extensions : undefined;
+  if (extensionEntries && agentConfig?.source === "project" && extensionEntries.some(isExtensionPathEntry)) {
+    const projectRoot = agentConfig.sourcePath ? dirname(dirname(dirname(agentConfig.sourcePath))) : configCwd;
+    if (!isProjectCodeTrusted(projectTrusted, projectRoot)) {
+      for (const entry of extensionEntries.filter(isExtensionPathEntry)) {
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:extension path "${entry}" in project agent "${type}" was not loaded — the project is not trusted to run its own code (trust it with /trust)`,
+        });
+      }
+      extensionEntries = extensionEntries.filter((entry) => !isExtensionPathEntry(entry));
+    }
+  }
+  const extensionsSpec = extensionEntries ? parseExtensionsSpec(extensionEntries, configCwd) : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
   // Plain canonical names only (case-insensitive). Note: excluded extensions'
@@ -927,7 +947,7 @@ export async function runAgent(
   // not load the project extensions, settings (`shellCommandPrefix`, packages)
   // or skills its parent refused. One manager, shared by the loader and the
   // session, so both read the project through the same decision.
-  const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted: isProjectTrustedBy(ctx) });
+  const settingsManager = SettingsManager.create(configCwd, agentDir, { projectTrusted });
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
@@ -1051,6 +1071,7 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
+        projectTrusted,
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));

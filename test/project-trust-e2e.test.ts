@@ -11,8 +11,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxToolCall } from "@earendil-works/pi-ai";
+import { getAgentDir, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { agentCall, type FauxResponder, runPrintMode } from "./helpers/print-mode-runner.js";
+import { agentCall, agentToolResults, type FauxResponder, runPrintMode } from "./helpers/print-mode-runner.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -93,6 +94,86 @@ describe("subagents and project trust", () => {
 
       const ran = existsSync(marker) ? readFileSync(marker, "utf-8").trim().split("\n").length : 0;
       expect(ran).toBe(trusted ? 1 : 0);
+    }, 60_000);
+  }
+});
+
+describe("the extension's own project files and project trust", () => {
+  for (const trusted of [false, true]) {
+    it(`a project agent file is used only when the parent trusts the project (trusted: ${trusted})`, async () => {
+      const cwd = project();
+      mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+      writeFileSync(join(cwd, ".pi", "agents", "helper.md"), "---\ndescription: helper\n---\nHELPER-PROMPT-MARKER");
+      let childPrompt: string | undefined;
+      const respond: FauxResponder = (context) => {
+        if (isParent(context.tools)) {
+          return hasToolResult(context.messages)
+            ? "parent done"
+            : agentCall({ prompt: "help", description: "agent file probe", subagent_type: "helper", run_in_background: false });
+        }
+        childPrompt ??= context.systemPrompt ?? "";
+        return "child done";
+      };
+
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
+      const results = agentToolResults(run.parentSession).join("\n");
+      await run.dispose();
+
+      expect(childPrompt).toBeDefined();
+      if (trusted) {
+        expect(childPrompt).toContain("HELPER-PROMPT-MARKER");
+      } else {
+        expect(childPrompt).not.toContain("HELPER-PROMPT-MARKER");
+        expect(results).toMatch(/Unknown agent type "helper"/);
+      }
+    }, 60_000);
+  }
+
+  for (const recorded of [false, true]) {
+    it(`a project agent's extension path loads only once the project is recorded as trusted (recorded: ${recorded})`, async () => {
+      // Nothing here is gated by Pi, so Pi trusts the folder without asking —
+      // which is not consent to run the code an agent file points at.
+      const cwd = project();
+      const marker = join(cwd, "EXT_LOADED.log");
+      mkdirSync(join(cwd, "tools"), { recursive: true });
+      writeFileSync(
+        join(cwd, "tools", "probe.ts"),
+        `import { appendFileSync } from "node:fs";
+export default function (pi: any) {
+  appendFileSync(${JSON.stringify(marker)}, "loaded\\n");
+  pi.registerTool({ name: "probe_tool", label: "probe", description: "probe", parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "probe ran" }] }; } });
+}
+`,
+      );
+      mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".pi", "agents", "helper.md"),
+        "---\ndescription: helper\nextensions: ./tools/probe.ts\n---\nYou help.",
+      );
+      let childTools: string[] | undefined;
+      const respond: FauxResponder = (context) => {
+        if (isParent(context.tools)) {
+          return hasToolResult(context.messages)
+            ? "parent done"
+            : agentCall({ prompt: "help", description: "extension path probe", subagent_type: "helper", run_in_background: false });
+        }
+        childTools ??= (context.tools ?? []).map((t) => t.name);
+        return "child done";
+      };
+
+      const run = await runPrintMode({
+        cwd,
+        prompt: "go",
+        respond,
+        projectTrusted: true,
+        beforeRun: () => { if (recorded) new ProjectTrustStore(getAgentDir()).set(cwd, true); },
+      });
+      await run.dispose();
+
+      expect(childTools).toBeDefined();
+      expect(childTools?.includes("probe_tool")).toBe(recorded);
+      expect(existsSync(marker)).toBe(recorded);
     }, 60_000);
   }
 });
