@@ -32,8 +32,8 @@ Restart Pi or run `/reload` after installing. Update with `pi update --extension
 
 ### Requirements
 
-- Pi: this Node build loads and runs a real turn on Pi 0.87.1 and Pi 1.0.0 (both on Node). The peer-dependency
-  range is `>=0.84.0`; earlier versions were not re-tested.
+- Pi 1.1.0 or newer (peer range `>=1.1.0`, the test suite runs against Pi 1.1.0). `typebox` is a `"*"` peer that Pi
+  supplies; `@sinclair/typebox` is no longer used.
 - Install only one Subagents package at a time: the public and private packages expose the same tools.
 
 ## Features

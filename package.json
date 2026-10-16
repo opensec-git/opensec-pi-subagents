@@ -28,16 +28,12 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.84.0",
-    "@earendil-works/pi-coding-agent": ">=0.84.0",
-    "@earendil-works/pi-tui": ">=0.84.0",
-    "@sinclair/typebox": "*",
+    "@earendil-works/pi-ai": ">=1.1.0",
+    "@earendil-works/pi-coding-agent": ">=1.1.0",
+    "@earendil-works/pi-tui": ">=1.1.0",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@sinclair/typebox": {
-      "optional": true
-    },
     "typebox": {
       "optional": true
     }
@@ -62,9 +58,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-tui": "1.0.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.10",
@@ -78,5 +74,14 @@
     ],
     "video": "https://github.com/tintinweb/pi-subagents/raw/master/media/demo.mp4",
     "image": "https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png"
+  },
+  "overrides": {
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
+    "@earendil-works/pi-telemetry": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0"
   }
 }
