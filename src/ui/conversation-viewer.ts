@@ -2,19 +2,25 @@
  * conversation-viewer.ts — Live conversation overlay for viewing agent sessions.
  *
  * Displays a scrollable, live-updating view of an agent's conversation.
- * Subscribes to session events for real-time streaming updates.
+ * Subscribes to session events for real-time streaming updates. The
+ * transcript is drawn with Pi's own chat components (`viewer-transcript.ts`),
+ * so it looks exactly like Pi's main session; the frame around it (header,
+ * footer, scrolling, steering) is the viewer's.
  */
 
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, type Focusable, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, Input, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import type { AgentRecord } from "../types.js";
 import { getCachedSessionContextPercent, getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
+import { PiTranscript, type ViewerRenderOptions } from "./viewer-transcript.js";
+
+export type { ViewerRenderOptions } from "./viewer-transcript.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
 const CHROME_LINES_BASE = 6;
@@ -36,21 +42,11 @@ export function getConversationOverlayOptions(tui: Pick<TUI, "mode">): OverlayOp
     : { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` };
 }
 
+/** Footer click target for the expand toggle, which may be bound to any key. */
+const EXPAND_TARGET = "expand";
+
 /** Message roles the fullscreen jump marker counts as "new messages" (not streaming updates). */
 const COUNTED_ROLES = new Set(["user", "assistant", "toolResult", "bashExecution"]);
-
-/**
- * Cap on a single tool result or bash output before the viewer elides the rest.
- *
- * The cap is not cosmetic — it bounds render cost. A message's lines are
- * rebuilt whenever the width or Markdown mode changes, and the streaming tail
- * on every frame it changes, so an uncapped 200 KB result costs ~6 ms per
- * rebuild to parse as Markdown, against ~0.5 ms once capped (best of 5, width
- * 76). 16 KB is roughly a screenful at every terminal size and still ~30x the
- * 500 characters this replaces, which was small enough to cut most real
- * results mid-sentence.
- */
-export const RESULT_MAX_CHARS = 16_000;
 
 /**
  * Session events that fire per streamed token or tool-output chunk. They are
@@ -60,120 +56,38 @@ const STREAMING_EVENTS = new Set(["message_update", "tool_execution_update"]);
 /** Redraw cadence while streaming — the widget's spinner frame. */
 const STREAM_FRAME_MS = 80;
 
-/**
- * One message's rendered lines, already clamped to the width they were built
- * for. `source` is what they were built from, compared only for messages that
- * may still change (see `ConversationViewer.contentView`).
- */
-type Block = { msg: object; source: string; lines: string[] | undefined };
-
 /** The `b` affordance: whether this run can be handed to the background now, and the handoff. */
 export interface ViewerBackgroundAction {
   available(): boolean;
   send(): void;
 }
 
-/** Cycle order for the viewer's `m` key. */
-const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
-
-/** Footer labels — short, because the idle footer is already full at 80 columns. */
-const MARKDOWN_MODE_LABELS: Record<ViewerMarkdownMode, string> = {
-  off: "raw",
-  assistant: "md",
-  all: "md+",
-};
-
 /**
- * Both options keep the renderer from *rewriting* source that only looks like
- * Markdown: without them `3) a / 7) b / 9) c` comes back renumbered `3. 4. 5.`
- * and backslash escapes are normalized away. Neither is a safe edit to make to
- * a tool's output, and both are cheap to switch off.
+ * Whether Pi's global theme is initialized. Pi's components read it while they
+ * are built and rendered, and throw without it; Pi's interactive mode always
+ * has one, tests and embedded sessions may not.
  */
-const MARKDOWN_OPTIONS: MarkdownOptions = {
-  preserveOrderedListMarkers: true,
-  preserveBackslashEscapes: true,
-};
-
-/**
- * Pi's own Markdown theme when this process has one, else a theme built from the
- * viewer's `Theme`.
- *
- * Preferring pi's is what buys syntax-highlighted code fences (it carries a
- * `highlightCode`), and it keeps this surface consistent with the notification
- * renderer, which uses the same source. It has to be *probed* rather than
- * try/caught around the call: `getMarkdownTheme()` returns arrow functions that
- * read pi's global theme lazily, so an uninitialized theme throws inside
- * `render()` — long after this returns — and takes the overlay with it. That is
- * the case in tests and any embedded session that never called `initTheme()`.
- */
-function resolveMarkdownTheme(th: Theme): MarkdownTheme {
+function piThemeReady(): boolean {
   try {
-    const piTheme = getMarkdownTheme();
-    piTheme.heading("probe");
-    return piTheme;
+    getMarkdownTheme().heading("probe");
+    return true;
   } catch {
-    return fallbackMarkdownTheme(th);
+    return false;
   }
 }
 
 /**
- * `Theme` carries only `fg` and `bold`, so the three remaining styles are
- * written as raw SGR. Rendering them as plain text instead would silently drop
- * `*emphasis*`'s markers with nothing in their place, turning a formatting
- * change into a content change.
+ * The footer's left group, dropping what fits least first: the line-count
+ * readout, then the expand hint (Pi's components already say "ctrl+o to
+ * expand" beside anything collapsed), never the actions.
  */
-function fallbackMarkdownTheme(th: Theme): MarkdownTheme {
-  const sgr = (on: number, off: number) => (text: string) => `\x1b[${on}m${text}\x1b[${off}m`;
-  return {
-    heading: text => th.bold(th.fg("accent", text)),
-    link: text => th.fg("accent", text),
-    linkUrl: text => th.fg("muted", text),
-    code: text => th.fg("muted", text),
-    codeBlock: text => th.fg("muted", text),
-    codeBlockBorder: text => th.fg("dim", text),
-    quote: text => th.fg("muted", text),
-    quoteBorder: text => th.fg("dim", text),
-    hr: text => th.fg("dim", text),
-    listBullet: text => th.fg("accent", text),
-    bold: text => th.bold(text),
-    italic: sgr(3, 23),
-    underline: sgr(4, 24),
-    strikethrough: sgr(9, 29),
-  };
-}
-
-/**
- * Cap `text` at `RESULT_MAX_CHARS`, reporting the elision separately rather than
- * appending it.
- *
- * Separately because the notice is the viewer's chrome, not the tool's output.
- * Appended into the string it becomes content: a cut landing inside a fenced
- * code block — likely, on exactly the large `ctx_execute` results this is for —
- * renders the notice as a line of source inside the fence.
- */
-function capResult(text: string): { text: string; elided: number } {
-  if (text.length <= RESULT_MAX_CHARS) return { text, elided: 0 };
-  return {
-    text: text.slice(0, RESULT_MAX_CHARS),
-    elided: text.length - RESULT_MAX_CHARS,
-  };
-}
-
-/**
- * `999` · `1.5k` · `8.4M` — a magnitude cue, not an exact count, past 1000.
- *
- * The bracket is chosen against the *rounded* value, so 999,999 reads `1M`
- * rather than the `1000.0k` a naive `< 1e6` test produces.
- */
-function humanCount(n: number): string {
-  if (n < 1_000) return `${n}`;
-  const thousands = n < 999_950;
-  const value = thousands ? n / 1_000 : n / 1_000_000;
-  return `${value.toFixed(1).replace(/\.0$/, "")}${thousands ? "k" : "M"}`;
-}
-
-function truncationNote(elided: number): string {
-  return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
+function fitFooterLeft(count: string, actions: string[], expand: string | undefined, sep: string, room: number): string {
+  const tail = expand ? [...actions, expand] : actions;
+  for (const parts of [[count, ...tail], tail]) {
+    const text = parts.join(sep);
+    if (visibleWidth(text) <= room) return text;
+  }
+  return actions.join(sep);
 }
 
 export class ConversationViewer implements Component, Focusable {
@@ -217,39 +131,13 @@ export class ConversationViewer implements Component, Focusable {
   private keys: ViewerKeys;
   /** Steering composer — present while the user is typing a message to the agent. */
   private composer: Input | undefined;
-  /** Resolved once: pi's Markdown theme is fixed for the life of the process. */
-  private readonly markdownTheme: MarkdownTheme;
-  /** Set by the `m` key. Wins over the setting so `m` works without a persist hook. */
-  private markdownModeOverride: ViewerMarkdownMode | undefined;
   /**
-   * One `Markdown` per message, so its own text/width cache does the work. A
-   * fresh instance per render would re-parse the whole transcript on every
-   * keystroke — the component caches, but only across calls to the same object.
-   * Weak so a compacted-away message doesn't pin its render.
+   * The transcript drawn with Pi's components, its lines cached between
+   * frames. Undefined when Pi's theme is not initialized (see `plainLines`).
    */
-  private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
-  /**
-   * The transcript, kept between frames. `blocks[i]` renders `messages[i]`;
-   * `lines` holds every block's lines (and separators) in order, and
-   * `blockStart[i]` is where block `i`'s part of it begins. All of it is valid
-   * for `cacheWidth` and `cacheMode` only.
-   */
-  private blocks: Block[] = [];
-  private blockStart: number[] = [];
-  private lines: string[] = [];
-  /** `lineWidths[i]` is the visible width of `lines[i]`, measured once when the line is built. */
-  private lineWidths: number[] = [];
-  /**
-   * The messages array the cache was last validated against. Pi only appends
-   * to that array and replaces it wholesale otherwise, so while it is the same
-   * object only the unsettled tail needs checking — what keeps a frame's cost
-   * flat however long the transcript gets.
-   */
-  private cacheMessages: readonly unknown[] | undefined;
-  private cacheWidth = -1;
-  private cacheMode: ViewerMarkdownMode | undefined;
-  /** Messages from this index on may still change in place; earlier ones are settled. */
-  private unsettledFrom = 0;
+  private readonly transcript: PiTranscript | undefined;
+  /** The plain fallback's lines and what they were built for. */
+  private plain: { messages: readonly unknown[]; count: number; width: number; lines: string[]; widths: number[] } | undefined;
   /** Pending coalesced redraw for streaming events. */
   private streamRenderTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -273,17 +161,6 @@ export class ConversationViewer implements Component, Focusable {
      */
     private showCost = false,
     /**
-     * The current `viewerMarkdown` setting. Read live rather than captured,
-     * unlike `showCost`: `m` changes it while the overlay is on screen.
-     * Omitted → `assistant`.
-     */
-    private viewerMarkdown?: () => ViewerMarkdownMode,
-    /**
-     * Persist a mode chosen with `m`, so the key and `/agents → Settings` mean
-     * the same thing. Omitted → `m` still cycles, viewer-locally.
-     */
-    private onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
-    /**
      * Hand this run to the background. `available` is read live — it turns
      * false the instant the handoff lands or the run ends. Omitted → no `b`
      * affordance (history views).
@@ -291,23 +168,26 @@ export class ConversationViewer implements Component, Focusable {
     private onBackground?: ViewerBackgroundAction,
     /** Pi's `fullscreenScrollbar` preference, captured when the viewer opens. */
     scrollbarMode: ScrollViewScrollbar = "auto",
+    /** Pi's chat settings (thinking blocks, padding, code indent), read when the viewer opens. */
+    renderOptions?: ViewerRenderOptions,
   ) {
     this.fullscreen = tui.mode === "fullscreen";
-    this.markdownTheme = resolveMarkdownTheme(theme);
     this.keys = createViewerKeys(keybindings);
+    this.transcript = piThemeReady() ? new PiTranscript(session, this.requestRender, renderOptions) : undefined;
     this.scrollView = new ScrollView(
       { render: () => [], invalidate: () => {} },
       { follow: "end", scrollbar: this.fullscreen ? scrollbarMode : "hidden" },
     );
     this.unsubscribe = session.subscribe((event) => {
       if (this.closed) return;
-      const e = event as { type?: string; message?: { role?: string } } | undefined;
+      const e = event as Parameters<PiTranscript["handleEvent"]>[0] | undefined;
+      if (e) this.transcript?.handleEvent(e);
       if (this.fullscreen && e?.type === "message_start" && !this.scrollView.isFollowingEnd && COUNTED_ROLES.has(e.message?.role ?? "")) {
         this.newMessages++;
       }
       if (STREAMING_EVENTS.has(e?.type ?? "")) {
-        // A token delta changes at most the activity line; one redraw per
-        // frame is enough, and unthrottled it was one per token.
+        // A token delta redraws only the streamed message's block; one redraw
+        // per frame is enough, and unthrottled it was one per token.
         this.streamRenderTimer ??= setTimeout(() => {
           this.streamRenderTimer = undefined;
           if (!this.closed) this.tui.requestRender();
@@ -372,15 +252,9 @@ export class ConversationViewer implements Component, Focusable {
       return;
     }
 
-    // Cycle raw → assistant-only → everything. The escape hatch that makes
-    // Markdown rendering safe to default on: a result the renderer reshapes
-    // (a diff, an indented log, a `#`-commented script) is one key from verbatim.
-    if (matchesKey(data, "m")) {
-      this.stopArmed = false;
-      const next = MARKDOWN_MODES[(MARKDOWN_MODES.indexOf(this.markdownMode()) + 1) % MARKDOWN_MODES.length];
-      this.markdownModeOverride = next;
-      this.onMarkdownMode?.(next);
-      this.tui.requestRender();
+    // Expand or collapse tool output, as Pi's ctrl+o (`app.tools.expand`).
+    if (this.keys.toggleExpand(data)) {
+      this.toggleExpand();
       return;
     }
     if (this.stopArmed) this.stopArmed = false;
@@ -472,7 +346,8 @@ export class ConversationViewer implements Component, Focusable {
       if (event.y === this.tui.terminal.rows - 1) {
         const target = this.footerTargets.find(t => event.x >= t.start && event.x < t.end);
         if (target) {
-          this.handleInput(target.key);
+          if (target.key === EXPAND_TARGET) this.toggleExpand();
+          else this.handleInput(target.key);
           return { handled: true, render: true };
         }
       }
@@ -549,11 +424,11 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   /** Content line `at` (transcript, then activity tail) with its visible width; "" past the end. */
-  private contentLine(content: { base: string[]; tail: string[] }, at: number): { text: string; width: number } {
+  private contentLine(content: { base: string[]; widths: number[] | undefined; tail: string[] }, at: number): { text: string; width: number } {
     if (at < content.base.length) {
       const text = content.base[at];
       // The cached transcript has its widths; the empty-session placeholder does not.
-      return { text, width: content.base === this.lines ? this.lineWidths[at] : visibleWidth(text) };
+      return { text, width: content.widths ? content.widths[at] : visibleWidth(text) };
     }
     const text = content.tail[at - content.base.length] ?? "";
     return { text, width: text ? visibleWidth(text) : 0 };
@@ -615,7 +490,7 @@ export class ConversationViewer implements Component, Focusable {
       const scrollPct = totalLines <= viewportHeight
         ? "100%"
         : `${Math.round(((visibleStart + viewportHeight) / totalLines) * 100)}%`;
-      const footerKey = `${width}|${this.canSteer()}|${this.canSendToBackground()}|${this.isStoppable()}|${this.stopArmed}|${this.markdownMode()}|${totalLines}|${scrollPct}`;
+      const footerKey = `${width}|${this.canSteer()}|${this.canSendToBackground()}|${this.isStoppable()}|${this.stopArmed}|${this.transcript?.isExpanded}|${totalLines}|${scrollPct}`;
       lines.push(this.chrome("r:footer", footerKey, () => {
       // Actions on the left, navigation on the right. The scroll hint keeps its
       // full key list so the less-obvious bindings stay discoverable; it leads
@@ -623,24 +498,18 @@ export class ConversationViewer implements Component, Focusable {
       const sep = th.fg("dim", " · ");
       const actions: string[] = [];
       if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
-      // Abbreviated for the same reason as the Markdown group below.
+      // Abbreviated: the idle footer is already full at 80 columns.
       if (this.canSendToBackground()) actions.push(th.fg("dim", "b bg"));
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
-      // Abbreviated (`raw`/`md`/`md+`) because the idle footer is already full
-      // at 80 columns with steer + stop present, and this group has no
-      // degradation step below "drop the line-count readout".
-      actions.push(th.fg("dim", `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`));
+      const expand = this.expandHint();
       const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
       // it's the first thing dropped so it never crowds out the hints.
       const count = th.fg("dim", `${totalLines} lines · ${scrollPct}`);
-      const withCount = [count, ...actions].join(sep);
-      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
-        ? withCount
-        : actions.join(sep);
+      const footerLeft = fitFooterLeft(count, actions, expand && th.fg("dim", expand.label), sep, innerW - visibleWidth(footerRight) - 1);
 
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       return row(footerLeft + " ".repeat(footerGap) + footerRight);
@@ -737,7 +606,7 @@ export class ConversationViewer implements Component, Focusable {
       : `${Math.round(((visibleStart + viewportHeight) / totalLines) * 100)}%`;
     const footerKey = this.composer
       ? `${width}|composer`
-      : `${width}|${this.canSteer()}|${this.canSendToBackground()}|${this.isStoppable()}|${this.stopArmed}|${this.markdownMode()}|${totalLines}|${scrollPct}`;
+      : `${width}|${this.canSteer()}|${this.canSendToBackground()}|${this.isStoppable()}|${this.stopArmed}|${this.transcript?.isExpanded}|${totalLines}|${scrollPct}`;
     const { footer, targets } = this.chrome("f:footer", footerKey, () => this.fullscreenFooter(innerW, totalLines, scrollPct, row));
     this.footerTargets = targets;
 
@@ -765,13 +634,13 @@ export class ConversationViewer implements Component, Focusable {
       if (this.canSteer()) footerActions.push({ label: "Enter steer", key: "\r" });
       if (this.canSendToBackground()) footerActions.push({ label: "b bg", key: "b" });
       if (this.isStoppable()) footerActions.push({ label: this.stopArmed ? "x again to STOP" : "x stop", key: "x" });
-      footerActions.push({ label: `m ${MARKDOWN_MODE_LABELS[this.markdownMode()]}`, key: "m" });
       const actions = footerActions.map(a => th.fg(a.key === "x" && this.stopArmed ? "error" : "dim", a.label));
+      const expand = this.expandHint();
+      if (expand) footerActions.push(expand);
       footerActions.push({ label: "Esc close", key: "\x1b" });
       const footerRight = th.fg("dim", "wheel/↑↓ scroll · PgUp/PgDn · Esc close");
       const count = th.fg("dim", `${totalLines} lines · ${scrollPct}`);
-      const withCount = [count, ...actions].join(sep);
-      const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW ? withCount : actions.join(sep);
+      const footerLeft = fitFooterLeft(count, actions, expand && th.fg("dim", expand.label), sep, innerW - visibleWidth(footerRight) - 1);
       footer = row(footerLeft + " ".repeat(Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight))) + footerRight);
     }
 
@@ -800,61 +669,17 @@ export class ConversationViewer implements Component, Focusable {
     return this.onBackground?.available() === true;
   }
 
-  /** The mode in force: an `m` press, else the setting, else the default. */
-  private markdownMode(): ViewerMarkdownMode {
-    return this.markdownModeOverride ?? this.viewerMarkdown?.() ?? "assistant";
+  /** Expand or collapse every tool, bash and summary block, as Pi's `app.tools.expand`. */
+  private toggleExpand(): void {
+    this.stopArmed = false;
+    this.transcript?.setExpanded(!this.transcript.isExpanded);
+    this.tui.requestRender();
   }
 
-  /** Wrap `text` literally — the pre-Markdown path, and the fallback from it. */
-  private rawLines(text: string, width: number, dim: boolean): string[] {
-    const lines = wrapTextWithAnsi(sanitizeTerminalText(text), width);
-    return dim ? lines.map(l => this.theme.fg("dim", l)) : lines;
-  }
-
-  /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], raw: string, width: number, dim: boolean): string[] {
-    const text = sanitizeTerminalText(raw);
-    let entry = this.markdownCache.get(msg);
-    if (!entry) {
-      entry = {
-        md: new Markdown(
-          text,
-          0,
-          0,
-          this.markdownTheme,
-          // Keeps result prose visually receded, the way the raw path's
-          // per-line `fg("dim", …)` did. Fenced code is the exception and is
-          // left alone deliberately: pi's theme highlights it with its own
-          // colors, which this would otherwise flatten.
-          dim ? { color: (t: string) => this.theme.fg("dim", t) } : undefined,
-          MARKDOWN_OPTIONS,
-        ),
-        text,
-      };
-      this.markdownCache.set(msg, entry);
-    } else if (entry.text !== text) {
-      // Streaming: the message object is stable, its text grows. A failed
-      // prefix remains unsafe after append-only deltas, so retry only when the
-      // content was replaced or truncated.
-      const shouldRetry = !text.startsWith(entry.text);
-      entry.md.setText(text);
-      entry.text = text;
-      if (shouldRetry) entry.failed = false;
-    }
-    if (entry.failed) return this.rawLines(text, width, dim);
-
-    try {
-      return entry.md.render(width);
-    } catch {
-      // The parser is recursive and this is arbitrary tool output: ~54 nested
-      // blockquotes overflow the stack, and no amount of fuzzing proves that is
-      // the only such input. `render()` is on the TUI's critical path, so a
-      // throw here takes the overlay down for content the literal path shows
-      // fine — degrade to that instead, and remember, since the throw would
-      // otherwise repeat on every render and every scroll key.
-      entry.failed = true;
-      return this.rawLines(text, width, dim);
-    }
+  /** The expand toggle's footer control: the key bound to it and what it does next. */
+  private expandHint(): { label: string; key: string } | undefined {
+    if (!this.transcript || !this.keys.expandLabel) return undefined;
+    return { label: `${this.keys.expandLabel} ${this.transcript.isExpanded ? "collapse" : "expand"}`, key: EXPAND_TARGET };
   }
 
   /** Steerable only when a steer handler exists and the agent is still active. */
@@ -881,7 +706,9 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   invalidate(): void {
-    this.cacheWidth = -1;
+    // Pi invalidates the TUI on a theme change: every block re-renders.
+    this.transcript?.invalidate();
+    this.plain = undefined;
     this.chromeCache.clear();
   }
 
@@ -896,6 +723,7 @@ export class ConversationViewer implements Component, Focusable {
       this.unsubscribe();
       this.unsubscribe = undefined;
     }
+    this.transcript?.dispose();
   }
 
   // ---- Private ----
@@ -935,79 +763,28 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   /**
-   * The content area as cached transcript lines (`base`, owned by the viewer —
-   * do not mutate) plus the live activity indicator (`tail`).
-   *
-   * Only messages that changed are rebuilt. A message is matched to its block
-   * by identity; messages from `unsettledFrom` on (the last one when the
-   * previous frame was drawn, and anything after it) are also compared by
-   * content, because older pi streams into the last message in place and a
-   * message can be edited and then pushed past before the next frame. Earlier
-   * messages are settled: pi never rewrites a message once another follows it,
-   * and compaction replaces the objects, which the identity check catches.
+   * The content area as cached transcript lines (`base`, owned by the
+   * transcript — do not mutate) with their widths, plus the live activity
+   * indicator (`tail`). Only blocks that changed are re-rendered, so a frame
+   * where nothing changed costs a few comparisons however long the transcript.
    */
-  private contentView(width: number): { base: string[]; tail: string[] } {
-    if (width <= 0) return { base: [], tail: [] };
+  private contentView(width: number): { base: string[]; widths: number[] | undefined; tail: string[] } {
+    if (width <= 0) return { base: [], widths: undefined, tail: [] };
     const th = this.theme;
-    const messages = this.session.messages;
-
-    if (messages.length === 0) {
-      return { base: [truncateToWidth(th.fg("dim", "(waiting for first message...)"), width)], tail: [] };
+    const transcript = this.transcript;
+    if (transcript ? !transcript.hasContent : this.session.messages.length === 0) {
+      return { base: [truncateToWidth(th.fg("dim", "(waiting for first message...)"), width)], widths: undefined, tail: [] };
     }
 
-    const mode = this.markdownMode();
-    if (width !== this.cacheWidth || mode !== this.cacheMode) {
-      this.blocks = [];
-      this.blockStart = [];
-      this.lines = [];
-      this.lineWidths = [];
-      this.cacheWidth = width;
-      this.cacheMode = mode;
-      this.unsettledFrom = 0;
-      this.cacheMessages = undefined;
+    let base: string[];
+    let widths: number[];
+    if (transcript) {
+      transcript.sync(width);
+      base = transcript.lines;
+      widths = transcript.widths;
+    } else {
+      ({ lines: base, widths } = this.plainLines(width));
     }
-
-    // First block that no longer matches its message. The same array as last
-    // frame has only grown at its end, so its settled part needs no check.
-    let stale = Math.min(this.blocks.length, messages.length);
-    const from = messages === this.cacheMessages && this.blocks.length <= messages.length ? Math.min(this.unsettledFrom, stale) : 0;
-    this.cacheMessages = messages;
-    for (let i = Math.max(0, from); i < stale; i++) {
-      const block = this.blocks[i];
-      if (block.msg !== messages[i] || (i >= this.unsettledFrom && block.source !== this.messageSource(messages[i]))) {
-        stale = i;
-        break;
-      }
-    }
-
-    if (stale < this.blocks.length || stale < messages.length) {
-      this.lines.length = stale < this.blockStart.length ? this.blockStart[stale] : this.lines.length;
-      this.lineWidths.length = this.lines.length;
-      this.blocks.length = stale;
-      this.blockStart.length = stale;
-      // Any line before the first rebuilt block means a block rendered there.
-      let needsSeparator = this.lines.length > 0;
-      const separator = truncateToWidth(th.fg("dim", "───"), width);
-      const separatorWidth = visibleWidth(separator);
-      for (let i = stale; i < messages.length; i++) {
-        const msg = messages[i];
-        const source = this.messageSource(msg);
-        const body = this.messageLines(msg, width, mode);
-        this.blocks.push({ msg, source, lines: body });
-        this.blockStart.push(this.lines.length);
-        if (!body) continue;
-        if (needsSeparator) {
-          this.lines.push(separator);
-          this.lineWidths.push(separatorWidth);
-        }
-        for (const line of body) {
-          this.lines.push(line);
-          this.lineWidths.push(visibleWidth(line));
-        }
-        needsSeparator = true;
-      }
-    }
-    this.unsettledFrom = messages.length - 1;
 
     // Streaming indicator for running agents
     const tail: string[] = [];
@@ -1016,88 +793,41 @@ export class ConversationViewer implements Component, Focusable {
       tail.push("", truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", sanitizeTerminalText(act)), width));
     }
 
-    return { base: this.lines, tail };
+    return { base, widths, tail };
   }
 
   /**
-   * Everything a message's rendered lines depend on, besides width and mode.
-   * Cheap next to rendering: string joins, no wrapping or parsing.
+   * The transcript as plain wrapped text, for a process whose Pi theme is not
+   * initialized (Pi's components cannot render there). Never the case in Pi's
+   * interactive mode; it keeps the viewer usable rather than throwing.
    */
-  private messageSource(msg: AgentSession["messages"][number]): string {
-    const m = msg as any;
-    switch (m.role) {
-      case "user":
-        return typeof m.content === "string" ? m.content : extractText(m.content);
-      case "assistant": {
-        let out = "";
-        for (const c of m.content) {
-          if (c.type === "text" && c.text) out += `t${c.text.length}:${c.text}`;
-          else if (c.type === "toolCall") out += `c${c.name ?? c.toolName ?? "unknown"}\n`;
-        }
-        return out;
-      }
-      case "toolResult":
-        return extractText(m.content);
-      case "bashExecution":
-        return `${String(m.command)}\n${m.output ?? ""}`;
-      default:
-        return "";
-    }
-  }
-
-  /** One message's lines without its separator, clamped to `width`; undefined when it renders nothing. */
-  private messageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | undefined {
-    const th = this.theme;
+  private plainLines(width: number): { lines: string[]; widths: number[] } {
+    const messages = this.session.messages;
+    const cached = this.plain;
+    if (cached && cached.messages === messages && cached.count === messages.length && cached.width === width) return cached;
     const lines: string[] = [];
-    if (msg.role === "user") {
-      const text = typeof msg.content === "string"
-        ? msg.content
-        : extractText(msg.content);
-      if (!text.trim()) return undefined;
-      lines.push(th.fg("accent", "[User]"));
-      for (const line of wrapTextWithAnsi(sanitizeTerminalText(text.trim()), width)) {
-        lines.push(line);
+    for (const raw of messages) {
+      const msg = raw as { role?: string; content?: unknown; command?: unknown; output?: unknown; summary?: unknown };
+      let text = "";
+      if (msg.role === "user" || msg.role === "toolResult" || msg.role === "custom") {
+        text = typeof msg.content === "string" ? msg.content : extractText(msg.content as Parameters<typeof extractText>[0]);
+      } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        text = (msg.content as { type?: string; text?: string; name?: string }[])
+          .map(c => c.type === "text" ? c.text ?? "" : c.type === "toolCall" ? `[${c.name ?? "tool"}]` : "")
+          .filter(Boolean)
+          .join("\n");
+      } else if (msg.role === "bashExecution") {
+        text = `$ ${String(msg.command)}\n${String(msg.output ?? "")}`;
+      } else if (msg.role === "compactionSummary" || msg.role === "branchSummary") {
+        text = String(msg.summary ?? "");
       }
-    } else if (msg.role === "assistant") {
-      const textParts: string[] = [];
-      const toolCalls: string[] = [];
-      for (const c of msg.content) {
-        if (c.type === "text" && c.text) textParts.push(c.text);
-        else if (c.type === "toolCall") {
-          toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
-        }
-      }
-      lines.push(th.bold("[Assistant]"));
-      if (textParts.length > 0) {
-        const text = textParts.join("\n").trim();
-        lines.push(...(mode === "off"
-          ? this.rawLines(text, width, false)
-          : this.markdownLines(msg, text, width, false)));
-      }
-      for (const name of toolCalls) {
-        lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${sanitizeTerminalText(name)}]`), width));
-      }
-    } else if (msg.role === "toolResult") {
-      const { text, elided } = capResult(extractText(msg.content).trim());
-      if (!text) return undefined;
-      lines.push(th.fg("dim", "[Result]"));
-      lines.push(...(mode === "all"
-        ? this.markdownLines(msg, text, width, true)
-        : this.rawLines(text, width, true)));
-      if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-    } else if ((msg as any).role === "bashExecution") {
-      const bash = msg as any;
-      lines.push(truncateToWidth(th.fg("muted", `  $ ${sanitizeTerminalText(String(bash.command))}`), width));
-      if (bash.output?.trim()) {
-        // Same cap as a tool result, never Markdown: command output is the one
-        // thing here that is definitionally not authored as Markdown.
-        const { text, elided } = capResult(bash.output.trim());
-        lines.push(...this.rawLines(text, width, true));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      }
-    } else {
-      return undefined;
+      text = sanitizeTerminalText(text).trim();
+      if (!text) continue;
+      if (lines.length > 0) lines.push("");
+      for (const line of wrapTextWithAnsi(text, width)) lines.push(truncateToWidth(line, width));
     }
-    return lines.map(l => truncateToWidth(l, width));
+    const plain = { messages, count: messages.length, width, lines, widths: lines.map(l => visibleWidth(l)) };
+    this.plain = plain;
+    return plain;
   }
 }

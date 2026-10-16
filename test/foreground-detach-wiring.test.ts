@@ -33,7 +33,7 @@ let fleet: { onAgentFinished: ReturnType<typeof vi.fn>; editorHasFocus: ReturnTy
 vi.mock("../src/ui/fleet-list.js", () => ({
   FleetList: class {
     constructor(...args: unknown[]) {
-      backgroundActionFor = args[6] as BackgroundActionFor;
+      backgroundActionFor = args[5] as BackgroundActionFor;
       fleet = this as any;
     }
     setUICtx = vi.fn();

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-10-16
+
+The conversation viewer draws a subagent's transcript with Pi's own chat components, so it looks exactly like Pi's
+main session.
+
+> **Possibly breaking:** the `viewerMarkdown` setting (`/agents → Settings → Viewer markdown`) and the viewer's `m`
+> key are removed: Pi's components decide how each message renders. A `viewerMarkdown` key left in `subagents.json`
+> is ignored.
+
+### Changed
+
+- **The conversation viewer (regular overlay and fullscreen observer) renders like Pi's main session.** It builds
+  `UserMessageComponent`, `AssistantMessageComponent` (thinking and text), `ToolExecutionComponent` (each tool's own
+  call and result renderers from the subagent's session: edit diffs, read previews, bash command, output, exit status
+  and duration, running/done/error state, arguments), `BashExecutionComponent`, `CompactionSummaryMessageComponent`,
+  `BranchSummaryMessageComponent`, `SkillInvocationMessageComponent` and `CustomMessageComponent` from the session's
+  messages as Pi's interactive mode does, with the same spacing and collapsed defaults. Streaming messages, tool
+  progress and results update live. It replaces the viewer's own `[User]` / `[Assistant]` / `[Tool: name]` /
+  `[Result]` rendering and its 16k-character result cap (Pi's renderers truncate collapsed output themselves).
+- **`ctrl+o` expands and collapses tool output in the viewer**, as in Pi; it follows a rebinding of Pi's
+  `app.tools.expand`, and the footer shows it when there is room. Pi's `hideThinkingBlock`, `outputPad` and
+  `markdown.codeBlockIndent` settings apply.
+- Each component is built once and its rendered lines are cached per width and expand state; a frame re-renders only
+  the streamed message and tools that changed, scrolling never re-renders, and only visible rows are assembled.
+  Without a JIT (Bun with `BUN_JSC_useJIT=0`, standing in for Pi-Bolt), at 500 messages: a frame 6 µs, a scroll step
+  15 µs, a streaming delta 0.70 ms (was 0.92 ms), a tool call finishing 0.26 ms (was 0.31 ms), the first frame 121 ms
+  (was 160 ms). A new user message costs 0.27 ms (was 0.17 ms): Pi's user message is Markdown on a background.
+- Where the viewer differs from Pi's main session: images in tool results show as Pi's text placeholder, since an
+  inline image cannot be clipped to a scrolled overlay; Mermaid blocks are not drawn as diagrams (Pi's Mermaid
+  transformer is not exported); OSC 133 prompt marks are not emitted inside the overlay; clicking a tool or thinking
+  block does not toggle it (use `ctrl+o`).
+
+### Removed
+
+- The `viewerMarkdown` setting and the viewer's `m` key (see above).
+
 ## [0.20.3] - 2026-10-16
 
 Background agents survive a session switch, subagents run on the parent's model by default, and nested and workflow

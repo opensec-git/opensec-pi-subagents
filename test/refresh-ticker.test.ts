@@ -98,7 +98,7 @@ describe("widget and fleet list on a shared clock", () => {
     const manager = { listAgents: () => records, abort: () => true } as any;
     const ticker = new RefreshTicker();
     const widget = new AgentWidget(manager, new Map(), () => "all", () => false, () => false, ticker);
-    const fleet = new FleetList(manager, new Map(), () => false, undefined, undefined, ticker);
+    const fleet = new FleetList(manager, new Map(), () => false, undefined, ticker);
     const tui = coalescingTui();
     widget.setUICtx({ setStatus: () => {}, setWidget: (_k, f) => { f?.(tui, theme); } });
     fleet.setUICtx(fleetUi(tui));

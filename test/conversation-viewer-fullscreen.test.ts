@@ -8,21 +8,12 @@
  * cached lines, a frame validates only the transcript's unsettled tail, only
  * visible rows are assembled, and nothing ticks while the viewer is idle.
  */
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ConversationViewer } from "../src/ui/conversation-viewer.js";
 
-const counts = { wrap: 0 };
-vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@earendil-works/pi-tui")>();
-  return {
-    ...actual,
-    wrapTextWithAnsi: (...args: [string, number]) => {
-      counts.wrap++;
-      return actual.wrapTextWithAnsi(...args);
-    },
-  };
-});
-
-const { ConversationViewer } = await import("../src/ui/conversation-viewer.js");
+// The transcript is drawn with Pi's components, which read Pi's global theme.
+initTheme("dark", false);
 
 const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 const COLS = 100;
@@ -32,8 +23,8 @@ function transcript(n: number): any[] {
   const out: any[] = [];
   for (let i = 0; i < n; i++) {
     out.push(i % 2 === 0
-      ? { role: "user", content: `question ${i}\nwith a second line` }
-      : { role: "toolResult", content: [{ type: "text", text: `result ${i}\nline two\nline three` }] });
+      ? { role: "user", content: `question ${i}\nwith a second line`, timestamp: 0 }
+      : { role: "assistant", content: [{ type: "text", text: `answer ${i}\n\nline two\n\nline three` }], stopReason: "stop", timestamp: 0 });
   }
   return out;
 }
@@ -49,7 +40,7 @@ function setup(n: number, scrollbar: "auto" | "always" | "hidden" = "always") {
   const record = { id: "a", type: "general-purpose", description: "fullscreen", status: "running", toolUses: 0, startedAt: 0, lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 } } as any;
   const tui = { mode: "fullscreen", terminal: { rows: ROWS, columns: COLS }, requestRender: vi.fn() };
   const viewer: any = new ConversationViewer(
-    tui as any, session as any, record, undefined, theme, () => {}, () => {}, undefined, () => {}, false, () => "off", undefined, undefined, scrollbar,
+    tui as any, session as any, record, undefined, theme, () => {}, () => {}, undefined, () => {}, false, undefined, scrollbar,
   );
   const mouse = (event: Record<string, unknown>) => viewer.handleMouse({
     type: "wheel", button: "none", x: 10, y: 8, screenX: 10, screenY: 8, width: COLS, height: ROWS, shift: false, alt: false, ctrl: false, ...event,
@@ -60,12 +51,14 @@ function setup(n: number, scrollbar: "auto" | "always" | "hidden" = "always") {
 
 afterEach(() => vi.useRealTimers());
 
+/** Pi component renders so far (each one is a block re-rendered). */
+const renders = (viewer: any): number => viewer.transcript.renders;
+
 describe("fullscreen observer cost profile", () => {
   it("scroll keys, wheel and scrollbar drags rebuild no lines", () => {
     const { viewer, mouse } = setup(200);
     viewer.render(COLS);
-    const sources = vi.spyOn(viewer, "messageLines");
-    counts.wrap = 0;
+    const built = renders(viewer);
 
     for (let i = 0; i < 20; i++) { viewer.handleInput("\x1b[A"); viewer.render(COLS); }
     for (let i = 0; i < 20; i++) { mouse({ wheelDelta: i % 2 ? 3 : -3 }); viewer.render(COLS); }
@@ -76,25 +69,25 @@ describe("fullscreen observer cost profile", () => {
     mouse({ type: "release", button: "left", x: COLS - 1, y: view.top + 3 });
     viewer.render(COLS);
 
-    expect(sources).not.toHaveBeenCalled();
-    expect(counts.wrap).toBe(0);
+    expect(renders(viewer)).toBe(built);
   });
 
   it("validates only the unsettled tail on a frame, however long the transcript", () => {
     for (const n of [200, 2000]) {
       const { viewer, session } = setup(n);
       viewer.render(COLS);
-      const sources = vi.spyOn(viewer, "messageSource");
+      const built = renders(viewer);
+      const lines = viewer.transcript.lines;
+      const copy = [...lines];
       for (let i = 0; i < 10; i++) viewer.render(COLS);
-      // One content check of the last message per frame, not one per message.
-      expect(sources.mock.calls.length).toBeLessThanOrEqual(10);
+      // Nothing re-rendered and the line array was not even rebuilt.
+      expect(renders(viewer)).toBe(built);
+      expect(viewer.transcript.lines).toBe(lines);
+      expect(lines).toEqual(copy);
 
-      sources.mockClear();
-      const lines = vi.spyOn(viewer, "messageLines");
-      session.messages.push({ role: "user", content: "one more" });
+      session.messages.push({ role: "user", content: "one more", timestamp: 0 });
       viewer.render(COLS);
-      expect(lines).toHaveBeenCalledTimes(1);
-      expect(sources.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(renders(viewer)).toBe(built + 1);
     }
   });
 

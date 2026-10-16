@@ -41,7 +41,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { agentIdLine, getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -61,7 +61,7 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
-import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./ui/conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction, type ViewerRenderOptions } from "./ui/conversation-viewer.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { RefreshTicker } from "./ui/refresh-ticker.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
@@ -595,14 +595,6 @@ export default function (pi: ExtensionAPI) {
   let showModel = false;
   function isShowModelEnabled(): boolean { return showModel; }
   function setShowModel(b: boolean): void { showModel = b; widget.update(); }
-  /**
-   * How much of the conversation viewer renders as Markdown. Read through a
-   * getter by the viewer rather than captured like `showCost`, because the
-   * viewer's `m` key writes back here while the overlay is on screen.
-   */
-  let viewerMarkdown: ViewerMarkdownMode = "assistant";
-  function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
-  function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
   /** The `backgroundKey` setting as written; undefined means the default. Persisted as written. */
   let backgroundKeySetting: string | undefined;
   function setBackgroundKey(key: string): void { backgroundKeySetting = key; }
@@ -610,16 +602,6 @@ export default function (pi: ExtensionAPI) {
   function getBackgroundKey(): string | undefined {
     const key = backgroundKeySetting ?? DEFAULT_BACKGROUND_KEY;
     return key === "off" ? undefined : key;
-  }
-  /**
-   * The viewer's `m` key, from either entry point: set the mode and persist it,
-   * so the key and `/agents → Settings` stay one setting rather than one per
-   * entry point. `ctx` carries only the warning a failed write notifies with,
-   * and the fleet list may be acting without one.
-   */
-  function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: ExtensionCommandContext): void {
-    setViewerMarkdown(mode);
-    persistSettings(ctx, `Viewer markdown set to ${mode}`);
   }
   const pendingUsage = new PendingUsagePool();
 
@@ -1759,11 +1741,28 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Pi's chat settings the conversation viewer draws with, read from the main
+   * session's live settings and normalized as Pi's SettingsManager getters do,
+   * so a subagent's transcript looks like the main one.
+   */
+  function getViewerRenderOptions(): ViewerRenderOptions {
+    try {
+      const settings = pi.getSettings();
+      return {
+        hideThinkingBlock: settings.hideThinkingBlock ?? false,
+        outputPad: settings.outputPad === 0 ? 0 : 1,
+        codeBlockIndent: settings.markdown?.codeBlockIndent ?? "  ",
+      };
+    } catch {
+      return {};
+    }
+  }
+
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  // The last two arguments keep a conversation overlay opened here identical to
-  // one opened from `/agents`: same setting on the way in, same persist out.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined), refreshTicker,
+  // The render options keep a conversation overlay opened here identical to one
+  // opened from `/agents`.
+  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerRenderOptions, refreshTicker,
     backgroundActionFor, getFullscreenScrollbar);
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
@@ -2118,7 +2117,6 @@ export default function (pi: ExtensionAPI) {
     setReportUsage,
     setShowCost,
     setShowModel,
-    setViewerMarkdown,
     setBackgroundKey,
   };
   applyAndEmitLoaded(settingsAppliers, (event, payload) => pi.events.emit(event, payload), process.cwd(), projectTrusted);
@@ -3966,8 +3964,8 @@ Terse command-style prompts produce shallow, generic work.
           if (manager.abort(record.id)) {
             ctx.ui.notify(`Stopped "${record.description}".`, "info");
           }
-        }, keybindings, (message: string) => manager.steer(record.id, message), showCost, getViewerMarkdown, (mode) => chooseViewerMarkdown(mode, ctx),
-        backgroundActionFor(record, message => ctx.ui.notify(message, "info")), getFullscreenScrollbar());
+        }, keybindings, (message: string) => manager.steer(record.id, message), showCost,
+        backgroundActionFor(record, message => ctx.ui.notify(message, "info")), getFullscreenScrollbar(), getViewerRenderOptions());
       },
       {
         overlay: true,
@@ -4371,7 +4369,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
-      viewerMarkdown: getViewerMarkdown(),
       // As written: undefined (the default) stays out of the file.
       backgroundKey: backgroundKeySetting,
     } satisfies SubagentsSettings;
@@ -4561,14 +4558,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
           values: ["on", "off"],
         },
         {
-          id: "viewerMarkdown",
-          label: "Viewer markdown",
-          description:
-            "How much of the conversation viewer renders as Markdown. assistant = assistant text only (default); all = tool results too, for tools that emit Markdown — accepting that a Markdown pass over a diff or a log eats `#` comments, swallows a `---` line and re-fences indented output; off = everything verbatim. `m` in the viewer cycles the same setting (footer: raw / md / md+).",
-          currentValue: getViewerMarkdown(),
-          values: ["off", "assistant", "all"],
-        },
-        {
           id: "fleetView",
           label: "Fleet view",
           description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
@@ -4754,9 +4743,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
         const enabled = value === "on";
         setShowModel(enabled);
         notifyApplied(ctx, `Model display ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "viewerMarkdown") {
-        setViewerMarkdown(value as ViewerMarkdownMode);
-        notifyApplied(ctx, `Viewer markdown set to ${value}`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
@@ -4873,27 +4859,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // the right toast. Successful saves show info; persistence failures downgrade
   // to warning so users aren't silently reverted on restart. Event fires regardless
   // of outcome so listeners see the in-memory change.
-  /**
-   * Persist + broadcast the settings, silent on success — for a change whose
-   * feedback is the UI it just changed: the viewer's `m` key, where a
-   * notification per press would talk over the overlay it is describing.
-   *
-   * A *failed* write still speaks. Every other settings path warns when the
-   * value is session-only, and swallowing it here would leave a preference
-   * looking persisted when the next session will not have it.
-   */
-  function persistSettings(ctx: ExtensionCommandContext | undefined, changeMsg: string): void {
-    const { message, level } = saveAndEmitChanged(
-      snapshotSettings(),
-      changeMsg,
-      (event, payload) => pi.events.emit(event, payload),
-    );
-    // `ctx` is absent only on the fleet path between sessions, where
-    // `currentCtx` has been cleared and there is no UI to carry the warning to.
-    // The write still happens.
-    if (level === "warning") ctx?.ui.notify(message, level);
-  }
-
   function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
     const { message, level } = saveAndEmitChanged(
       snapshotSettings(),

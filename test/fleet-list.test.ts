@@ -2,9 +2,9 @@ import { Editor, type OverlayOptions, type TuiMode, visibleWidth } from "@earend
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import { registerAgents } from "../src/agent-types.js";
-import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
+import type { AgentConfig, AgentRecord } from "../src/types.js";
 import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
-import type { ViewerBackgroundAction } from "../src/ui/conversation-viewer.js";
+import type { ViewerBackgroundAction, ViewerRenderOptions } from "../src/ui/conversation-viewer.js";
 import {
   FLEET_TICK_MS,
   FleetList,
@@ -123,8 +123,7 @@ function harness(
   agents: AgentRecord[],
   opts: {
     tuiMode?: TuiMode;
-    viewerMarkdown?: () => ViewerMarkdownMode;
-    onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    viewerRenderOptions?: () => ViewerRenderOptions | undefined;
     backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction;
   } = {},
 ): Harness {
@@ -158,7 +157,7 @@ function harness(
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown, undefined, opts.backgroundAction);
+  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerRenderOptions, undefined, opts.backgroundAction);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -612,22 +611,15 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.manager.steer).toHaveBeenCalledWith("live", "go left");
   });
 
-  it("hands the viewer the user's markdown setting, and persists a mode chosen with m", () => {
-    const persisted: ViewerMarkdownMode[] = [];
-    const h = harness([makeRecord({ id: "live", description: "the one" })], {
-      viewerMarkdown: () => "all",
-      onViewerMarkdown: (mode) => persisted.push(mode),
-    });
+  it("hands the viewer Pi's chat settings, read when it opens", () => {
+    const options = vi.fn(() => ({ hideThinkingBlock: true, outputPad: 0 }));
+    const h = harness([makeRecord({ id: "live", description: "the one" })], { viewerRenderOptions: options });
+    expect(options).not.toHaveBeenCalled();
     h.press(DOWN);  // activate (main)
     h.press(DOWN);  // → the agent
     h.press(ENTER); // open the conversation viewer
 
-    h.overlayComponent()!.handleInput("m");
-
-    // "all" → "off" proves the cycle started from the *setting*; the viewer's own
-    // fallback would have started at "assistant" and landed on "all". A recorded
-    // value at all proves the persist hook is wired, as it is from /agents.
-    expect(persisted).toEqual(["off"]);
+    expect(options).toHaveBeenCalledTimes(1);
   });
 
   it("does NOT auto-close when the viewed agent finishes (final output stays readable)", () => {

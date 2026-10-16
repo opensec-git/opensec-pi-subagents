@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
 import { createDiscoveryCache } from "./discovery-cache.js";
-import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
+import type { AgentMentionMode, JoinMode, WidgetMode } from "./types.js";
 
 export type ProjectTrustMode = "full" | "pi";
 
@@ -323,19 +323,6 @@ export interface SubagentsSettings {
    */
   showModel?: boolean;
   /**
-   * How much of the conversation viewer's transcript renders as Markdown.
-   * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
-   * same setting, so a choice made in the overlay persists like one made in
-   * `/agents → Settings`.
-   *
-   * Scoped rather than all-or-nothing because the two kinds of content have
-   * different contracts: assistant text is authored as Markdown, while a tool
-   * result is whatever bytes the tool produced. Rendering the latter as
-   * Markdown is lossy in ways that look like the tool misbehaved — see
-   * `ViewerMarkdownMode` for the specific rewrites — so `all` is opt-in.
-   */
-  viewerMarkdown?: ViewerMarkdownMode;
-  /**
    * The key that sends every running foreground `Agent` call to the background,
    * as Claude Code's ctrl+b does. A pi key id (`ctrl+b`, `alt+b`, `ctrl+shift+b`,
    * …); `"off"` disables it. Defaults to `ctrl+b`.
@@ -377,7 +364,6 @@ export interface SettingsAppliers {
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
-  setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
   setBackgroundKey: (key: string) => void;
 }
 
@@ -387,7 +373,6 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
-const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
@@ -506,9 +491,7 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.showModel === "boolean") {
     out.showModel = r.showModel;
   }
-  if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
-    out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
-  }
+  // `viewerMarkdown` (until 0.20.3) is ignored: the viewer draws with Pi's own components now.
   if (typeof r.backgroundKey === "string" && r.backgroundKey.trim()) {
     out.backgroundKey = r.backgroundKey.trim().toLowerCase();
   }
@@ -615,7 +598,6 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
-  if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (s.backgroundKey) appliers.setBackgroundKey(s.backgroundKey);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }

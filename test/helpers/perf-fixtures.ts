@@ -27,6 +27,17 @@
  *    reports the wrong arity and silently measures the wrong configuration.
  */
 
+import { initTheme } from "@earendil-works/pi-coding-agent";
+
+/**
+ * Initialize Pi's global theme. The conversation viewer draws with Pi's chat
+ * components, which read it; without it the viewer falls back to plain text
+ * and a benchmark would measure the fallback.
+ */
+export function usePiTheme(): void {
+  initTheme("dark", false);
+}
+
 /** Identity theme: measure the render, not the ANSI. */
 export const perfTheme = {
   fg: (_color: string, text: string) => text,
@@ -148,36 +159,41 @@ const ASSISTANT_MARKDOWN =
   `## Findings\n\n${PARAGRAPH}\n\n- the first observation, which wraps\n` +
   "- the second observation\n\n```ts\nconst x = compute(input);\n```\n";
 
-/** A tool result: arbitrary bytes, rendered raw, capped by the viewer at 16 KB. */
+/** A tool result: arbitrary bytes, drawn by the tool's renderer. */
 const TOOL_RESULT = `${PARAGRAPH}\n${PARAGRAPH}\n`;
 
 /**
- * A synthetic transcript of `n` messages, cycling user → assistant → toolResult.
+ * A synthetic transcript of `n` messages, cycling user → assistant (with a
+ * `read` call) → that call's toolResult, shaped as Pi's session messages are.
  *
- * Message objects are stable across renders on purpose: the viewer's Markdown
- * cache is a `WeakMap` keyed by the message, so reusing one session across
- * iterations measures the warm path a real viewer sees on its second frame
- * onward. Build a fresh session to measure the cold one.
+ * Reusing one session across iterations measures the warm path a real viewer
+ * sees on its second frame onward (its components and their lines are kept).
+ * Build a fresh session and viewer to measure the cold one.
  */
 export function makeSession(n: number) {
   const messages: any[] = [];
   for (let i = 0; i < n; i++) {
     const slot = i % 3;
     if (slot === 0) {
-      messages.push({ role: "user", content: `Message ${i}: ${PARAGRAPH}` });
+      messages.push({ role: "user", content: `Message ${i}: ${PARAGRAPH}`, timestamp: 0 });
     } else if (slot === 1) {
       messages.push({
         role: "assistant",
         content: [
           { type: "text", text: `${ASSISTANT_MARKDOWN}\n(message ${i})` },
-          { type: "toolCall", name: "read" },
+          { type: "toolCall", id: `call-${i}`, name: "read", arguments: { path: `src/file-${i}.ts` } },
         ],
+        stopReason: "toolUse",
+        timestamp: 0,
       });
     } else {
       messages.push({
         role: "toolResult",
+        toolCallId: `call-${i - 1}`,
         toolName: "read",
         content: [{ type: "text", text: `${TOOL_RESULT}(result ${i})` }],
+        isError: false,
+        timestamp: 0,
       });
     }
   }
@@ -252,25 +268,7 @@ export function mountFleet(FleetList: any, records: unknown[]) {
   };
 }
 
-/** Construct a `ConversationViewer` over a synthetic session. */
-export function mountViewer(
-  Viewer: any,
-  session: any,
-  record: unknown = makeRecord(0),
-  markdownMode?: () => string,
-) {
-  const viewer = new Viewer(
-    perfTui(120, 40),
-    session,
-    record,
-    undefined,
-    perfTheme,
-    () => {},
-    undefined,
-    undefined,
-    undefined,
-    false,
-    markdownMode,
-  );
-  return viewer;
+/** Construct a `ConversationViewer` over a synthetic session. Call `usePiTheme()` first. */
+export function mountViewer(Viewer: any, session: any, record: unknown = makeRecord(0)) {
+  return new Viewer(perfTui(120, 40), session, record, undefined, perfTheme, () => {});
 }

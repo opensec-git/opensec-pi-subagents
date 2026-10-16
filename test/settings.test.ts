@@ -171,13 +171,10 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
-  it("round-trips viewerMarkdown; keeps valid values, drops invalid", () => {
-    saveSettings({ viewerMarkdown: "off" }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "off" });
-    saveSettings({ viewerMarkdown: "all" }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "all" });
-    writeProject({ viewerMarkdown: "markdown" } as any);
-    expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
+  it("ignores the removed viewerMarkdown setting", () => {
+    // 0.20.4: the viewer draws with Pi's own components; an old file still loads.
+    writeProject({ viewerMarkdown: "off", showCost: true } as any);
+    expect(loadSettings(projectDir)).toEqual({ showCost: true });
   });
 
   it("round-trips outputTranscript; drops non-boolean", () => {
@@ -565,7 +562,6 @@ describe("settings persistence", () => {
         setAgentMentions: vi.fn(),
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
-        setViewerMarkdown: vi.fn(),
         setBackgroundKey: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
@@ -688,13 +684,6 @@ describe("settings persistence", () => {
       expect(appliers.setBackgroundKey).toHaveBeenCalledWith("off");
       applySettings({}, appliers);
       expect(appliers.setBackgroundKey).toHaveBeenCalledTimes(1); // absence is "use default"
-    });
-
-    it("applies viewerMarkdown; skips it when absent", () => {
-      applySettings({ viewerMarkdown: "all" }, appliers);
-      expect(appliers.setViewerMarkdown).toHaveBeenCalledWith("all");
-      applySettings({}, appliers);
-      expect(appliers.setViewerMarkdown).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
     it("applies fleetView (true and false); skips it when absent", () => {
@@ -824,7 +813,6 @@ describe("settings persistence", () => {
         setAgentMentions: vi.fn(),
       setRememberAgents: vi.fn(),
         setWidgetMode: vi.fn(),
-        setViewerMarkdown: vi.fn(),
         setBackgroundKey: vi.fn(),
         setOutputTranscript: vi.fn(),
         setWorktreeIsolation: vi.fn(),
