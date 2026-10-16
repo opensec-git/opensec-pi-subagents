@@ -57,6 +57,7 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { RefreshTicker } from "./ui/refresh-ticker.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
@@ -105,7 +106,7 @@ function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
  * Create an AgentActivity state and spawn callbacks for tracking tool usage.
  * Used by both foreground and background paths to avoid duplication.
  */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
+function createActivityTracker(maxTurns?: number) {
   const state: AgentActivity = {
     activeTools: new Map(),
     toolUses: 0,
@@ -125,24 +126,20 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
         }
         state.toolUses++;
       }
-      onStreamUpdate?.();
     },
     onTextDelta: (_delta: string, fullText: string) => {
       state.responseText = fullText;
-      onStreamUpdate?.();
     },
     onTurnEnd: (turnCount: number) => {
       state.turnCount = turnCount;
-      onStreamUpdate?.();
     },
     onSessionCreated: (session: any) => {
       state.session = session;
     },
     // Spend is accumulated on the AgentRecord (agent-manager), which is what
-    // every surface reads; this callback exists here only to repaint on it.
-    onAssistantUsage: (_usage: LifetimeUsage) => {
-      onStreamUpdate?.();
-    },
+    // every surface reads. Surfaces pick changes up on their next frame (the
+    // widget tick, the foreground spinner) rather than one push per event.
+    onAssistantUsage: (_usage: LifetimeUsage) => {},
   };
 
   return { state, callbacks };
@@ -1176,6 +1173,7 @@ export default function (pi: ExtensionAPI) {
     // The interval is cleared first; the UI calls after it may meet a context
     // that is already gone.
     try { widget.dispose(); } catch { /* stale UI context at shutdown */ }
+    refreshTicker.clear();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
@@ -1190,14 +1188,17 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  // One clock for the widget, the fleet list and the inline foreground
+  // spinners, so their redraws share a frame.
+  const refreshTicker = new RefreshTicker();
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled, refreshTicker);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined), refreshTicker);
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
@@ -2334,7 +2335,9 @@ Terse command-style prompts produce shallow, generic work.
         });
       };
 
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
+      // No per-event push: the spinner frame below sends the latest state, so
+      // a token-rate stream costs one update per frame, not one per token.
+      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
       // Wire session creation: register in widget + stream to output file.
       // The output file path is set synchronously after spawn (below),
@@ -2368,11 +2371,13 @@ Terse command-style prompts produce shallow, generic work.
         }
       };
 
-      // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
-      const spinnerInterval = setInterval(() => {
+      // Animate spinner at ~80ms (smooth rotation through 10 braille frames),
+      // on the clock the widget and fleet list share, so their redraws coincide.
+      const spinnerOwner = {};
+      refreshTicker.set(spinnerOwner, 80, () => {
         spinnerFrame++;
         streamUpdate();
-      }, 80);
+      });
 
       streamUpdate();
 
@@ -2406,7 +2411,7 @@ Terse command-style prompts produce shallow, generic work.
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
         // ticking or a finished agent on the widget.
-        clearInterval(spinnerInterval);
+        refreshTicker.delete(spinnerOwner);
         if (fgId) {
           agentActivity.delete(fgId);
           widget.markFinished(fgId);
@@ -2936,11 +2941,13 @@ Terse command-style prompts produce shallow, generic work.
       // call; the background agent keeps running and remains unconsumed so its
       // completion notification can still be delivered.
       // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
+      // them), so wait on the queue's start gate (resolved on every way out of
+      // the queue) until they leave it, then await like a running one. Polling
+      // is the fallback for a queued record without a gate.
       if (params.wait && (record.status === "running" || record.status === "queued")) {
         while (record.status === "queued") {
           await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
+            record.startGate ?? new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
             signal,
           );
         }

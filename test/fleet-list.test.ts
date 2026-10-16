@@ -5,6 +5,7 @@ import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
 import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
 import {
+  FLEET_TICK_MS,
   FleetList,
   type FleetUICtx,
   type FleetWorkflow,
@@ -352,7 +353,7 @@ describe("FleetList navigation", () => {
       fleet.setEnabled(false); // hides, clears the timer
       fleet.setEnabled(true);  // re-shows — must re-arm the timer
       const before = listAgents.mock.calls.length;
-      vi.advanceTimersByTime(250); // a tick should fire and re-read the roster
+      vi.advanceTimersByTime(FLEET_TICK_MS); // a tick should fire and re-read the roster
       expect(listAgents.mock.calls.length).toBeGreaterThan(before);
       fleet.dispose();
     } finally {

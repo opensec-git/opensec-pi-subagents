@@ -1,0 +1,777 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`AgentWidget rows > 0 running, 0 queued, 1 finished, width 70 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 1 finished, width 70, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 1 finished, width 220 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 1 finished, width 220, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 11 finished, width 70 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 11 finished, width 70, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 11 finished, width 220 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 2.0s</dim><error> error: boom boom boom boom boom boom b[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 3.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>5.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 6.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 8.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>9.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> aborted</warning>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 10 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 11.0s</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 11 finished, width 220, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.001 · 2.0s</dim><error> error: boom boom boom boom b[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.002 · 3.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.004 · 5.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.005 · 6.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · ~$0.007 · 8.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.008 · 9.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> aborted</warning>
+<dim>└─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 10 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.01 · 11.0s</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 12 finished, width 70 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 12 finished, width 70, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 12 finished, width 220 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 2.0s</dim><error> error: boom boom boom boom boom boom b[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 3.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>5.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 6.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 8.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>9.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> aborted</warning>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 0 queued, 12 finished, width 220, cost+model 1`] = `
+"<dim>○</dim> <dim>Agents</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 0 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.001 · 2.0s</dim><error> error: boom boom boom boom b[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.002 · 3.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.004 · 5.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.005 · 6.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · ~$0.007 · 8.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.008 · 9.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> aborted</warning>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 2 queued, 15 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>└─</dim> <dim>+6 more (6 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 2 queued, 15 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>└─</dim> <dim>+6 more (6 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 2 queued, 15 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 3.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>5.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 6.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 8.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>9.0s</dim><error> error: boom boom boom boom boom boom boom boom boom[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 10 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 11.0s</dim><dim> stopped</dim>
+<dim>└─</dim> <dim>+6 more (6 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 2 queued, 15 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.002 · 3.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.004 · 5.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.005 · 6.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · ~$0.007 · 8.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.008 · 9.0s</dim><error> error: boom boom boom boom boom boom boom[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 10 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.01 · 11.0s</dim><dim> stopped</dim>
+<dim>└─</dim> <dim>+6 more (6 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 3 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>3 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 3 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>3 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 3 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>3 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 3 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>3 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 5 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>5 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 5 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>5 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 5 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>5 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 0 running, 5 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <muted>◦</muted> <dim>5 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  thinking…</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  thinking…</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>   </dim><dim>  ⎿  thinking…</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>   </dim><dim>  ⎿  thinking…</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 10 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 10 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 10 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 2.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 3.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>5.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 6.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 8.0s</dim><error> error: boom boom boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>9.0s</dim><warning> (turn limit)</warning>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 1 running, 0 queued, 10 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 1 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.001 · 2.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 2 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · ~$0.002 · 3.0s</dim><error> error: boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.004 · 5.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.005 · 6.0s</dim><warning> aborted</warning>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 7 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · ~$0.007 · 8.0s</dim><error> error: boom boom boom boom [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 8 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.008 · 9.0s</dim><warning> (turn limit)</warning>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 2 running, 1 queued, 1 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 2 running, 1 queued, 1 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 2 running, 1 queued, 1 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 2 running, 1 queued, 1 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 3 running, 0 queued, 4 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  searching 2 patterns…</dim>"
+`;
+
+exports[`AgentWidget rows > 3 running, 0 queued, 4 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  [0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim[0m...[0m
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  searching 2 patterns…</dim>"
+`;
+
+exports[`AgentWidget rows > 3 running, 0 queued, 4 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>5.0s</dim><error> error: boom boom boom boom boom boom boom boom boom[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 6.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>   </dim><dim>  ⎿  searching 2 patterns…</dim>"
+`;
+
+exports[`AgentWidget rows > 3 running, 0 queued, 4 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 3 doing a task with a fairly long description</dim> <dim>·</dim> <dim>3 tool uses · 4.0s</dim>
+<dim>├─</dim> <error>✗</error> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 4 doing a task with a fairly long description</dim> <dim>·</dim> <dim>~$0.004 · 5.0s</dim><error> error: boom boom boom boom boom boom boom[0m...[0m
+<dim>├─</dim> <warning>✓</warning> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 5 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · ~$0.005 · 6.0s</dim><warning> (turn limit)</warning>
+<dim>├─</dim> <dim>■</dim> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim><dim> stopped</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>   </dim><dim>  ⎿  searching 2 patterns…</dim>"
+`;
+
+exports[`AgentWidget rows > 4 running, 2 queued, 3 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 4 running, 2 queued, 3 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 4 running, 2 queued, 3 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 4 running, 2 queued, 3 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>2 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 6 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 7.0s</dim>
+<dim>└─</dim> <dim>+2 more (2 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 0 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  reading…</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 0 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>   </dim><dim>  ⎿  reading…</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 0 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · 5.0s</dim>
+<dim>   </dim><dim>  ⎿  reading…</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 0 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>└─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · ~$0.004 · 5.0s</[0m...[0m
+<dim>   </dim><dim>  ⎿  reading…</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 1 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 1 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 1 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · 5.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 5 running, 1 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · ~$0.004 · 5.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <muted>◦</muted> <dim>1 queued</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 0 queued, 0 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <dim>+1 more (1 running)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 0 queued, 0 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <dim>+1 more (1 running)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 0 queued, 0 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · 5.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <dim>+1 more (1 running)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 0 queued, 0 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 4 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻5 · 4 tool uses · 440 token (<dim>⇊1</dim>) · ~$0.004 · 5.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>└─</dim> <dim>+1 more (1 running)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 3 queued, 5 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>3 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+6 more (2 running, 4 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 3 queued, 5 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>3 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+6 more (2 running, 4 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 3 queued, 5 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>3 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim>
+<dim>└─</dim> <dim>+6 more (2 running, 4 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 6 running, 3 queued, 5 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>3 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 9 doing a task with a fairly long description</dim> <dim>·</dim> <dim>1 tool use · 10.0s</dim>
+<dim>└─</dim> <dim>+6 more (2 running, 4 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 10 running, 20 queued, 30 finished, width 70 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>20 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+35 more (6 running, 29 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 10 running, 20 queued, 30 finished, width 70, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>[0m...[0m
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>20 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</di[0m...[0m
+<dim>└─</dim> <dim>+35 more (6 running, 29 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 10 running, 20 queued, 30 finished, width 220 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>) · 2.0s</dim>
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · 3.0s</dim>
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>20 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 30 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 31.0s</dim>
+<dim>└─</dim> <dim>+35 more (6 running, 29 finished)</dim>"
+`;
+
+exports[`AgentWidget rows > 10 running, 20 queued, 30 finished, width 220, cost+model 1`] = `
+"<accent>●</accent> <accent>Agents</accent>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 0 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻1 · 1.0s</dim>
+<dim>│  </dim><dim>  ⎿  thinking…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 1 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻2≤20 · 1 tool use · 110 token (<dim>⇊1</dim>)[0m...[0m
+<dim>│  </dim><dim>  ⎿  reading…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 2 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · ↻3 · 2 tool uses · 220 token (<dim>⇊2</dim>) · ~$0.002 · 3.0s</[0m...[0m
+<dim>│  </dim><dim>  ⎿  searching 2 patterns…</dim>
+<dim>├─</dim> <accent>⠙</accent> *Agent* <dim>(twin)</dim>  <muted>agent 3 doing a task with a fairly long description</muted> <dim>·</dim> <dim>sonnet · thinking: high · ↻4≤20 · 3 tool uses · 330 token · 4.0s</dim>
+<dim>│  </dim><dim>  ⎿  first line of the reply</dim>
+<dim>├─</dim> <muted>◦</muted> <dim>20 queued</dim>
+<dim>├─</dim> <success>✓</success> <dim>Agent</dim> <dim>(twin)</dim>  <dim>agent 30 doing a task with a fairly long description</dim> <dim>·</dim> <dim>2 tool uses · 31.0s</dim>
+<dim>└─</dim> <dim>+35 more (6 running, 29 finished)</dim>"
+`;

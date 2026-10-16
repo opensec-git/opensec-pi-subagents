@@ -397,10 +397,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // Wait for completion if requested. Cancellation (e.g. the parent's tool
       // call is aborted) stops only this wait; the nested child keeps running and
       // stays unconsumed. Queued records have no promise until the manager starts
-      // them, so poll — abortably — until they leave the queue, then await.
+      // them, so wait — abortably — on the queue's start gate (polling without
+      // one) until they leave the queue, then await.
       if (params.wait && (record.status === "queued" || record.status === "running")) {
         while (record.status === "queued") {
-          await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
+          await abortable(record.startGate ?? new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
         if (record.promise) await abortable(record.promise, signal);
       }

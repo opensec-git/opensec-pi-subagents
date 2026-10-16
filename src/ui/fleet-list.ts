@@ -18,13 +18,18 @@ import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
+import { RefreshTicker } from "./refresh-ticker.js";
 
 /** Widget key for the below-editor fleet list. */
 const FLEET_KEY = "fleet";
 /** Max agent rows shown at once; extras collapse into a "↓ N more" indicator. */
 const MAX_AGENT_ROWS = 5;
-/** Re-render cadence so elapsed/token stats tick while agents run. */
-const TICK_MS = 200;
+/**
+ * Re-render cadence so elapsed/token stats tick while agents run. The list
+ * shows whole seconds, so once a second is enough; while the widget's 80 ms
+ * spinner runs, every frame redraws this list anyway.
+ */
+export const FLEET_TICK_MS = 1000;
 /** How long a finished agent lingers in the list before it drops out. */
 const FINISHED_LINGER_MS = 4000;
 
@@ -101,7 +106,6 @@ export class FleetList {
   private tui: any | undefined;
   private inputUnsub: (() => void) | undefined;
   private widgetRegistered = false;
-  private timer: ReturnType<typeof setInterval> | undefined;
 
   private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
@@ -144,6 +148,8 @@ export class FleetList {
      * point. Omitted → `m` still cycles, viewer-locally.
      */
     private onViewerMarkdown?: (mode: ViewerMarkdownMode) => void,
+    /** Shared with the widget by the extension, so both redraw on one frame. */
+    private ticker: RefreshTicker = new RefreshTicker(),
   ) {}
 
   // ---- Lifecycle ----
@@ -167,7 +173,7 @@ export class FleetList {
 
   /** Ensure the re-render timer is running (called when an agent spawns). */
   ensureTimer(): void {
-    if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
+    if (!this.ticker.has(this)) this.ticker.set(this, FLEET_TICK_MS, () => this.update());
   }
 
   /**
@@ -179,7 +185,7 @@ export class FleetList {
   }
 
   dispose(): void {
-    if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+    this.ticker.delete(this);
     this.inputUnsub?.();
     this.inputUnsub = undefined;
     if (this.viewerClose) { this.viewerClose(); this.viewerClose = undefined; }
@@ -202,7 +208,8 @@ export class FleetList {
     // it is the thing the user opens to see what its children did. Read off the
     // roster for the same reason activation does: two counts of "is there
     // anything here" drifted apart once before.
-    const hasRows = this.enabled && this.roster().length > 1;
+    const roster = this.roster();
+    const hasRows = this.enabled && roster.length > 1;
 
     if (!hasRows) {
       if (this.widgetRegistered) {
@@ -210,14 +217,18 @@ export class FleetList {
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      this.ticker.delete(this);
       this.active = false;
       this.selectedIndex = 0;
       return;
     }
 
     this.clampSelection();
-    this.ensureTimer(); // keep stats ticking whenever the list is shown (e.g. after a re-enable)
+    // Tick only while a row's clock runs or a finished row still has to drop
+    // out. The agent an open overlay keeps in the list is static once it has
+    // finished, and ticking for it redrew the overlay every 200 ms forever.
+    if (roster.some(entry => this.isLive(entry))) this.ensureTimer();
+    else this.ticker.delete(this);
 
     if (!this.widgetRegistered) {
       this.ui.setWidget(FLEET_KEY, (tui, theme) => {
@@ -294,6 +305,20 @@ export class FleetList {
       ...this.workflows().map(workflow => ({ kind: "workflow" as const, workflow })),
       ...this.agentRecords().map(record => ({ kind: "agent" as const, record })),
     ];
+  }
+
+  /** Whether a row changes with time: a running clock, or a linger that has not expired yet. */
+  private isLive(entry: FleetEntry): boolean {
+    const now = Date.now();
+    if (entry.kind === "agent") {
+      const r = entry.record;
+      return r.status === "running" || r.status === "queued" || (r.completedAt != null && now - r.completedAt < FINISHED_LINGER_MS);
+    }
+    if (entry.kind === "workflow") {
+      const w = entry.workflow;
+      return w.status === "running" || w.status === "paused" || (w.completedAt != null && now - w.completedAt < FINISHED_LINGER_MS);
+    }
+    return false;
   }
 
   private clampSelection(): void {

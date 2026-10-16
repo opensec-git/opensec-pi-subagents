@@ -293,6 +293,8 @@ export function installExtensionToolScope(
   },
 ): void {
   const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames, guard } = ctx;
+  // A loaded extension's manifest is fixed for the session; read each once, not per tool call.
+  const canonsByPath = new Map<string, string[]>();
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -303,7 +305,8 @@ export function installExtensionToolScope(
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
       if (extension.path === TOOL_SCOPE_GUARD_PATH) continue;
-      const canons = extensionCanonicalNames(extension.path);
+      const canons = canonsByPath.get(extension.path) ?? extensionCanonicalNames(extension.path);
+      canonsByPath.set(extension.path, canons);
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
