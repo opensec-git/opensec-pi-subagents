@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.5] - 2026-10-16
+
+Orchestration results the main agent can act on: failed runs are error results with what they produced, unfinished
+agents point at the completion notification instead of inviting polling, and a released agent's result stays readable.
+
+> **Possibly breaking:**
+> - **Failed, aborted and stopped runs return `isError: true`**, as do unknown-agent lookups and refused steers or
+>   resumes. Pi shows them as tool errors and the main agent reads them as failures.
+> - **A model name that matches several models is refused** instead of resolving to the closest one. Use the exact
+>   `provider/id`, or a short name that matches one model.
+
+### Added
+
+- **`get_subagent_result` reads a released agent's result from its saved session.** After the 10-minute cleanup it
+  used to answer `Agent not found`; it now answers with the status and model from the kept resume state and the final
+  result read from the session file, marked as such. Nothing is held in memory longer: the file is read on demand. The
+  resume state now records the run's status.
+- **Each run records the model and thinking level it ran with**, a resumed run its own. The foreground result's
+  stats, `get_subagent_result` (`Model:`) and the completion notification (`<model>`, `<thinking>`) show them.
+- **Malformed tool arguments from weak models are repaired before validation** (`prepareArguments`) on the top-level
+  and nested `Agent`, `get_subagent_result` and `steer_subagent` tools: the arguments object sent as a JSON string or
+  stuffed into one string field, arrays where a string is expected, `null` optional fields, booleans and numbers sent
+  as strings, and a missing `subagent_type` on the top-level `Agent` tool, which goes to the default type under the
+  `fallbackSubagent` policy (`Note: No agent type given — using …`). A missing prompt is never invented.
+
+### Changed
+
+- **Failed runs are error results.** The foreground `Agent` result, resumed runs and `get_subagent_result`, top-level
+  and nested, set `isError` for `error`, `aborted` and `stopped`. The result renderer keeps the agent's status line for
+  these. A stopped run's headline reads `Agent was stopped by the user after …`, an aborted one `Agent was aborted
+  after …`, instead of `Agent completed in …`.
+- **Failure results keep the partial output and name the session file.** The run's last assistant text is kept also
+  when the run threw or a stopped run was abandoned, bounded to the run's own turns, and the result names the agent's
+  saved session file, which holds every turn (`<session-file>` in the notification). No separate files are written.
+- **No more polling prompts.** `get_subagent_result` on a running, queued or still-stopping agent says a completion
+  notification arrives on its own, to continue with other work, and not to call it again for that agent until then.
+  Its description and the `wait` parameter say the same; `wait` stays `false` by default. Background spawn and resume
+  results and the refused resume of a running agent no longer suggest `get_subagent_result` to wait.
+- **Notifications preview the first 10 lines of a result**, still capped at 500 characters (300 per agent in a group)
+  so one long line cannot flood the context, and carry the full result's size in `<result_bytes>`. The truncation note
+  says how many lines and bytes were left out.
+- **Model names resolve without guessing.** An exact `provider/id` (case-insensitive) and a short name that matches one
+  model resolve as before. A name whose best match is shared by several models is an error naming up to five closest
+  candidates. A per-call model that does not resolve stays a tool error on every path.
+- **An agent file's model that does not resolve is reported.** The run still falls back to the parent's model, but its
+  results say which model was asked for, why it was not used and which model ran instead (the `Agent` and nested
+  `Agent` results, `get_subagent_result`, `<model-note>` in the notification). Spawns that resolve the agent file's
+  model by exact `provider/id` only (`@mentions`, RPC, scheduled jobs) and scheduled jobs whose model no longer
+  resolves note it the same way; workflows show it as a warning once per run.
+- **More released agents stay addressable:** 2000 top-level and 4000 nested or workflow entries (was 100 and 200).
+  An entry holds ids, paths and settings, about 450 bytes (700 with a worktree), never the conversation. Restoring
+  them at session start trims once instead of rescanning per entry.
+
 ## [0.20.4] - 2026-10-16
 
 The conversation viewer draws a subagent's transcript with Pi's own chat components, so it looks exactly like Pi's

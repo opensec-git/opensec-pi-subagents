@@ -61,7 +61,7 @@ Agent({ subagent_type: "Explore", prompt: "Find authentication code", descriptio
 | Tool | What it does |
 |---|---|
 | `Agent` | Starts an agent. A background run returns an ID and notifies the main session when it finishes; set `run_in_background: false` when the next step must wait for its result. Also accepts session-scoped cron, interval, and one-shot schedules. |
-| `get_subagent_result` | Returns the full result of an agent. |
+| `get_subagent_result` | Returns the full result of a finished agent, also after its record was released from memory. For an agent still running it says to wait for the completion notification instead of checking again (`wait: true` blocks, and is off by default). |
 | `steer_subagent` | Redirects a running agent. |
 | `SubagentWorkflow` | Runs repeatable multi-agent work (`agent()`, `parallel()`, `pipeline()`). |
 
@@ -82,6 +82,9 @@ When a background agent (or workflow) finishes, the main session is notified, as
 - If you interrupt the parent (`Esc`), what was waiting is kept and delivered once the interrupted turn has stopped,
   starting a turn.
 - Reading a result with `get_subagent_result` (or the RPC `consume`) before the notification is sent suppresses it.
+- A notification carries the first 10 lines of the result (at most 500 characters, 300 per agent in a group), the
+  full result's size in `<result_bytes>`, the model and thinking level the run used (`<model>`, `<thinking>`), and,
+  when anything was cut, how many lines and bytes were left out. `get_subagent_result` returns the rest.
 - A result that lands while another session is open, or that is still waiting for its parent's boundary when you switch
   away, is recorded in its own session and delivered the same way when you return there (see
   [Switching sessions](#switching-sessions)).
@@ -92,6 +95,21 @@ The join mode (`/agents → Settings → Join mode`, `defaultJoinMode`) decides 
 |---|---|
 | `smart` (default) | No waiting: each result is delivered at the parent's next boundary. `async` is accepted as an older name for it. |
 | `group` | The background agents spawned in one parent turn report together, in one notification once all of them have finished (a lone spawn reports alone). A 30 s timeout after the first completion sends a partial notification; stragglers follow within 15 s. |
+
+### Failed runs
+
+An agent that ends in an error, is aborted at its turn limit, or is stopped by the user is reported to the main agent
+as an error result (`isError`), not as a completed task: the foreground `Agent` result, a resumed run, and
+`get_subagent_result`, top-level and nested. So are lookups of an unknown agent and refused steers or resumes.
+
+- The result keeps the run's last assistant text (`Partial output before the failure:` for an error), also when the
+  run threw or a stopped run had to be abandoned, and names the agent's saved session file, which holds every turn.
+  The background notification carries the file as `<session-file>`.
+- A run the user stopped says so (`Agent was stopped by the user …`, `STOPPED BY THE USER`).
+- Weak models' malformed tool arguments are repaired before Pi validates them: the arguments object sent as a JSON
+  string or stuffed into one field, arrays for strings, `null` optional fields, `"true"` or `"5"` for booleans and
+  numbers, and a missing `subagent_type` (the default type, under the `fallbackSubagent` policy). A missing prompt is
+  never invented.
 
 ### Sending a foreground agent to the background
 
@@ -167,8 +185,10 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
 - A worktree agent resumes in its worktree: it is restored at the same path from the agent's branch, and the new work
   is committed to that branch afterwards. If the branch is gone the resume is refused and nothing runs.
 - How long: a finished agent stays in memory for about ten minutes; after that it is reopened from its saved session
-  file, under the same id, for as long as that file exists. Sessions are saved by default (`rememberAgents`; turn it
-  off and agents are resumable only for those ten minutes).
+  file, under the same id, for as long as that file exists, and `get_subagent_result` reads its status, model and
+  final result from that file (marked as read from the saved session). Sessions are saved by default (`rememberAgents`;
+  turn it off and agents are resumable only for those ten minutes). The last 2000 such agents of a session stay
+  addressable, and 4000 nested and workflow children, at a few hundred bytes each.
 - What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
   stay resumable by the model and by `@handle`. `/new` starts with none. Nested agents and workflow children are
   rebuilt too (their resume state is written to the parent session as `subagents:resume` entries, one small entry per
@@ -204,11 +224,18 @@ A subagent runs on the parent's current model at the parent's current thinking l
 tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cross-extension RPC. For a nested agent the
 parent is the agent that spawned it.
 
-- An agent file's own `model:` or `thinking:` is your configuration and always applies.
+- An agent file's own `model:` or `thinking:` is your configuration and always applies. `model:` takes an exact
+  `provider/id`, or a short name such as `haiku` that matches exactly one available model. A name that matches several
+  models, or none, is not guessed at: the agent runs on the parent's model and its result starts with a note naming
+  the model asked for, why it was not used (with up to five candidates for an ambiguous name), and the model used
+  instead. Workflows show the note as a warning. Spawns that pass no model of their own (`@mentions`, RPC, scheduled
+  jobs) match the agent file's `model:` by exact `provider/id` only, and note a fallback the same way.
+- A model passed per call (with `allowModelOverride`) that is ambiguous or unknown is refused with the candidates.
 - Per-call choices are ignored by default: the `Agent` tool and the nested tool do not offer `model` or `thinking`,
   workflow `agent({ model, effort })` is ignored, and so are a scheduled job's and an RPC spawn's model and thinking
   level. This keeps the main model from picking cheaper models or lower effort on its own.
-- A resumed agent keeps the model and thinking level it ran with.
+- A resumed agent keeps the model and thinking level it ran with. Each run records the model and level it actually ran
+  with; the foreground result, `get_subagent_result` and the notification show them.
 - `allowModelOverride: true` (project or global `subagents.json`, or `/agents → Settings → Model override`) restores the
   per-call overrides and the tool parameters. The resolution changes at once; the tool parameters at the next session.
 
