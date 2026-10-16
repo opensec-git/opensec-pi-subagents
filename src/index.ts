@@ -77,7 +77,7 @@ import { resolveWorkflowScript } from "./workflow/saved.js";
 import { readWorkflowScriptFile } from "./workflow/script-file.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
-import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
+import { isWorktreeIsolationEnabled, MERGED_BRANCH_MAX_AGE_DAYS, pruneMergedAgentBranches, recoverLeftoverWorktrees, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
 
 // ---- Shared helpers ----
@@ -861,6 +861,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     syncProjectTrust(ctx);
+    void tidyAgentWorktrees(ctx);
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1559,6 +1560,25 @@ export default function (pi: ExtensionAPI) {
     setViewerMarkdown,
   };
   applyAndEmitLoaded(settingsAppliers, (event, payload) => pi.events.emit(event, payload), process.cwd(), projectTrusted);
+
+  /**
+   * Salvage or report agent worktrees an interrupted run left behind, and drop
+   * old merged `pi-agent-*` branches (see worktree.ts). Detached and silent on
+   * failure: housekeeping must never delay or break a session start.
+   */
+  async function tidyAgentWorktrees(ctx: ExtensionContext): Promise<void> {
+    try {
+      const lines = await recoverLeftoverWorktrees(pi, ctx.cwd);
+      const pruned = await pruneMergedAgentBranches(pi, ctx.cwd);
+      if (pruned.length > 0) {
+        lines.push(`Deleted ${pruned.length} merged pi-agent branch${pruned.length === 1 ? "" : "es"} older than ${MERGED_BRANCH_MAX_AGE_DAYS} days: ${pruned.join(", ")}.`);
+      }
+      if (lines.length === 0 || currentCtx !== ctx) return;
+      const message = lines.join("\n");
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.warn(`[pi-subagents] ${message}`);
+    } catch { /* housekeeping only */ }
+  }
 
   /**
    * Replace the startup prediction with the session's real trust decision.

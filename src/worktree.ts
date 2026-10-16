@@ -14,7 +14,7 @@
 
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { commandExec } from "./exec-tree.js";
 
@@ -193,6 +193,7 @@ export async function createWorktree(
   try {
     // Create detached worktree at HEAD
     await git(pi, cwd, ["worktree", "add", "--detach", worktreePath, "HEAD"], 30000);
+    await lockWorktree(pi, worktreePath);
     const stash = await stashTop(pi, cwd);
     return {
       path: worktreePath,
@@ -221,6 +222,20 @@ export async function createWorktree(
  * afterwards, so test output and updated snapshots never reach the branch.
  */
 export async function cleanupWorktree(
+  pi: ExtensionAPI,
+  cwd: string,
+  worktree: WorktreeInfo,
+  agentDescription: string,
+  beforeRemove?: (worktreePath: string) => Promise<void>,
+): Promise<WorktreeCleanupResult> {
+  const result = await commitAndRemove(pi, cwd, worktree, agentDescription, beforeRemove);
+  // A worktree left on disk is the user's now: unlocked, so `git worktree
+  // remove --force` and `prune` treat it like any other.
+  if (existsSync(worktree.path)) await unlockWorktree(pi, worktree.path);
+  return result;
+}
+
+async function commitAndRemove(
   pi: ExtensionAPI,
   cwd: string,
   worktree: WorktreeInfo,
@@ -448,6 +463,7 @@ export async function restoreWorktree(
     }
     worktree.baseSha = await git(pi, worktree.path, ["rev-parse", "HEAD"], 5000);
     worktree.stashTop = await stashTop(pi, repo);
+    await lockWorktree(pi, worktree.path);
   } catch (err) {
     if (existsSync(worktree.path)) await removeWorktree(pi, repo, worktree.path);
     else if (createdParent) removeParentDir(worktree.path);
@@ -466,7 +482,8 @@ function removeParentDir(worktreePath: string): void {
  */
 async function removeWorktree(pi: ExtensionAPI, cwd: string, worktreePath: string): Promise<void> {
   try {
-    await git(pi, cwd, ["worktree", "remove", "--force", worktreePath], 10000);
+    // Twice: once for local changes, once more for our own lock.
+    await git(pi, cwd, ["worktree", "remove", "--force", "--force", worktreePath], 10000);
   } catch {
     // If git worktree remove fails, try pruning
     try {
@@ -483,4 +500,168 @@ export async function pruneWorktrees(pi: ExtensionAPI, cwd: string): Promise<voi
   try {
     await git(pi, cwd, ["worktree", "prune"], 5000);
   } catch { /* ignore */ }
+}
+
+/**
+ * A running agent's worktree is locked with this reason and the owning
+ * process id, so a later start (this process or another) can tell a live
+ * agent's worktree from one whose process died.
+ */
+const LOCK_REASON_PREFIX = "pi-agent pid ";
+
+async function lockWorktree(pi: ExtensionAPI, path: string): Promise<void> {
+  try {
+    await git(pi, path, ["worktree", "lock", "--reason", `${LOCK_REASON_PREFIX}${process.pid}`, path], 5000);
+  } catch { /* best effort: an old git without `worktree lock` still works, unprotected */ }
+}
+
+async function unlockWorktree(pi: ExtensionAPI, path: string): Promise<void> {
+  try { await git(pi, path, ["worktree", "unlock", path], 5000); } catch { /* not locked */ }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: it exists, under another user.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+interface RegisteredWorktree {
+  path: string;
+  head?: string;
+  locked?: string;
+}
+
+/** `git worktree list --porcelain`, as records. */
+async function listWorktrees(pi: ExtensionAPI, repo: string): Promise<RegisteredWorktree[]> {
+  const out = await git(pi, repo, ["worktree", "list", "--porcelain"], 10000);
+  const records: RegisteredWorktree[] = [];
+  for (const block of out.split(/\n\s*\n/)) {
+    const record: Partial<RegisteredWorktree> = {};
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) record.path = line.slice("worktree ".length);
+      else if (line.startsWith("HEAD ")) record.head = line.slice("HEAD ".length);
+      else if (line === "locked") record.locked = "";
+      else if (line.startsWith("locked ")) record.locked = line.slice("locked ".length);
+    }
+    if (record.path) records.push(record as RegisteredWorktree);
+  }
+  return records;
+}
+
+/** The agent id when `path` is a worktree `createWorktree` made, else undefined. */
+function agentWorktreeId(path: string): string | undefined {
+  const id = /^pi-agent-(.+)$/.exec(basename(path))?.[1];
+  return id !== undefined && basename(dirname(path)).startsWith(`pi-agent-${id}-`) ? id : undefined;
+}
+
+/**
+ * Agent worktrees a previous run left behind, handled at startup.
+ *
+ * - Locked by a process that is gone (pi was killed, crashed, or quit before
+ *   cleanup finished): cleaned up like a finished agent's, so uncommitted work
+ *   is committed to `pi-agent-<id>-recovered` and the worktree is removed
+ *   unless it holds work a branch cannot carry. A registration whose directory
+ *   is gone is unlocked so `git worktree prune` can drop it.
+ * - Locked by a live process: an agent running now, here or in another pi.
+ *   Left alone.
+ * - Unlocked: kept on purpose by an earlier cleanup, or made by a version that
+ *   did not lock. Never touched; reported when it still holds uncommitted
+ *   work or files git ignores.
+ *
+ * Returns one line per worktree worth telling the user about.
+ */
+export async function recoverLeftoverWorktrees(pi: ExtensionAPI, repo: string): Promise<string[]> {
+  let registered: RegisteredWorktree[];
+  try {
+    registered = await listWorktrees(pi, repo);
+  } catch {
+    return []; // not a git repository
+  }
+  const lines: string[] = [];
+  let pruneNeeded = false;
+  for (const wt of registered) {
+    const id = agentWorktreeId(wt.path);
+    if (id === undefined) continue;
+    const owner = wt.locked?.startsWith(LOCK_REASON_PREFIX) ? Number(wt.locked.slice(LOCK_REASON_PREFIX.length)) : undefined;
+    if (owner !== undefined && processAlive(owner)) continue;
+
+    if (!existsSync(wt.path)) {
+      if (owner !== undefined) {
+        // From the repository: the worktree's own directory is gone.
+        try { await git(pi, repo, ["worktree", "unlock", wt.path], 5000); } catch { /* already unlocked */ }
+        pruneNeeded = true;
+      }
+      continue;
+    }
+
+    try {
+      if (owner === undefined) {
+        const line = await describeKeptWorktree(pi, wt.path);
+        if (line) lines.push(line);
+        continue;
+      }
+      const head = wt.head ?? await git(pi, wt.path, ["rev-parse", "HEAD"], 5000);
+      // The base the cleanup compares against: HEAD itself when a branch
+      // already holds it, else where it left the repository's history.
+      const onBranch = (await git(pi, repo, ["for-each-ref", "--count=1", "--contains", head, "refs/heads"], 5000)) !== "";
+      const baseSha = onBranch ? head : await git(pi, repo, ["merge-base", head, "HEAD"], 5000);
+      const info: WorktreeInfo = { path: wt.path, branch: `pi-agent-${id}-recovered`, baseSha, workPath: wt.path };
+      const result = await cleanupWorktree(pi, repo, info, `work of agent ${id}, recovered after pi stopped`);
+      if (!result.hasChanges) continue;
+      const where = [
+        result.branch ? `saved to branch \`${result.branch}\`` : undefined,
+        result.path && (result.kept || !result.branch) ? `worktree kept at \`${result.path}\`` : undefined,
+      ].filter(Boolean).join("; ");
+      lines.push(`Agent ${id} was interrupted with unsaved work: ${where}.${result.notes?.length ? ` ${result.notes.join(" ")}` : ""}`);
+    } catch { /* unreadable: leave it as it is */ }
+  }
+  if (pruneNeeded) await pruneWorktrees(pi, repo);
+  return lines;
+}
+
+/** A line about an unlocked agent worktree that still holds something, or undefined. */
+async function describeKeptWorktree(pi: ExtensionAPI, path: string): Promise<string | undefined> {
+  const status = await git(pi, path, ["status", "--porcelain"], 10000);
+  if (status) return `Agent worktree \`${path}\` has uncommitted changes.`;
+  const ignored = (await git(pi, path, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"], 10000))
+    .split("\n")
+    .filter((p) => p && !isRegenerable(p));
+  if (ignored.length > 0) {
+    return `Agent worktree \`${path}\` is kept for files git ignores (${listPaths(ignored)}); ` +
+      `remove it with \`git worktree remove --force ${path}\` when done.`;
+  }
+  return undefined;
+}
+
+/** How old a merged `pi-agent-*` branch must be before startup deletes it. */
+export const MERGED_BRANCH_MAX_AGE_DAYS = 7;
+
+/**
+ * Delete `pi-agent-*` branches that are fully merged into HEAD and whose last
+ * commit is older than {@link MERGED_BRANCH_MAX_AGE_DAYS}. Merged means every
+ * commit is already in HEAD, so nothing is lost; `git branch -d` checks that
+ * again and refuses a branch checked out in a worktree. Returns the names.
+ */
+export async function pruneMergedAgentBranches(pi: ExtensionAPI, repo: string, now = Date.now()): Promise<string[]> {
+  let listing: string;
+  try {
+    listing = await git(pi, repo, ["for-each-ref", "--merged=HEAD", "--format=%(refname:short)%09%(committerdate:unix)", "refs/heads/pi-agent-*"], 10000);
+  } catch {
+    return [];
+  }
+  const cutoff = now / 1000 - MERGED_BRANCH_MAX_AGE_DAYS * 86_400;
+  const deleted: string[] = [];
+  for (const line of listing.split("\n")) {
+    const [name, time] = line.split("\t");
+    if (!name || !(Number(time) < cutoff)) continue;
+    try {
+      await git(pi, repo, ["branch", "-d", name], 5000);
+      deleted.push(name);
+    } catch { /* checked out somewhere, or not merged after all */ }
+  }
+  return deleted;
 }

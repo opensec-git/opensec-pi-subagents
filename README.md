@@ -144,6 +144,12 @@ Subagents follow Pi's project trust decision for the parent session.
   repositories it created or changed inside the worktree. Then the worktree is kept and the result names its path and
   the reason; remove it with `git worktree remove --force <path>` when you are done. Stash entries made while the
   agent ran are reported too, since they are not on the branch.
+- A running agent's worktree is locked (`git worktree lock`) with its process id. When pi starts in a repository, a
+  worktree whose process is gone (pi was killed or crashed) has its uncommitted work committed to
+  `pi-agent-<id>-recovered` and is removed unless it holds work a branch cannot carry; you are told either way.
+  Worktrees of agents running in another pi are left alone, and unlocked agent worktrees that still hold changes or
+  ignored files are only reported. At the same start, `pi-agent-*` branches already merged into `HEAD` whose last
+  commit is more than 7 days old are deleted (`git branch -d`); resuming such an agent afterwards is refused.
 - A workflow `gate` on an isolated agent runs after the agent's changes are committed; whatever the gate changes
   (snapshots, coverage, build output) is discarded and never reaches the branch.
 - A worktree agent's `memory: project` and `memory: local` directories are in the real project, not the copy, so
