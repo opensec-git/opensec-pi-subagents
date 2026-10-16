@@ -11,13 +11,13 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
-import { ConversationViewer, VIEWPORT_HEIGHT_PCT, type ViewerBackgroundAction } from "./conversation-viewer.js";
+import { ConversationViewer, getConversationOverlayOptions, type ViewerBackgroundAction } from "./conversation-viewer.js";
 import { RefreshTicker } from "./refresh-ticker.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -156,6 +156,8 @@ export class FleetList {
      * widget this list shares with. Omitted → no `b` affordance.
      */
     private backgroundAction?: (record: AgentRecord, notify: (message: string) => void) => ViewerBackgroundAction,
+    /** Pi's `fullscreenScrollbar` preference, read when a viewer opens. */
+    private scrollbarMode: () => ScrollViewScrollbar = () => "auto",
   ) {}
 
   // ---- Lifecycle ----
@@ -440,9 +442,11 @@ export class FleetList {
     const session = record.session;
     const activity = this.agentActivity.get(record.id);
     this.viewingAgentId = record.id;
+    let overlayOptions = getConversationOverlayOptions({ mode: "regular" });
 
     void this.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
+        overlayOptions = getConversationOverlayOptions(tui);
         this.viewerClose = () => done(undefined);
         return new ConversationViewer(
           tui,
@@ -460,11 +464,12 @@ export class FleetList {
           this.viewerMarkdown,
           this.onViewerMarkdown,
           this.backgroundAction?.(record, message => this.ui?.notify(message, "info")),
+          this.scrollbarMode(),
         );
       },
       {
         overlay: true,
-        overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
+        overlayOptions: () => overlayOptions,
       },
     ).then(() => this.clearViewer(), () => this.clearViewer());
   }

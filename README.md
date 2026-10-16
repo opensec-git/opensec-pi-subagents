@@ -105,6 +105,25 @@ appears under one of them after 2 s. In the conversation viewer (FleetView, `/ag
   run moves from the foreground to the background concurrency pool, over the limit if the pool is full.
 - Nested agents, workflow agents, queued spawns and resumed runs cannot be handed off.
 
+### Fullscreen conversation observer
+
+In Pi's fullscreen mode (`/settings → TUI mode → fullscreen`, Pi's default), an agent opened from FleetView, `/agents`
+or the workflow inspector fills the terminal; regular mode keeps the floating viewer. Neither replaces the main session
+or pauses an agent, and `Esc` returns to the previous view (while composing, the first `Esc` cancels the draft).
+
+- Mouse-wheel scrolling. Scrolling up pauses following; reaching the bottom resumes it.
+- A one-column scrollbar in Pi's style that follows Pi's `/settings → Fullscreen scrollbar`: `auto` appears while
+  scrolling or hovering and hides after a second, `always` stays, `hidden` removes it and its mouse target. Drag the
+  thumb, or click the track to page. The column is kept free in `auto` mode too, so the bar never re-wraps the text.
+- Clickable footer controls (steer, send to background, stop with two clicks, Markdown mode, close).
+- While scrolled away, the divider above the footer shows `[ ↓ N new messages · Ctrl+End ]` (conversation messages,
+  not streaming updates); click it or press `Ctrl+End` to jump back and follow, without losing a steering draft.
+- Mouse events are consumed, so they never scroll, select or click the main view underneath. Text selection, copying
+  and switching agents without leaving the observer are not implemented.
+- Cost: built on the viewer's incremental transcript, so scrolling, wheel and drags reuse cached lines, a frame checks
+  only the transcript's last message and draws only the visible rows, and nothing ticks while it is idle. Without a JIT
+  (Pi-Bolt), a frame or a scroll step costs well under a millisecond whatever the transcript's length.
+
 ### Resuming agents
 
 Every agent result names the agent: `Agent ID: <id>` (foreground and background results alike). Pass it back to continue
