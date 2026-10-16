@@ -15,8 +15,8 @@ agents point at the completion notification instead of inviting polling, and a r
 > **Possibly breaking:**
 > - **Failed, aborted and stopped runs return `isError: true`**, as do unknown-agent lookups and refused steers or
 >   resumes. Pi shows them as tool errors and the main agent reads them as failures.
-> - **A model name that matches several models is refused** instead of resolving to the closest one. Use the exact
->   `provider/id`, or a short name that matches one model.
+> - **A model name whose closest matches span several providers is refused** instead of resolving to one of them,
+>   unless the parent's provider is among them. Use the exact `provider/id` to choose another provider.
 
 ### Added
 
@@ -48,9 +48,11 @@ agents point at the completion notification instead of inviting polling, and a r
 - **Notifications preview the first 10 lines of a result**, still capped at 500 characters (300 per agent in a group)
   so one long line cannot flood the context, and carry the full result's size in `<result_bytes>`. The truncation note
   says how many lines and bytes were left out.
-- **Model names resolve without guessing.** An exact `provider/id` (case-insensitive) and a short name that matches one
-  model resolve as before. A name whose best match is shared by several models is an error naming up to five closest
-  candidates. A per-call model that does not resolve stays a tool error on every path.
+- **Model names no longer resolve across providers by guessing.** An exact `provider/id` (case-insensitive) resolves
+  as before. Among a short name's closest matches (`haiku`, `sonnet`), the parent's provider wins when it serves one;
+  matches from a single provider resolve to the tightest, as before (ties by id). Only matches that still span several
+  providers are an error naming up to five closest candidates. An exact id two providers serve follows the same rule.
+  A per-call model that does not resolve stays a tool error on every path.
 - **An agent file's model that does not resolve is reported.** The run still falls back to the parent's model, but its
   results say which model was asked for, why it was not used and which model ran instead (the `Agent` and nested
   `Agent` results, `get_subagent_result`, `<model-note>` in the notification). Spawns that resolve the agent file's

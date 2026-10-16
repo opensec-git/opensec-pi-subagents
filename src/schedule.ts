@@ -320,7 +320,7 @@ export class SubagentScheduler {
     const overridesAllowed = isModelOverrideAllowed();
     const thinking = overridesAllowed ? job.thinking : undefined;
     if (job.model && overridesAllowed) {
-      const resolution = resolveModelDetailed(job.model, ctx.modelRegistry);
+      const resolution = resolveModelDetailed(job.model, ctx.modelRegistry, ctx.model?.provider);
       if (resolution.ok) resolvedModel = resolution.model;
       else modelNote = unresolvedModelNote(job.model, unresolvedReason(resolution), "the agent's default model", "the scheduled job");
     }

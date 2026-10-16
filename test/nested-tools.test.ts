@@ -211,32 +211,46 @@ describe("child-safe nested Agent tools", () => {
     expect(inScope.isError).toBe(false);
   });
 
-  it("runs an agent whose file names an ambiguous model on the parent's, and says so", async () => {
-    writeAgent("pinned", "model: anthropic\n");
-    const parentModel = MODELS[0];
-    const [agent] = tools();
-    const result = await agent.execute(
-      "call-1",
-      { subagent_type: "pinned", description: "pinned", prompt: "Do it" },
-      undefined,
-      undefined,
-      { ...ctx(), model: parentModel },
-    );
-    expect(result.isError).toBe(false);
-    expect(spawnAndWait.mock.calls[0][4]).toMatchObject({ model: parentModel });
-    expect(result.content[0].text).toMatch(
-      /^Note: model "anthropic" from the agent file is ambiguous \(candidates: anthropic\/allowed, anthropic\/blocked\); ran on anthropic\/allowed instead\.\n\n/,
-    );
-    expect(spawnAndWait.mock.calls[0][4].modelNote).toContain('model "anthropic" from the agent file is ambiguous');
+  /** The same model from two providers, neither of them the parent's. */
+  const SHARED = [
+    { id: "shared-model", name: "Shared", provider: "anthropic" },
+    { id: "shared-model", name: "Shared", provider: "openrouter" },
+  ];
+  const PARENT = { id: "deepseek-chat", name: "DeepSeek", provider: "deepseek" };
+  const sharedCtx = () => ({
+    ...ctx(),
+    model: PARENT,
+    modelRegistry: {
+      find: (provider: string, id: string) => SHARED.find(m => m.provider === provider && m.id === id),
+      getAvailable: () => SHARED,
+      getAll: () => SHARED,
+    },
   });
 
-  it("refuses a caller-supplied model that matches several, naming them", async () => {
+  it("runs an agent whose file names a model two other providers serve on the parent's, and says so", async () => {
+    writeAgent("pinned", "model: shared\n");
+    const [agent] = tools();
+    const result = await agent.execute(
+      "call-1", { subagent_type: "pinned", description: "pinned", prompt: "Do it" }, undefined, undefined, sharedCtx(),
+    );
+    expect(result.isError).toBe(false);
+    expect(spawnAndWait.mock.calls[0][4]).toMatchObject({ model: PARENT });
+    expect(result.content[0].text.startsWith(
+      'Note: model "shared" from the agent file is ambiguous (candidates: anthropic/shared-model, openrouter/shared-model); '
+        + "ran on deepseek/deepseek-chat instead.\n\n",
+    )).toBe(true);
+    expect(spawnAndWait.mock.calls[0][4].modelNote).toContain('model "shared" from the agent file is ambiguous');
+  });
+
+  it("refuses a caller-supplied model that matches several providers, naming them", async () => {
     setModelOverrideAllowed(true);
     const [agent] = tools();
-    const result = await execute(agent, { subagent_type: "scout", description: "d", prompt: "p", model: "anthropic" });
+    const result = await agent.execute(
+      "call-1", { subagent_type: "scout", description: "d", prompt: "p", model: "shared" }, undefined, undefined, sharedCtx(),
+    );
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('Model "anthropic" is ambiguous');
-    expect(result.content[0].text).toContain("anthropic/allowed, anthropic/blocked");
+    expect(result.content[0].text).toContain('Model "shared" is ambiguous');
+    expect(result.content[0].text).toContain("anthropic/shared-model, openrouter/shared-model");
     expect(spawnAndWait).not.toHaveBeenCalled();
   });
 

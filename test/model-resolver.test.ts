@@ -233,13 +233,10 @@ describe("resolveModel", () => {
       { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
     ];
 
-    it("'sonnet' matching two models is refused, naming both, closest first", () => {
+    it("'sonnet' within one provider takes the tightest id match (shorter id)", () => {
       const result = resolveModel("sonnet", makeRegistry(SIMILAR_MODELS));
-      expect(typeof result).toBe("string");
-      expect(result).toContain('Model "sonnet" is ambiguous');
-      // "sonnet" is a larger fraction of "claude-sonnet-4-6", so it is named first.
-      expect(result).toContain("anthropic/claude-sonnet-4-6, anthropic/claude-sonnet-4-5-20241022.");
-      expect(result).not.toContain("claude-haiku");
+      // "sonnet" is a larger fraction of "claude-sonnet-4-6" than "claude-sonnet-4-5-20241022"
+      expect(result).toEqual(SIMILAR_MODELS[0]);
     });
 
     it("'sonnet 4.5' resolves to the 4.5 model via name", () => {
@@ -286,7 +283,7 @@ describe("resolveModel", () => {
     });
 
     it("names at most five candidates, and how many more there are", () => {
-      const many = Array.from({ length: 8 }, (_, i) => ({ id: `gpt-5-variant-${i}`, name: `GPT 5 ${i}`, provider: "openai" }));
+      const many = Array.from({ length: 8 }, (_, i) => ({ id: `gpt-5-variant-${i}`, name: `GPT 5 ${i}`, provider: `gateway-${i}` }));
       const result = resolveModelDetailed("gpt-5", makeRegistry(many));
       expect(result.ok).toBe(false);
       if (result.ok) return;
@@ -306,15 +303,61 @@ describe("resolveModel", () => {
     it("words the run's note with the candidates and the model used instead", () => {
       const failure = resolveModelDetailed("sonnet", makeRegistry([
         { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
-        { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic" },
-      ]));
+        { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "openrouter" },
+      ]), "openai");
       if (failure.ok) throw new Error("expected ambiguity");
       expect(unresolvedModelNote("sonnet", unresolvedReason(failure), { provider: "openai", id: "gpt-5" })).toBe(
         'Note: model "sonnet" from the agent file is ambiguous (candidates: anthropic/claude-sonnet-4-6, '
-          + "anthropic/claude-sonnet-4-5); ran on openai/gpt-5 instead.",
+          + "openrouter/claude-sonnet-4-6); ran on openai/gpt-5 instead.",
       );
       expect(unresolvedModelNote("nope", unresolvedReason({ reason: "not-found", candidates: [] }), undefined, "the scheduled job"))
         .toBe('Note: model "nope" from the scheduled job was not found among the available models; ran on the default model instead.');
+    });
+  });
+
+  describe("the parent's provider, then the tightest match within one provider", () => {
+    const ANTHROPIC = [
+      { id: "claude-3-5-haiku-20241022", name: "Claude Haiku 3.5", provider: "anthropic" },
+      { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "anthropic" },
+    ];
+    const OPENROUTER = [
+      { id: "anthropic/claude-3-5-haiku", name: "Claude Haiku 3.5", provider: "openrouter" },
+      { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "openrouter" },
+    ];
+
+    it("'haiku' with only anthropic models resolves to the tightest", () => {
+      expect(resolveModel("haiku", makeRegistry(ANTHROPIC))).toEqual(ANTHROPIC[1]);
+    });
+
+    it("breaks a score tie by id, not by registry order", () => {
+      const tied = [
+        { id: "claude-haiku-b", name: "B", provider: "anthropic" },
+        { id: "claude-haiku-a", name: "A", provider: "anthropic" },
+      ];
+      expect(resolveModel("haiku", makeRegistry(tied))).toEqual(tied[1]);
+      expect(resolveModel("haiku", makeRegistry([...tied].reverse()))).toEqual(tied[1]);
+    });
+
+    it("'haiku' across anthropic and openrouter follows an anthropic parent", () => {
+      const result = resolveModel("haiku", makeRegistry([...OPENROUTER, ...ANTHROPIC]), "anthropic");
+      expect(result).toEqual(ANTHROPIC[1]);
+    });
+
+    it("the same with a deepseek parent is ambiguous", () => {
+      const result = resolveModelDetailed("haiku", makeRegistry([...OPENROUTER, ...ANTHROPIC]), "deepseek");
+      expect(result).toMatchObject({ ok: false, reason: "ambiguous" });
+      if (result.ok) return;
+      expect(result.candidates).toEqual(expect.arrayContaining(["anthropic/claude-haiku-4-5", "openrouter/anthropic/claude-haiku-4-5"]));
+    });
+
+    it("an exact id served by two providers follows the parent's provider", () => {
+      const twice = [
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" },
+        { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" },
+      ];
+      expect(resolveModel("claude-haiku-4-5", makeRegistry(twice), "openrouter")).toEqual(twice[1]);
+      expect(resolveModel("claude-haiku-4-5", makeRegistry(twice), "anthropic")).toEqual(twice[0]);
+      expect(resolveModelDetailed("claude-haiku-4-5", makeRegistry(twice), "deepseek")).toMatchObject({ ok: false, reason: "ambiguous" });
     });
   });
 

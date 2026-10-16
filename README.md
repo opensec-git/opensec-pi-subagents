@@ -225,12 +225,14 @@ tool, nested delegation, workflow `agent()`, `@mentions`, scheduled jobs and cro
 parent is the agent that spawned it.
 
 - An agent file's own `model:` or `thinking:` is your configuration and always applies. `model:` takes an exact
-  `provider/id`, or a short name such as `haiku` that matches exactly one available model. A name that matches several
-  models, or none, is not guessed at: the agent runs on the parent's model and its result starts with a note naming
-  the model asked for, why it was not used (with up to five candidates for an ambiguous name), and the model used
-  instead. Workflows show the note as a warning. Spawns that pass no model of their own (`@mentions`, RPC, scheduled
+  `provider/id`, or a short name such as `haiku`. Among a short name's closest matches, the parent's provider wins when
+  it serves one, and matches from one provider resolve to the tightest. A name whose matches span several other
+  providers, or that matches nothing, is not guessed at: the agent runs on the parent's model and its result starts
+  with a note naming the model asked for, why it was not used (with up to five candidates for an ambiguous name), and
+  the model used instead. Workflows show the note as a warning. Spawns that pass no model of their own (`@mentions`, RPC, scheduled
   jobs) match the agent file's `model:` by exact `provider/id` only, and note a fallback the same way.
-- A model passed per call (with `allowModelOverride`) that is ambiguous or unknown is refused with the candidates.
+- A model passed per call (with `allowModelOverride`) resolves the same way; one that is ambiguous across providers or
+  unknown is refused with the candidates.
 - Per-call choices are ignored by default: the `Agent` tool and the nested tool do not offer `model` or `thinking`,
   workflow `agent({ model, effort })` is ignored, and so are a scheduled job's and an RPC spawn's model and thinking
   level. This keeps the main model from picking cheaper models or lower effort on its own.

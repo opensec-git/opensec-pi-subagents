@@ -19,15 +19,17 @@ import { type BootedPi, ctx, type Hermetic, hermeticDir, makePi, textOf } from "
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
 
+// Sonnet from two providers, and a parent on a third: the cross-provider case
+// that must not be settled by a guess.
 const MODELS = [
-  { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+  { provider: "deepseek", id: "deepseek-chat", name: "DeepSeek Chat" },
   { provider: "anthropic", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-  { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+  { provider: "openrouter", id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
 ];
 const PARENT = MODELS[0];
 const NOTE =
   'Note: model "sonnet" from the agent file is ambiguous (candidates: anthropic/claude-sonnet-4-6, '
-  + "anthropic/claude-sonnet-4-5); ran on anthropic/claude-opus-4-6 instead.";
+  + "openrouter/claude-sonnet-4-6); ran on deepseek/deepseek-chat instead.";
 
 let booted: BootedPi | undefined;
 let hermetic: Hermetic | undefined;
@@ -75,6 +77,17 @@ const call = (b: BootedPi & { parentCtx: any }, extra: Record<string, unknown>) 
   );
 
 describe("an agent file model that does not resolve", () => {
+  it("resolves a short name to the parent provider's model when that provider serves it", async () => {
+    const b = await boot();
+    b.parentCtx.model = MODELS[1]; // an anthropic parent
+    runs();
+
+    const res = await call(b, { run_in_background: false });
+
+    expect(vi.mocked(runAgent).mock.calls[0][3].model).toBe(MODELS[1]);
+    expect(textOf(res)).not.toContain("Note: model");
+  });
+
   it("runs on the parent's model, and the foreground result and get_subagent_result say so", async () => {
     const b = await boot();
     runs();
@@ -113,7 +126,7 @@ describe("an agent file model that does not resolve", () => {
 
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain('Model "sonnet" is ambiguous');
-    expect(textOf(res)).toContain("anthropic/claude-sonnet-4-6, anthropic/claude-sonnet-4-5");
+    expect(textOf(res)).toContain("anthropic/claude-sonnet-4-6, openrouter/claude-sonnet-4-6");
     expect(runAgent).not.toHaveBeenCalled();
   });
 });

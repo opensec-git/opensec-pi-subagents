@@ -53,12 +53,15 @@ export type ModelResolution = { ok: true; model: any } | ModelResolutionFailure;
  * An exact "provider/modelId" (case-insensitive) always resolves. Anything else
  * is matched fuzzily against the available models in tiers — exact id, id
  * substring, name substring, all words present — and resolves only when the
- * best tier holds exactly one model: short names like "haiku" work as long as
- * they name one model. A name that matches several is refused with the closest
- * candidates rather than settled by a guess, since a silently wrong model is
- * worse than an error the caller can act on.
+ * best tier settles on one provider. Within that tier the parent's provider
+ * (`preferProvider`) wins when it is among the matches; if the remaining
+ * matches all share one provider, the tightest match is taken (ties broken by
+ * id), so a Claude Code-style "haiku" or "sonnet" keeps working. Only matches
+ * that still span several providers are refused, with the closest candidates:
+ * a silent pick across providers (another vendor's model under a similar name)
+ * is worse than an error the caller can act on.
  */
-export function resolveModelDetailed(input: string, registry: ModelRegistry): ModelResolution {
+export function resolveModelDetailed(input: string, registry: ModelRegistry, preferProvider?: string): ModelResolution {
   // Available models (those with auth configured)
   const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
 
@@ -106,8 +109,14 @@ export function resolveModelDetailed(input: string, registry: ModelRegistry): Mo
 
   if (matches.length > 0) {
     const bestTier = Math.max(...matches.map(match => match.tier));
-    const best = matches.filter(match => match.tier === bestTier).sort((a, b) => b.score - a.score);
-    if (best.length === 1) {
+    // Tightest first; equal scores in id order, so the pick never depends on registry order.
+    let best = matches
+      .filter(match => match.tier === bestTier)
+      .sort((a, b) => b.score - a.score || a.model.id.localeCompare(b.model.id));
+    const preferred = preferProvider?.toLowerCase();
+    const fromParent = best.filter(match => match.model.provider.toLowerCase() === preferred);
+    if (fromParent.length > 0) best = fromParent;
+    if (new Set(best.map(match => match.model.provider.toLowerCase())).size === 1) {
       const found = registry.find(best[0].model.provider, best[0].model.id);
       if (found) return { ok: true, model: found };
     } else {
@@ -129,7 +138,7 @@ export function resolveModelDetailed(input: string, registry: ModelRegistry): Mo
   // so the same model from another provider beats falling back to "inherit".
   // An ambiguous bare name is reported as such, not as "not found".
   if (slashIdx !== -1 && matches.length === 0) {
-    const bare = resolveModelDetailed(input.slice(slashIdx + 1), registry);
+    const bare = resolveModelDetailed(input.slice(slashIdx + 1), registry, preferProvider);
     if (bare.ok || bare.reason === "ambiguous") return bare;
   }
 
@@ -149,13 +158,15 @@ export function resolveModelDetailed(input: string, registry: ModelRegistry): Mo
 /**
  * Resolve a model string to a Model instance.
  * Returns the Model on success, or an error message string on failure — not
- * found, or ambiguous (see {@link resolveModelDetailed}).
+ * found, or ambiguous (see {@link resolveModelDetailed}, which also explains
+ * `preferProvider`, the parent's provider).
  */
 export function resolveModel(
   input: string,
   registry: ModelRegistry,
+  preferProvider?: string,
 ): any | string {
-  const resolution = resolveModelDetailed(input, registry);
+  const resolution = resolveModelDetailed(input, registry, preferProvider);
   return resolution.ok ? resolution.model : resolution.message;
 }
 

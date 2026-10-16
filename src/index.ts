@@ -2275,13 +2275,13 @@ export default function (pi: ExtensionAPI) {
   // them goes too — a model told it may pick a model will keep trying.
   const modelOverrideAllowed = isModelOverrideAllowed();
   const modelGuideline = modelOverrideAllowed
-    ? `- Use model to specify a different model (as "provider/modelId", or a short name such as "haiku" that matches exactly one available model; a name that matches several is refused).\n- Use thinking to control extended thinking level.\n`
+    ? `- Use model to specify a different model (as "provider/modelId", or a short name such as "haiku"; the parent's provider is preferred, and a name matching models of several other providers is refused).\n- Use thinking to control extended thinking level.\n`
     : "";
   const modelParamShape = {
     model: Type.Optional(
       Type.String({
         description:
-          'Optional model override. Accepts "provider/modelId", or a short name (e.g. "haiku") that matches exactly one available model; an ambiguous name is refused. Omit to use the agent type\'s default.',
+          'Optional model override. Accepts "provider/modelId", or a short name (e.g. "haiku"); the parent\'s provider is preferred, and a name matching models of several other providers is refused. Omit to use the agent type\'s default.',
       }),
     ),
     thinking: Type.Optional(
@@ -2642,7 +2642,7 @@ Terse command-style prompts produce shallow, generic work.
       let model = ctx.model;
       let modelNote: string | undefined;
       if (resolvedConfig.modelInput) {
-        const resolution = resolveModelDetailed(resolvedConfig.modelInput, ctx.modelRegistry);
+        const resolution = resolveModelDetailed(resolvedConfig.modelInput, ctx.modelRegistry, ctx.model?.provider);
         if (resolution.ok) {
           model = resolution.model;
         } else if (resolvedConfig.modelFromParams) {
@@ -2698,7 +2698,7 @@ Terse command-style prompts produce shallow, generic work.
       // resolves to nothing is still worth disclosing: it cannot have taken effect.
       const askedModel = ((asked: string | undefined) => {
         if (!asked) return undefined;
-        const resolvedAsked = resolveModel(asked, ctx.modelRegistry);
+        const resolvedAsked = resolveModel(asked, ctx.modelRegistry, ctx.model?.provider);
         if (typeof resolvedAsked === "string") return asked;
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
@@ -3931,12 +3931,12 @@ Terse command-style prompts produce shallow, generic work.
   // so they are reachable from tests — this command handler is only registered
   // through `registerCommand`, which every test mocks.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
+  function getModelLabel(type: string, registry?: ModelRegistry, parentProvider?: string): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
-    const resolution = resolveModelDetailed(cfg.model, registry);
+    const resolution = resolveModelDetailed(cfg.model, registry, parentProvider);
     // Configured but unresolvable: the run falls back to the parent model (and
     // its result says so), so flag it here too rather than hiding the config.
     if (!resolution.ok) return `${label} (${resolution.reason === "ambiguous" ? "ambiguous" : "unavailable"}, fallback: inherit)`;
@@ -4042,7 +4042,7 @@ Terse command-style prompts produce shallow, generic work.
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const model = getModelLabel(name, ctx.modelRegistry, ctx.model?.provider);
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,

@@ -126,7 +126,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // means "inherit" — not an override to resolve or scope-check.
       const override = normalizedOptions.model;
       if (override != null) {
-        const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
+        const { modelRegistry, cwd, model: parentModel } = ctx as { modelRegistry?: ModelRegistry; cwd?: string; model?: { provider?: string } };
         // Names the override the same way in both messages below; an object
         // override would otherwise interpolate as "[object Object]".
         const label = typeof override === "string" ? override : `${override.provider}/${override.id}`;
@@ -135,7 +135,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         }
         let model = override;
         if (typeof override === "string") {
-          const resolved = resolveModel(override, modelRegistry);
+          const resolved = resolveModel(override, modelRegistry, parentModel?.provider);
           if (typeof resolved === "string") {
             // resolveModel returns a human-readable error string when the
             // input doesn't match any available model. Surface it instead of

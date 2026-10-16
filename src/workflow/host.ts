@@ -269,7 +269,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const modelInput = requestedModel ?? config?.model;
       let modelNote: string | undefined;
       if (modelInput !== undefined) {
-        const resolution = resolveModelDetailed(modelInput, ctx.modelRegistry);
+        const resolution = resolveModelDetailed(modelInput, ctx.modelRegistry, ctx.model?.provider);
         if (resolution.ok) {
           model = resolution.model;
         } else if (requestedModel !== undefined) {

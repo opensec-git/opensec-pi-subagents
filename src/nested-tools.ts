@@ -301,7 +301,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       let model = ctx.model;
       let modelNote: string | undefined;
       if (invocation.modelInput) {
-        const resolution = resolveModelDetailed(invocation.modelInput, ctx.modelRegistry);
+        const resolution = resolveModelDetailed(invocation.modelInput, ctx.modelRegistry, ctx.model?.provider);
         if (resolution.ok) {
           model = resolution.model;
         } else if (invocation.modelFromParams) {
