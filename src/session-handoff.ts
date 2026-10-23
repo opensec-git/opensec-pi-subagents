@@ -38,7 +38,7 @@ import { existsSync } from "node:fs";
 import { type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 
 /** The package version this code ships in. `test/session-handoff.test.ts` keeps it equal to package.json. */
-export const PACKAGE_VERSION = "0.20.7";
+export const PACKAGE_VERSION = "0.20.8";
 
 /** Bumped when the shape of a parked entry changes within one version (never in a release). */
 export const HANDOFF_PROTOCOL = 1;

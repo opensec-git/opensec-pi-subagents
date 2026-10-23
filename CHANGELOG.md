@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.8] - 2026-10-23
+
+### Changed
+
+- **The agents widget redraws only when its text changes.** While agents ran or waited, its 80 ms tick asked Pi for a
+  frame every time, also with the main agent idle, and each frame walks the whole main transcript. Now:
+  - When Pi draws nothing else (main agent idle), the spinner and the elapsed counters step every 240 ms instead of
+    every 80 ms, so the tenths jump by .2 or .3. Other changes (activity, tool uses, tokens, rows, queued count) still
+    show on the next 80 ms tick.
+  - When Pi draws frames of its own (the main agent streaming, its working indicator, typing), the widget moves every
+    80 ms as before, carried by those frames.
+  - A widget with only queued agents no longer redraws. Completions and status changes are drawn at once, as before.
+
 ## [0.20.7] - 2026-10-21
 
 Stopped and failed subagents are resumed, not replaced. When a provider error (403, 429, a usage limit) or the end
