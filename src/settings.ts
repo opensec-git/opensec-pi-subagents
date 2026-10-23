@@ -338,6 +338,12 @@ export interface SubagentsSettings {
    * extension's key lives here.
    */
   backgroundKey?: string;
+  /**
+   * Tools the subagent tool watchdog never stops, because they keep their own
+   * deadline. Defaults to `["second_opinion_agent"]` (see orchestration.ts); a
+   * list here replaces the default.
+   */
+  watchdogExemptTools?: string[];
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -371,6 +377,7 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setBackgroundKey: (key: string) => void;
+  setWatchdogExemptTools?: (names: string[]) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -512,6 +519,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  if (Array.isArray(r.watchdogExemptTools)) {
+    out.watchdogExemptTools = (r.watchdogExemptTools as unknown[]).filter((x): x is string => typeof x === "string" && !!x.trim());
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -615,6 +625,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.backgroundKey) appliers.setBackgroundKey(s.backgroundKey);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (s.watchdogExemptTools) appliers.setWatchdogExemptTools?.(s.watchdogExemptTools);
 }
 
 /**

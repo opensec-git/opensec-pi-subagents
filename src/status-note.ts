@@ -8,7 +8,7 @@
  * through agent-runner).
  */
 
-import type { AgentRecord } from "./types.js";
+import type { AgentRecord, StopCause } from "./types.js";
 
 /**
  * Explicit parenthetical note for a non-normal terminal outcome, so the parent
@@ -17,12 +17,16 @@ import type { AgentRecord } from "./types.js";
  *
  * `stopped` (a human aborted it) is deliberately distinct from `aborted` (the
  * turn limit was hit) — the parent should treat human intervention differently
- * from a budget cutoff.
+ * from a budget cutoff. A `stopped` agent whose parent session ended under it
+ * (`stopCause: "session-end"`) was interrupted, not stopped by anyone, and says
+ * so: it keeps its context and is resumed rather than replaced.
  */
-export function getStatusNote(status: string): string {
+export function getStatusNote(status: string, stopCause?: StopCause): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER before completion — the user ended this run; output is partial and the task was NOT finished)";
+      return stopCause === "session-end"
+        ? " (INTERRUPTED when the parent session ended, not stopped by anyone — output is partial and the task was NOT finished; the agent keeps its context and can be resumed)"
+        : " (STOPPED BY THE USER before completion — the user ended this run; output is partial and the task was NOT finished)";
     case "aborted":
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
@@ -65,10 +69,12 @@ export function getStatusNote(status: string): string {
  * behavior) and adding an instruction (which can) are not equally safe bets.
  * Don't add either back without a way to measure it.
  */
-export function getForegroundOutcomeNote(status: string): string {
+export function getForegroundOutcomeNote(status: string, stopCause?: StopCause): string {
   switch (status) {
     case "stopped":
-      return " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
+      return stopCause === "session-end"
+        ? " (interrupted when the session ended — everything the agent produced is above; the task is unfinished)"
+        : " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
     case "aborted":
       return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":
@@ -85,6 +91,18 @@ export function getForegroundOutcomeNote(status: string): string {
  */
 export function agentIdLine(id: string): string {
   return `\n\nAgent ID: ${id} (pass it as \`resume\` to continue this agent)`;
+}
+
+/**
+ * The resume hint of a background notification for a run that did not finish
+ * (failed, stopped or aborted), or null. Foreground results carry the id in
+ * their `Agent ID:` line; without this a parent told only "stopped" or "failed"
+ * launched a fresh agent that redid the work. Only for an agent with a saved
+ * session, the only kind that can be resumed.
+ */
+export function resumeHintXml(record: Pick<AgentRecord, "id" | "status" | "sessionFile">): string | null {
+  if (!record.sessionFile || !isFailedStatus(record.status)) return null;
+  return `<resume>It keeps its context: pass ${record.id} as \`resume\` to continue this agent instead of starting a fresh one.</resume>`;
 }
 
 /**

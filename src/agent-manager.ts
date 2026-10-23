@@ -26,7 +26,7 @@ import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import { sessionFileProblem } from "./session-file.js";
 import { sessionFileOf, snapshotContext } from "./session-handoff.js";
-import type { AgentInvocation, AgentRecord, AgentResumeState, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, AgentResumeState, AgentTombstone, IsolationMode, MentionResolution, StopCause, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, restoreWorktree } from "./worktree.js";
@@ -665,6 +665,7 @@ export function resumeStateOf(record: AgentRecord): AgentResumeState | undefined
     sessionFile: record.sessionFile,
     completedAt: record.completedAt ?? Date.now(),
     status: record.status,
+    stopCause: record.status === "stopped" ? record.stopCause : undefined,
     handle: record.handle,
     alias: record.alias,
     parentAgentId: record.parentAgentId,
@@ -1652,8 +1653,11 @@ export class AgentManager {
    * covered transitively — each abort lands in that child's own settle path.
    */
   private abortOwnedChildren(parentId: string): void {
+    // A parent interrupted by its session's end passes that cause on.
+    const parent = this.agents.get(parentId);
+    const cause = parent?.status === "stopped" ? parent.stopCause : undefined;
     for (const [id, record] of this.agents) {
-      if (record.parentAgentId === parentId) this.abort(id);
+      if (record.parentAgentId === parentId) this.abort(id, cause);
     }
   }
 
@@ -1901,6 +1905,7 @@ export class AgentManager {
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
+      record.stopCause = undefined;
       record.completedAt = undefined;
       record.status = "queued";
 
@@ -1941,6 +1946,7 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.stopCause = undefined;
 
     const session = record.session;
     recordRunModel(record, session);
@@ -2369,20 +2375,25 @@ export class AgentManager {
     );
   }
 
-  abort(id: string): boolean {
+  /**
+   * Stop a running or queued agent. `cause` says why when it was not the user
+   * (`session-end`: the parent session ended under it); see `AgentRecord.stopCause`.
+   */
+  abort(id: string, cause?: StopCause): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
 
     // Remove from queue if queued. No decrement — the slot was never taken.
     if (record.status === "queued") {
       this.dequeue(q => q.id === id);
-      this.stopQueued(record);
+      this.stopQueued(record, cause);
       return true;
     }
 
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
+    record.stopCause = cause;
     record.completedAt = Date.now();
     // "stopped" is what the user sees at once; the run itself settles when it
     // has wound down — or is abandoned if a tool ignores the abort.
@@ -2396,9 +2407,10 @@ export class AgentManager {
    * session's `subagents:record` entry and the UI's activity cleanup all hang
    * off it. A blocking caller learns of the stop from its own tool result.
    */
-  private stopQueued(record: AgentRecord): void {
+  private stopQueued(record: AgentRecord, cause?: StopCause): void {
     this.pendingArgs.delete(record.id);
     record.status = "stopped";
+    record.stopCause = cause;
     record.completedAt = Date.now();
     if (record.isBackground === false) record.resultConsumed = true;
     this.notifyComplete(record);
@@ -2517,8 +2529,8 @@ export class AgentManager {
     return [...this.agents.values()].some(record => isBusy(record) && this.isVisible(record));
   }
 
-  /** Abort all running and queued agents immediately. */
-  abortAll(): number {
+  /** Abort all running and queued agents immediately (`cause`: see {@link abort}). */
+  abortAll(cause?: StopCause): number {
     let count = 0;
     // Clear queued agents first
     const queued = this.queue
@@ -2526,7 +2538,7 @@ export class AgentManager {
       .filter((record): record is AgentRecord => record?.status === "queued");
     this.dequeue(() => true);
     for (const record of queued) {
-      this.stopQueued(record);
+      this.stopQueued(record, cause);
       count++;
     }
     // Abort running agents
@@ -2534,6 +2546,7 @@ export class AgentManager {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
+        record.stopCause = cause;
         record.completedAt = Date.now();
         this.armStopGrace(id);
         count++;

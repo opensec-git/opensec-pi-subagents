@@ -20,16 +20,18 @@ import {
   type InlineExtension,
   SessionManager,
   SettingsManager,
+  type ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
-import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, createCodemodeAudit, getCodemodeTimeoutSeconds } from "./codemode-guard.js";
+import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, codemodeDeadlineSeconds, createCodemodeAudit, getCodemodeTimeoutSeconds } from "./codemode-guard.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { unresolvedModelNote } from "./model-resolver.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { getWatchdogExemptTools, type PromptTool, stripToolLines } from "./orchestration.js";
 import { isProjectCodeTrusted, isProjectTrustedBy } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -490,7 +492,7 @@ export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
  *
  * Turn limits only count finished turns, and a turn whose tool never returns
  * never finishes: a `find /` or a server that never closes would hold the agent
- * forever. So a subagent's `bash` calls get this as their timeout (pi kills the
+ * forever. So a subagent's `bash` calls that set no timeout get this one (pi kills the
  * whole process tree and reports the timeout to the model, which carries on),
  * and a watchdog stops any other tool that overruns it and tells the agent to
  * continue another way.
@@ -521,6 +523,8 @@ export function setWatchdogTiming(timing: Partial<typeof watchdogTiming>): void 
 /** Times one run is resumed after a stuck tool before it is left stopped. */
 export const MAX_TOOL_RECOVERIES = 3;
 const WATCHDOG_EXEMPT_TOOLS: ReadonlySet<string> = new Set(EXCLUDED_TOOL_NAMES);
+/** Nested agents and workflows, plus the `watchdogExemptTools` setting (tools with their own deadline). */
+const isWatchdogExempt = (name: string): boolean => WATCHDOG_EXEMPT_TOOLS.has(name) || getWatchdogExemptTools().has(name);
 
 export interface HungTool {
   toolName: string;
@@ -541,16 +545,30 @@ export function hungToolPrompt(hung: HungTool): string {
 
 /**
  * Give a `bash` call's arguments the limit as their timeout when they set none —
- * and, with `cap`, when they set a longer or invalid one. Pi mutates the same
- * object it then executes with, so this changes the running call.
+ * and, with `fixInvalid`, when they set one that is not a positive number. A
+ * valid timeout the call sets is kept, longer than the limit or not: a build or
+ * fuzz run that asks for 1800 s must not be killed at 1200 s. Pi mutates the
+ * same object it then executes with, so this changes the running call.
  */
-export function boundBashTimeout(args: unknown, limitSeconds: number, cap: boolean): void {
+export function boundBashTimeout(args: unknown, limitSeconds: number, fixInvalid: boolean): void {
   if (limitSeconds <= 0 || !args || typeof args !== "object") return;
   const call = args as { timeout?: unknown };
   if (call.timeout == null) call.timeout = limitSeconds;
-  else if (cap && (typeof call.timeout !== "number" || !(call.timeout > 0) || call.timeout > limitSeconds)) {
-    call.timeout = limitSeconds;
+  else if (fixInvalid && (typeof call.timeout !== "number" || !(call.timeout > 0))) call.timeout = limitSeconds;
+}
+
+/**
+ * How long the watchdog lets one tool call run, in seconds (before its slack):
+ * a `bash` call's own timeout, a codemode script's deadline (its `timeout_ms`,
+ * else `codemodeTimeoutSeconds`), and `limitSeconds` for everything else.
+ */
+export function callLimitSeconds(toolName: string, args: unknown, limitSeconds: number): number {
+  if (toolName === "bash") {
+    const timeout = args && typeof args === "object" ? (args as { timeout?: unknown }).timeout : undefined;
+    if (typeof timeout === "number" && timeout > 0) return timeout;
   }
+  if (toolName === CODEMODE_TOOL_NAME) return codemodeDeadlineSeconds(args) ?? limitSeconds;
+  return limitSeconds;
 }
 
 /**
@@ -563,11 +581,12 @@ const toolCallBoundSessions = new WeakSet<object>();
 /**
  * Bound a subagent session's tool calls (see `toolTimeoutSeconds`).
  *
- * `bash` calls without a timeout, or with a longer one, get the limit: through
+ * `bash` calls without a valid timeout get the limit (one they set is kept): through
  * the inline `tool_call` guard when the session loaded extensions (every call
  * path), otherwise by wrapping `session.agent.beforeToolCall` (a session without
  * extensions loads no built-ins either, so no tool calls tools). The
- * watchdog covers every tool: past the limit (plus slack) it aborts the run,
+ * watchdog covers every tool: past the call's own limit (`callLimitSeconds`,
+ * plus slack) it aborts the run,
  * which kills a running command's process tree, and `takeHung()` then reports
  * the call so the caller can resume the agent with `hungToolPrompt()`. When the
  * abort does not end the run (the tool ignores its signal), it escalates:
@@ -592,13 +611,14 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
     };
   }
 
-  const running = new Map<string, { toolName: string; started: number }>();
+  const running = new Map<string, { toolName: string; started: number; limitMs: number }>();
   let hung: HungTool | undefined;
   let hungAt = 0;
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     // Nested agents and workflows wait on child runs with their own limits.
-    if (event.type === "tool_execution_start" && !WATCHDOG_EXEMPT_TOOLS.has(event.toolName)) {
-      running.set(event.toolCallId, { toolName: event.toolName, started: Date.now() });
+    if (event.type === "tool_execution_start" && !isWatchdogExempt(event.toolName)) {
+      const limitMs = callLimitSeconds(event.toolName, event.args, limitSeconds) * 1000;
+      running.set(event.toolCallId, { toolName: event.toolName, started: Date.now(), limitMs });
     }
     if (event.type === "tool_execution_end") running.delete(event.toolCallId);
     if (event.type === "agent_end") running.clear();
@@ -614,7 +634,7 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
       return;
     }
     for (const call of running.values()) {
-      if (now - call.started < limitSeconds * 1000 + watchdogTiming.slackMs) continue;
+      if (now - call.started < call.limitMs + watchdogTiming.slackMs) continue;
       hung = { toolName: call.toolName, seconds: Math.round((now - call.started) / 1000) };
       hungAt = now;
       running.clear();
@@ -901,6 +921,48 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/**
+ * The parent's tools a subagent will not have, with their prompt guidelines, so
+ * an inherited (append-mode) system prompt can drop their lines: the
+ * orchestration tools (never given to subagents), tools its agent file denies,
+ * built-ins it was not given, and tools of extensions it does not load. Tools of
+ * inline extensions (no file path) are kept: they cannot be matched to the
+ * child's extension list. Reads the parent's registry, so this is a best effort:
+ * on any failure nothing is stripped.
+ */
+export function toolsChildLacks(
+  pi: Pick<ExtensionAPI, "getAllTools"> | undefined,
+  child: {
+    toolNames: readonly string[];
+    disallowed?: readonly string[];
+    extensions: true | string[] | false;
+    excludeExtensions?: readonly string[];
+  },
+): PromptTool[] {
+  let all: ToolInfo[];
+  try {
+    all = pi?.getAllTools?.() ?? [];
+  } catch {
+    return [];
+  }
+  const builtins = new Set<string>(BUILTIN_TOOL_NAMES);
+  const own = new Set(child.toolNames);
+  const denied = new Set(child.disallowed ?? []);
+  const excluded = new Set((child.excludeExtensions ?? []).map((n) => n.toLowerCase()));
+  const listed = Array.isArray(child.extensions) ? new Set(child.extensions.map((n) => n.toLowerCase())) : undefined;
+  const lacks = (tool: ToolInfo): boolean => {
+    if (EXCLUDED_TOOL_NAMES.includes(tool.name) || denied.has(tool.name)) return true;
+    const path = tool.sourceInfo?.path ?? "";
+    if (builtins.has(tool.name) && (path === "" || path.startsWith("builtin:"))) return !own.has(tool.name);
+    if (child.extensions === false) return true;
+    if (path === "" || path.startsWith("<inline:")) return false;
+    const canons = extensionCanonicalNames(path);
+    if (canons.some((n) => excluded.has(n))) return true;
+    return listed !== undefined && !listed.has("*") && !canons.some((n) => listed.has(n));
+  };
+  return all.filter(lacks).map((tool) => ({ name: tool.name, promptGuidelines: tool.promptGuidelines }));
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -986,16 +1048,30 @@ export async function runAgent(
     }
   }
 
+  // The parent's prompt lists the parent's tools and their guidelines; an
+  // append-mode child inherits it, so drop the lines of tools it will not have.
+  const inheritedPrompt = parentSystemPrompt
+    ? stripToolLines(
+        parentSystemPrompt,
+        toolsChildLacks(options.pi, {
+          toolNames,
+          disallowed: agentConfig?.disallowedTools,
+          extensions,
+          excludeExtensions,
+        }),
+      ) || undefined
+    : parentSystemPrompt;
+
   // Build system prompt from agent config
   let systemPrompt: string;
   if (agentConfig) {
-    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, inheritedPrompt, extras);
   } else {
     // Unknown type fallback: spread the canonical general-purpose config (defensive —
     // unreachable in practice since index.ts resolves unknown types before calling runAgent).
     const fallback = DEFAULT_AGENTS.get("general-purpose");
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
-    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, inheritedPrompt, extras);
   }
 
   // When skills is string[], we've already preloaded them into the prompt.

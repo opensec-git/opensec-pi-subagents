@@ -105,7 +105,11 @@ as an error result (`isError`), not as a completed task: the foreground `Agent` 
 - The result keeps the run's last assistant text (`Partial output before the failure:` for an error), also when the
   run threw or a stopped run had to be abandoned, and names the agent's saved session file, which holds every turn.
   The background notification carries the file as `<session-file>`.
-- A run the user stopped says so (`Agent was stopped by the user …`, `STOPPED BY THE USER`).
+- A run the user stopped says so (`Agent was stopped by the user …`, `STOPPED BY THE USER`). A run the end of the parent
+  session interrupted (quit, `pi -p` exiting after a provider error, SIGTERM) says that instead (`interrupted when the
+  parent session ended`, recorded as `stopCause: "session-end"`), and that the agent can be resumed.
+- Background notifications of failed, stopped and aborted runs end with `<resume>`, naming the id to pass as `resume`:
+  the agent keeps its context, so it is resumed rather than replaced. Only for agents with a saved session.
 - Weak models' malformed tool arguments are repaired before Pi validates them: the arguments object sent as a JSON
   string or stuffed into one field, arrays for strings, `null` optional fields, `"true"` or `"5"` for booleans and
   numbers, and a missing `subagent_type` (the default type, under the `fallbackSubagent` policy). A missing prompt is
@@ -189,8 +193,10 @@ Agent({ resume: "<id>", prompt: "Now check the tests too", description: "Continu
   final result from that file (marked as read from the saved session). Sessions are saved by default (`rememberAgents`;
   turn it off and agents are resumable only for those ten minutes). The last 2000 such agents of a session stay
   addressable, and 4000 nested and workflow children, at a few hundred bytes each.
-- What survives a restart, `/resume`, `/fork` or `/reload`: finished agents of that session (on its branch, for a fork)
-  stay resumable by the model and by `@handle`. `/new` starts with none. Nested agents and workflow children are
+- What survives a restart, `/resume`, `/fork` or `/reload`: finished, stopped and failed agents of that session (on its
+  branch, for a fork) stay resumable by the model and by `@handle`. Agents still running when the session ended are
+  named once, by id, in a notice ahead of the first prompt of the next start of that session (`pi -p --session-id`,
+  `/resume`), which says to resume them with `Agent({ resume })`; a `subagents:interrupted-notice` entry records it. `/new` starts with none. Nested agents and workflow children are
   rebuilt too (their resume state is written to the parent session as `subagents:resume` entries, one small entry per
   settled child): a nested agent stays resumable by the agent that owns it, once that agent is resumed under its id.
 - In workflows, `agent(prompt, { resume: label })` continues a child of the same run the same way, also after its record
@@ -249,7 +255,9 @@ model and thinking level unless their definition sets one (see [Model and thinki
 `isolated: true` (on a call or in an agent file) removes extension and MCP tools, skills, `ext:` selectors and nested
 delegation. It is not a sandbox: the agent still inherits Pi's environment variables (including provider keys its
 `bash` can read), the parent's model registry and auth, global and trusted project settings (shell, command prefix,
-retry, compaction), and, for append-mode agents such as `general-purpose`, the parent's whole system prompt.
+retry, compaction), and, for append-mode agents such as `general-purpose`, the parent's system prompt. That prompt
+drops the lines of tools the agent does not have (each such tool's `- name: …` line and its own guidelines, matched
+exactly): the orchestration tools, built-ins it was not given, denied tools and tools of extensions it does not load.
 
 The agent file wins over the caller for `isolated:` and `isolation:`; a call's value applies only when the file leaves
 the field unset. This holds on every spawn path: the `Agent` tool, `@handle` mentions (direct mode and the fallback
@@ -312,7 +320,8 @@ To have them follow Pi's project trust decision instead, set `"projectTrust": "p
 | Background concurrency (`/agents → Settings`) | `10` | How many background agents run at once. |
 | `backgroundKey` (`subagents.json`) | `ctrl+b` | Key that sends running foreground `Agent` calls to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)); `"off"` disables it. |
 | Model override (`/agents → Settings`, `allowModelOverride`) | `false` | Whether a spawn's own `model` / `thinking` (Agent tool, nested tool, workflow `agent()`, scheduled jobs, RPC) may choose the subagent's model and thinking level. Off: subagents run on the parent's current model and level unless their agent file sets one, and the tools do not offer the parameters. |
-| Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call is killed at the limit and the agent sees the timeout; any other tool still running a minute later is stopped and the agent is told to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none; a timeout the main agent asks for is kept. |
+| Tool timeout (`/agents → Settings`, `toolTimeoutSeconds`) | `1200` | Seconds one subagent tool call may run (`0` = no limit). A `bash` call that sets no `timeout` gets this one and is killed at it, and the agent sees the timeout; a timeout the call sets is kept, longer or not. The watchdog stops any call still running a minute past its own limit (its `bash` timeout, a codemode script's deadline, else this) and tells the agent to continue another way (up to 3 times per run). The main agent's `bash` calls get the same timeout when they set none. |
+| `watchdogExemptTools` (`subagents.json`) | `["second_opinion_agent"]` | Tools the subagent tool watchdog never stops, because they keep their own deadline. A list here replaces the default. |
 | `codemodeTimeoutSeconds` (`subagents.json`) | `1800` | Deadline in seconds for a Pi `codemode` script whose first line sets no `timeout_ms` (`0` = none), in the main agent and in subagents; a deadline the script sets is kept. Every call a script makes is logged raw to `$PI_CODEMODE_AUDIT_DIR/<session>/<call id>.log` (default `<agent dir>/opensec/codemode/`, capped at `PI_CODEMODE_AUDIT_MAX_BYTES`, default 16 MiB), and the script's result names the file. |
 
 ## Notes

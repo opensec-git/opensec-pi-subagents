@@ -26,6 +26,28 @@ export function setCodemodeTimeoutSeconds(n: number): void {
 }
 
 /**
+ * The deadline in seconds a codemode call runs under: the script's own `timeout_ms` when its
+ * options line sets a positive one, else `codemodeTimeoutSeconds` (undefined when that is 0,
+ * i.e. no deadline). The tool watchdog uses it so it never stops a script inside its deadline.
+ */
+export function codemodeDeadlineSeconds(input: unknown): number | undefined {
+  const code = input && typeof input === "object" ? (input as { code?: unknown }).code : undefined;
+  if (typeof code === "string") {
+    const newline = code.indexOf("\n");
+    const firstLine = (newline === -1 ? code : code.slice(0, newline)).trim();
+    if (firstLine.startsWith(OPTIONS_PREFIX)) {
+      try {
+        const timeoutMs = (JSON.parse(firstLine.slice(OPTIONS_PREFIX.length).trim()) as { timeout_ms?: unknown } | null)?.timeout_ms;
+        if (typeof timeoutMs === "number" && timeoutMs > 0) return timeoutMs / 1000;
+      } catch {
+        // A malformed options line: codemode reports it; fall back to the default deadline.
+      }
+    }
+  }
+  return codemodeTimeoutSeconds > 0 ? codemodeTimeoutSeconds : undefined;
+}
+
+/**
  * Give a codemode call a `timeout_ms` when its script sets none. Pi executes the same input
  * object the `tool_call` handlers receive, so this changes the running script.
  *
