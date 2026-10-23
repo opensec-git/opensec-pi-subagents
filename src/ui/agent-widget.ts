@@ -18,6 +18,16 @@ import { RefreshTicker } from "./refresh-ticker.js";
 /** Maximum number of rendered lines before overflow collapse kicks in. */
 const MAX_WIDGET_LINES = 12;
 
+/** The refresh tick while an agent runs or waits. */
+const TICK_MS = 80;
+
+/**
+ * How often the spinner and the running clocks move when nothing else on the
+ * screen does: every third tick. Each widget redraw is a whole TUI frame,
+ * whose cost grows with the length of the main session.
+ */
+const IDLE_CLOCK_MS = 3 * TICK_MS;
+
 /** Braille spinner frames for animated running indicator. */
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -306,6 +316,19 @@ export class AgentWidget {
   private lastStatusText: string | undefined;
   /** The last frame, reused until update() or a width/theme change. */
   private frameCache: { width: number; theme: Theme; lines: string[] } | undefined;
+  /** Theme from the widget factory, to build a frame before the TUI asks for one. */
+  private theme: Theme | undefined;
+  /** The lines last handed to the TUI: returned by render(), or built for a requested frame. */
+  private lastSent: string[] | undefined;
+  /**
+   * The time the running rows' elapsed counters show. It moves with the
+   * spinner (see advanceClock()), so a tick that moves neither changes no text.
+   */
+  private clockAt = 0;
+  /** A frame this widget requested has not been rendered yet. */
+  private ownFramePending = false;
+  /** Renders since the last tick that this widget did not request: the TUI is drawing anyway. */
+  private foreignRenders = 0;
 
   constructor(
     private manager: AgentManager,
@@ -373,6 +396,8 @@ export class AgentWidget {
       this.frameCache = undefined;
       this.widgetRegistered = false;
       this.tui = undefined;
+      this.theme = undefined;
+      this.lastSent = undefined;
       this.lastStatusText = undefined;
     }
   }
@@ -392,7 +417,30 @@ export class AgentWidget {
 
   /** Ensure the widget update timer is running. */
   ensureTimer() {
-    if (!this.ticker.has(this)) this.ticker.set(this, 80, () => this.update());
+    if (!this.ticker.has(this)) this.ticker.set(this, TICK_MS, () => this.tick());
+  }
+
+  /**
+   * The refresh tick. It builds the lines as every update() does, but asks the
+   * TUI for a frame only when they differ from the ones it shows.
+   *
+   * If the TUI drew a frame of its own since the last tick (the main agent
+   * streaming, Pi's working indicator, a key press), the spinner and the
+   * elapsed counters move as on every tick before, and no frame is requested:
+   * the TUI's next frame shows them, or the next tick asks for one if it did
+   * not come. Otherwise they move every IDLE_CLOCK_MS, and any other change
+   * (activity, counts, rows) is drawn on the next tick.
+   */
+  private tick() {
+    const drawing = this.foreignRenders > 0;
+    this.foreignRenders = 0;
+    this.update(drawing || Date.now() - this.clockAt + TICK_MS / 2 >= IDLE_CLOCK_MS, !drawing);
+  }
+
+  /** Move the spinner one frame and the elapsed counters to now. */
+  private advanceClock() {
+    this.widgetFrame++;
+    this.clockAt = Date.now();
   }
 
   /** When a finished agent's row expires by time. */
@@ -476,7 +524,7 @@ export class AgentWidget {
   private renderRunningLines(a: ReturnType<AgentWidget["widgetAgents"]>[number], theme: Theme, frame: string, truncate: (line: string) => string): [string, string] {
     const modeLabel = getPromptModeLabel(a.type);
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    const elapsed = formatMs(Date.now() - a.startedAt);
+    const elapsed = formatMs(Math.max(0, this.clockAt - a.startedAt));
 
     const bg = this.agentActivity.get(a.id);
     const toolUses = bg?.toolUses ?? a.toolUses;
@@ -523,12 +571,32 @@ export class AgentWidget {
    * every streamed token of the parent, and between ticks nothing here moves.
    */
   private renderWidget(tui: any, theme: Theme): string[] {
-    const w = tui.terminal.columns;
+    if (this.ownFramePending) this.ownFramePending = false;
+    else this.foreignRenders++;
+    const lines = this.cachedLines(tui.terminal.columns, theme);
+    this.lastSent = lines;
+    return lines.slice();
+  }
+
+  private cachedLines(w: number, theme: Theme): string[] {
     const cached = this.frameCache;
-    if (cached && cached.width === w && cached.theme === theme) return cached.lines.slice();
+    if (cached && cached.width === w && cached.theme === theme) return cached.lines;
     const lines = this.buildWidgetLines(w, theme);
     this.frameCache = { width: w, theme, lines };
-    return lines.slice();
+    return lines;
+  }
+
+  /** Rebuild the lines and, if `request`, ask for a frame when they differ from the ones the TUI has. */
+  private refresh(advance: boolean, request: boolean) {
+    const tui = this.tui;
+    const theme = this.theme;
+    if (!tui || !theme) return;
+    if (advance) this.advanceClock();
+    const lines = this.cachedLines(tui.terminal.columns, theme);
+    if (!request || sameLines(lines, this.lastSent)) return;
+    this.lastSent = lines;
+    this.ownFramePending = true;
+    tui.requestRender();
   }
 
   private buildWidgetLines(w: number, theme: Theme): string[] {
@@ -626,8 +694,12 @@ export class AgentWidget {
     return lines;
   }
 
-  /** Force an immediate widget update. */
-  update() {
+  /**
+   * Refresh the widget after a change. From the tick, `advance` false keeps the
+   * spinner and the elapsed counters where they are, and `request` false leaves
+   * the frame to the TUI.
+   */
+  update(advance = true, request = true) {
     this.frameCache = undefined;
     if (!this.uiCtx) return;
     const allAgents = this.widgetAgents();
@@ -693,26 +765,29 @@ export class AgentWidget {
       this.lastStatusText = newStatusText;
     }
 
-    this.widgetFrame++;
-
     // Register widget callback once; subsequent updates use requestRender()
     // which re-invokes render() without replacing the component (avoids layout thrashing).
     if (!this.widgetRegistered) {
+      this.advanceClock();
+      this.lastSent = undefined;
+      this.ownFramePending = true; // pi draws a new widget at once
       this.uiCtx.setWidget("agents", (tui, theme) => {
         this.tui = tui;
+        this.theme = theme;
         return {
           render: () => this.renderWidget(tui, theme),
           invalidate: () => {
             // Theme changed — force re-registration so factory captures fresh theme.
             this.widgetRegistered = false;
             this.tui = undefined;
+            this.theme = undefined;
           },
         };
       }, { placement: "aboveEditor" });
       this.widgetRegistered = true;
     } else {
-      // Widget already registered — just request a re-render of existing components.
-      this.tui?.requestRender();
+      // Widget already registered — re-render the existing component if its lines changed.
+      this.refresh(advance, request);
     }
   }
 
@@ -725,6 +800,14 @@ export class AgentWidget {
     }
     this.widgetRegistered = false;
     this.tui = undefined;
+    this.theme = undefined;
+    this.lastSent = undefined;
     this.lastStatusText = undefined;
   }
+}
+
+function sameLines(a: readonly string[], b: readonly string[] | undefined): boolean {
+  if (!b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

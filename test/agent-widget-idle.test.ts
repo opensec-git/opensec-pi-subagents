@@ -70,10 +70,13 @@ describe("AgentWidget refresh timer", () => {
     h.widget.update();
 
     vi.advanceTimersByTime(1000);
-    expect(h.requestRenders).toBeGreaterThan(5); // spinner ticks while running
+    // The spinner and the clock move every third tick when nothing else does
+    // (agent-widget-redraw.test.ts); this harness never renders, so the first
+    // tick also sends the first frame.
+    expect(h.requestRenders).toBe(5);
     expect(h.render()).toEqual([
       "● Agents",
-      "└─ ⠸ Agent (twin)  bg description · ↻3 · 2 tool uses · 1.2k token · 1.0s",
+      "└─ ⠴ Agent (twin)  bg description · ↻3 · 2 tool uses · 1.2k token · 1.0s",
       "     ⎿  working",
     ]);
 
