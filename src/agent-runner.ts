@@ -23,6 +23,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
+import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, createCodemodeAudit, getCodemodeTimeoutSeconds } from "./codemode-guard.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
@@ -263,7 +264,8 @@ export interface ToolScopeGuard {
 }
 
 /**
- * A `tool_call` handler that blocks out-of-scope tools for every call path.
+ * A `tool_call` handler that blocks out-of-scope tools for every call path, and
+ * gives in-scope `bash` calls the tool timeout (see `toolTimeoutSeconds`).
  *
  * Replacing `session.agent.beforeToolCall` only covers calls the model makes
  * directly. Pi 1.0 also lets tools call tools (`ctx.executeTool()`, used by
@@ -279,10 +281,21 @@ export function createToolScopeGuard(): ToolScopeGuard {
       name: TOOL_SCOPE_GUARD_NAME,
       hidden: true,
       factory: (pi) => {
-        pi.on("tool_call", (event) => {
-          if (!inScope || inScope().has(event.toolName)) return undefined;
-          return { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` };
+        const audit = createCodemodeAudit();
+        pi.on("tool_call", (event, ctx) => {
+          if (inScope && !inScope().has(event.toolName)) {
+            return { block: true, reason: `Tool "${event.toolName}" is not available to this subagent.` };
+          }
+          // Pi executes the same input object, so this bounds the running call,
+          // including calls another tool makes (codemode, ctx.executeTool), which
+          // never pass through session.agent.beforeToolCall.
+          if (event.toolName === "bash") boundBashTimeout(event.input, toolTimeoutSeconds, true);
+          if (event.toolName === CODEMODE_TOOL_NAME) boundCodemodeTimeout(event.input, getCodemodeTimeoutSeconds());
+          audit.recordCall(event, ctx);
+          return undefined;
         });
+        // Keeps the raw output of every call a codemode script makes; see codemode-guard.ts.
+        pi.on("tool_result", (event) => audit.onToolResult(event));
       },
     },
     setScope(fn) {
@@ -541,9 +554,19 @@ export function boundBashTimeout(args: unknown, limitSeconds: number, cap: boole
 }
 
 /**
+ * Sessions whose `bash` calls are already bounded by the inline `tool_call`
+ * guard. Those must not also get the `beforeToolCall` patch: the guard covers
+ * nested calls too, and pi's own `beforeToolCall` is what runs the guard.
+ */
+const toolCallBoundSessions = new WeakSet<object>();
+
+/**
  * Bound a subagent session's tool calls (see `toolTimeoutSeconds`).
  *
- * `bash` calls without a timeout, or with a longer one, get the limit. The
+ * `bash` calls without a timeout, or with a longer one, get the limit: through
+ * the inline `tool_call` guard when the session loaded extensions (every call
+ * path), otherwise by wrapping `session.agent.beforeToolCall` (a session without
+ * extensions loads no built-ins either, so no tool calls tools). The
  * watchdog covers every tool: past the limit (plus slack) it aborts the run,
  * which kills a running command's process tree, and `takeHung()` then reports
  * the call so the caller can resume the agent with `hungToolPrompt()`. When the
@@ -560,11 +583,14 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
   let resolveStuck!: () => void;
   const stuck = new Promise<void>(resolve => { resolveStuck = resolve; });
 
+  const patchBeforeToolCall = !toolCallBoundSessions.has(session);
   const priorBeforeToolCall = session.agent.beforeToolCall;
-  session.agent.beforeToolCall = async (context, signal) => {
-    if (context.toolCall.name === "bash") boundBashTimeout(context.args, limitSeconds, true);
-    return priorBeforeToolCall?.(context, signal);
-  };
+  if (patchBeforeToolCall) {
+    session.agent.beforeToolCall = async (context, signal) => {
+      if (context.toolCall.name === "bash") boundBashTimeout(context.args, limitSeconds, true);
+      return priorBeforeToolCall?.(context, signal);
+    };
+  }
 
   const running = new Map<string, { toolName: string; started: number }>();
   let hung: HungTool | undefined;
@@ -608,7 +634,7 @@ export function installToolTimeouts(session: AgentSession, limitSeconds = toolTi
     dispose() {
       clearInterval(timer);
       unsubscribe();
-      session.agent.beforeToolCall = priorBeforeToolCall;
+      if (patchBeforeToolCall) session.agent.beforeToolCall = priorBeforeToolCall;
     },
   };
 }
@@ -1342,6 +1368,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  if (toolScopeGuard) toolCallBoundSessions.add(session);
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(

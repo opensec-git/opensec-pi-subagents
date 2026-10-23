@@ -52,9 +52,14 @@
 /**
  * Runs inside the realm, ahead of the script body, on a single line.
  *
- * One line matters: the body is compiled at `\n` + line 1, and the host passes
- * `lineOffset: -1` so reported line numbers match the file the author wrote. Any
- * newline in here shifts every stack frame in every workflow script.
+ * One line matters: the body starts on the same line as the wrapper and this
+ * prelude, so the script's line N is the compiled source's line N and reported
+ * line numbers match the file the author wrote. Any newline in here shifts every
+ * stack frame in every workflow script.
+ *
+ * Same line rather than `\n` + `lineOffset: -1`: Bun's `vm.Script` honours a
+ * positive `lineOffset` but ignores a negative one, which put every frame one
+ * line below the line the author wrote.
  */
 const DETERMINISM_PRELUDE =
   "const Date = (function () {" +
@@ -732,8 +737,8 @@ async function workflowIn(scope, nameOrRef, args) {
       // \`meta\` is deliberately not a parameter: the body still opens with its
       // own \`const meta = { ... }\` (extractMeta strips only the \`export\`), so a
       // parameter of that name would collide with it.
-      "(async (agent, phase, log, workflow, console, args) => {" + PRELUDE + "\\n" + loaded.body + "\\n})",
-      { filename: "workflow:" + loaded.name + ".js", lineOffset: -1 }
+      "(async (agent, phase, log, workflow, console, args) => {" + PRELUDE + loaded.body + "\\n})",
+      { filename: "workflow:" + loaded.name + ".js" }
     );
     run = compiled.runInContext(realmContext);
   } catch (error) {
@@ -805,11 +810,10 @@ async function main() {
   sandbox.meta = realmParse(workerData.metaJson);
   sandbox.args = workerData.argsJson === undefined ? undefined : realmParse(workerData.argsJson);
 
-  const script = new vm.Script("(async () => {" + PRELUDE + "\\n" + workerData.body + "\\n})()", {
+  // The wrapper and prelude share the body's first line (see PRELUDE), so a
+  // thrown error points at the line the author wrote with no lineOffset.
+  const script = new vm.Script("(async () => {" + PRELUDE + workerData.body + "\\n})()", {
     filename: "workflow.js",
-    // The wrapper adds exactly one line above the body; undo it so a thrown
-    // error points at the line the author wrote.
-    lineOffset: -1,
   });
 
   const value = await script.runInContext(context);

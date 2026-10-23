@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.6] - 2026-10-17
+
+Restores four fixes the Bun build had in 0.19.5-bun.6 to bun.8 (and 0.19.4-bun.0) that were lost when 0.20.x was
+cut from the Node sources. Both builds have them again.
+
+### Added
+
+- **Codemode scripts get a deadline.** Pi runs a `codemode` script with no time limit unless its first line sets
+  `timeout_ms`, so one stuck call held the agent forever. Scripts that set none now get `codemodeTimeoutSeconds`
+  (setting; default 1800, 0 = off), in the main session and in subagents; a deadline the script sets is kept.
+- **Codemode audit trail.** Every call a codemode script makes is written to
+  `$PI_CODEMODE_AUDIT_DIR/<session>/<call id>.log` (default `<agent dir>/opensec/codemode/`): the structured output
+  the script received (bash: up to 1 MiB), the exit code and the full-output path, capped per script by
+  `PI_CODEMODE_AUDIT_MAX_BYTES` (default 16 MiB). The script's result names the file and says that its filtered
+  output is not proof that something is absent; the script's structured result is kept.
+
+### Fixed
+
+- **A subagent's `bash` calls made by another tool are bounded too.** The subagent tool timeout only reached calls
+  the model made directly; calls a codemode script, `ctx.executeTool()` or a deferred tool made ran without a limit.
+  Since 0.20.3 loads codemode in every subagent, that was most of them. The subagent's tool-scope guard now sets the
+  timeout on every call path.
+- **Workflow scripts report the right line numbers on Bun.** Bun ignores a negative `lineOffset`, so every stack
+  frame pointed one line below the line the author wrote. The wrapper now needs no offset on either runtime.
+
 ## [0.20.5] - 2026-10-16
 
 Orchestration results the main agent can act on: failed runs are error results with what they produced, unfinished

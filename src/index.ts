@@ -22,6 +22,7 @@ import { AgentManager, type CompactionInfo, isTopLevelAgent, type ManagerObserve
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, createCodemodeAudit, getCodemodeTimeoutSeconds, setCodemodeTimeoutSeconds } from "./codemode-guard.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -2098,10 +2099,17 @@ export default function (pi: ExtensionAPI) {
   // so an unbounded `grep -r … /` or a server started in the foreground would
   // otherwise hold the turn until someone notices. (Subagents are also capped —
   // see installToolTimeouts in agent-runner.ts.)
-  pi.on("tool_call", (event) => {
+  const codemodeAudit = createCodemodeAudit();
+  pi.on("tool_call", (event, ctx) => {
     if (event.toolName === "bash") boundBashTimeout(event.input, getToolTimeoutSeconds(), false);
+    // Pi's codemode scripts have no deadline unless they set one; give those that don't
+    // `codemodeTimeoutSeconds` (default 30 minutes). A deadline the script sets is kept.
+    if (event.toolName === CODEMODE_TOOL_NAME) boundCodemodeTimeout(event.input, getCodemodeTimeoutSeconds());
+    codemodeAudit.recordCall(event, ctx);
     return undefined;
   });
+  // Keeps the raw output of every call a codemode script makes; see codemode-guard.ts.
+  pi.on("tool_result", (event) => codemodeAudit.onToolResult(event));
 
   // The parent's turn is over: spend that arrived after its last subagent tool
   // result (background agents, workflows) reaches the session stats now.
@@ -2172,6 +2180,7 @@ export default function (pi: ExtensionAPI) {
     setDefaultMaxTurns,
     setGraceTurns,
     setToolTimeoutSeconds,
+    setCodemodeTimeoutSeconds,
     setDefaultJoinMode,
     setBackgroundByDefault,
     setSchedulingEnabled,
@@ -4500,6 +4509,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       toolTimeoutSeconds: getToolTimeoutSeconds(),
+      codemodeTimeoutSeconds: getCodemodeTimeoutSeconds(),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
