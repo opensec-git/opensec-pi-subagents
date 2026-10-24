@@ -124,7 +124,7 @@ A script you will run more than once belongs somewhere durable. Copy it out of t
 
 First hit wins, in that order, so a project file shadows a same-named global one.
 
-By default (`"projectTrust": "pi"` in the global subagents.json; `"full"` uses them in every project), the two project locations are used only when you trusted the project: the folder was trusted at Pi's prompt (or by `defaultProjectTrust`, or a CLI flag), or `/trust` recorded it. Pi trusts a folder without asking when it holds nothing Pi gates, and `.pi/workflows` is not gated, so a cloned repo that ships only workflows does not get them run by name until you run `/trust`. A refused name says so and runs nothing.
+By default (`"projectTrust": "pi"` in the global subagents.json; `"full"` uses them in every project), the two project locations are used only when you trusted the project: the folder was trusted at Pi's prompt, `/trust` recorded it, `defaultProjectTrust` is `"always"`, or Pi runs with `--approve`. Pi trusts a folder without asking when it holds nothing Pi gates, and `.pi/workflows` is not gated, so a cloned repo that ships only workflows does not get them run by name until you run `/trust`. A refused name says so and runs nothing.
 
 The file must carry an `export const meta = { name, description }` declaration. Those are ordinary directories that may hold anything, so that declaration is what marks a file as a workflow — name something else and you are told it is not a workflow rather than getting a parse error from halfway through it. Nothing in the file is executed to decide that.
 
