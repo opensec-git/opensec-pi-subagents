@@ -22,6 +22,7 @@ import { AgentManager, type CompactionInfo, isTopLevelAgent, type ManagerObserve
 import { boundBashTimeout, getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, getToolTimeoutSeconds, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, setToolTimeoutSeconds, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, createCodemodeAudit, getCodemodeTimeoutSeconds, setCodemodeTimeoutSeconds } from "./codemode-guard.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -34,6 +35,7 @@ import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel, resolveModelDetailed, unresolvedModelNote, unresolvedReason } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
+import { orchestrationSettingsAsWritten, setWatchdogExemptTools } from "./orchestration.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
@@ -41,7 +43,7 @@ import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { readSavedResult } from "./session-file.js";
 import { appendToSessionFile, type EntryWriter, HANDOFF_PROTOCOL, isCompatible, isSessionOnDisk, isSessionSwitch, PACKAGE_VERSION, type ParkedSubagents, parkSubagents, sessionFileOf, takeParkedSubagents } from "./session-handoff.js";
 import { applyAndEmitLoaded, applySettings, loadSettings, type SettingsAppliers, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, runModelText, sessionFileLine } from "./status-note.js";
+import { agentIdLine, getForegroundOutcomeNote, getStatusNote, isFailedStatus, partialOutputSuffix, resumeHintXml, runModelText, sessionFileLine } from "./status-note.js";
 import { AGENT_ARG_SHAPE, argumentRepair, RESULT_ARG_SHAPE, STEER_ARG_SHAPE } from "./tool-args.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentResumeState, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -271,7 +273,9 @@ function formatTaskNotification(
     record.invocation?.modelId && record.invocation.thinking ? `<thinking>${escapeXml(record.invocation.thinking)}</thinking>` : null,
     // The agent file's model did not resolve and the run used another.
     record.modelNote ? `<model-note>${escapeXml(record.modelNote)}</model-note>` : null,
-    `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
+    `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status, record.stopCause)}</summary>`,
+    // A run that did not finish keeps its context: name the id to resume it with.
+    resumeHintXml(record),
     `<result>${escapeXml(resultPreview)}</result>`,
     resultBytes,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
@@ -344,6 +348,7 @@ function recordEntryData(record: AgentRecord, pending = false): Record<string, u
   return {
     id: record.id, type: record.type, description: record.description,
     status: record.status, result: record.result, error: record.error,
+    ...(record.status === "stopped" && record.stopCause ? { stopCause: record.stopCause } : {}),
     startedAt: record.startedAt, completedAt: record.completedAt,
     resume: resumeStateOf(record),
     ...(pending
@@ -375,6 +380,8 @@ export function pendingResultsFromEntries(entries: readonly unknown[]): AgentRec
         type: String(d.type ?? ""),
         description: String(d.description ?? ""),
         status: (d.status as AgentRecord["status"]) ?? "completed",
+        stopCause: d.stopCause === "session-end" || d.stopCause === "user" ? d.stopCause : undefined,
+        sessionFile: typeof (d.resume as { sessionFile?: unknown } | undefined)?.sessionFile === "string" ? (d.resume as { sessionFile: string }).sessionFile : undefined,
         result: typeof d.result === "string" ? d.result : undefined,
         error: typeof d.error === "string" ? d.error : undefined,
         startedAt: typeof d.startedAt === "number" ? d.startedAt : 0,
@@ -390,6 +397,57 @@ export function pendingResultsFromEntries(entries: readonly unknown[]): AgentRec
     }
   }
   return [...pending.values()];
+}
+
+/** Session entry recording that the restart notice named these agents (see {@link interruptedAgentsFromEntries}). */
+const INTERRUPTED_NOTICE_ENTRY_TYPE = "subagents:interrupted-notice";
+
+/** An agent the parent session's end interrupted, as the restart notice names it. */
+export interface InterruptedAgent {
+  id: string;
+  type: string;
+  description: string;
+}
+
+/**
+ * The agents of a session that its last end interrupted (`stopped` with
+ * `stopCause: "session-end"` in their latest `subagents:record` entry) and that
+ * can be resumed (a saved session), less those a `subagents:interrupted-notice`
+ * entry already named. A later record of the same agent (resumed and finished,
+ * stopped by the user) replaces the earlier one.
+ */
+export function interruptedAgentsFromEntries(entries: readonly unknown[]): InterruptedAgent[] {
+  const interrupted = new Map<string, InterruptedAgent>();
+  for (const entry of entries) {
+    const e = entry as { type?: unknown; customType?: unknown; data?: Record<string, unknown> } | null;
+    if (e?.type !== "custom" || !e.data) continue;
+    if (e.customType === RECORD_ENTRY_TYPE && typeof e.data.id === "string") {
+      const d = e.data;
+      const resume = d.resume as { sessionFile?: unknown; stopCause?: unknown } | undefined;
+      const cause = d.stopCause ?? resume?.stopCause;
+      interrupted.delete(d.id as string);
+      if (d.status === "stopped" && cause === "session-end" && typeof resume?.sessionFile === "string") {
+        interrupted.set(d.id as string, { id: d.id as string, type: String(d.type ?? ""), description: String(d.description ?? "") });
+      }
+    } else if (e.customType === INTERRUPTED_NOTICE_ENTRY_TYPE && Array.isArray(e.data.ids)) {
+      for (const id of e.data.ids) if (typeof id === "string") interrupted.delete(id);
+    }
+  }
+  return [...interrupted.values()];
+}
+
+/**
+ * The notice the first run after a restart gets, ahead of its prompt: which
+ * agents the session's end interrupted, and that they are resumed, not replaced.
+ */
+export function formatInterruptedNotice(agents: readonly InterruptedAgent[]): string {
+  const lines = agents.map((a) => `- ${a.id} (${a.type}): ${a.description}`);
+  return [
+    `<interrupted-agents>`,
+    `${agents.length === 1 ? "1 background agent" : `${agents.length} background agents`} of this session ${agents.length === 1 ? "was" : "were"} still running when the session last ended, and ${agents.length === 1 ? "was" : "were"} interrupted by that, not stopped by anyone. Each keeps its whole context: to finish its task, resume it with the Agent tool (\`resume: "<id>"\` and a prompt to continue) instead of starting a fresh agent, which would redo its work.`,
+    ...lines,
+    `</interrupted-agents>`,
+  ].join("\n");
 }
 
 /**
@@ -409,7 +467,7 @@ async function stopParkedAgents(manager: AgentManager, entry: ParkedSubagents, w
   };
   for (const record of entry.completed.splice(0) as AgentRecord[]) put(record, isTopLevelAgent(record) && !record.resultConsumed);
   const interrupted = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
-  manager.abortAll();
+  manager.abortAll("session-end");
   await manager.awaitWorktreeCleanup(15_000);
   for (const record of interrupted) put(record, false);
   await manager.dispose();
@@ -431,6 +489,7 @@ function recordParkedAgentsAtExit(manager: AgentManager, entry: ParkedSubagents)
   for (const record of manager.listAllAgents()) {
     if (record.status !== "running" && record.status !== "queued") continue;
     record.status = "stopped";
+    record.stopCause = "session-end";
     record.completedAt ??= Date.now();
     put(record, false);
   }
@@ -841,6 +900,8 @@ export default function (pi: ExtensionAPI) {
    * reports to its owner, not to whichever session is open.
    */
   let currentSession: string | undefined;
+  /** Agents the last end of the current session interrupted, for the next run's notice (see `before_agent_start`). */
+  let interruptedNotice: InterruptedAgent[] = [];
   const ownedHere = (record: Pick<AgentRecord, "ownerSession">): boolean => record.ownerSession === currentSession;
 
   /**
@@ -1183,6 +1244,15 @@ export default function (pi: ExtensionAPI) {
     // Results of this session's agents that finished while another session
     // was open, recorded here for delivery now.
     deliverPendingResults(branch);
+    // Agents the last end of this session interrupted, named once to the next
+    // run so it resumes them rather than starting fresh ones. Not those whose
+    // result is about to be delivered, nor any running again (a /reload).
+    const pendingIds = new Set(pendingResultsFromEntries(branch).map((r) => r.id));
+    interruptedNotice = interruptedAgentsFromEntries(branch).filter((a) => {
+      if (pendingIds.has(a.id)) return false;
+      const live = manager.getRecord(a.id);
+      return !(live && (live.status === "running" || live.status === "queued" || manager.isRunActive(a.id)));
+    });
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1617,6 +1687,7 @@ export default function (pi: ExtensionAPI) {
     // Spend no tool result carried back yet: record it while the session can.
     flushPendingUsage();
     disposed = true;
+    interruptedNotice = [];
     sessionGeneration++;
     for (const stop of mentionClones) stop.abort();
     mentionClones.clear();
@@ -1637,6 +1708,12 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
+
+    // Runs Pi's shutdown aborted just before this (foreground agents) and the
+    // workflow children aborted above are stopped but still winding down: the
+    // session's end interrupted them, not the user.
+    const cutShort = manager.listAllAgents().filter(r => r.status === "stopped" && r.stopCause === undefined && manager.isRunActive(r.id));
+    for (const record of cutShort) record.stopCause = "session-end";
 
     const live = manager.listAllAgents().filter(r => r.status === "running" || r.status === "queued");
     // Pi says why (Pi >= 1.0): `new`, `resume`, `fork` and `reload` replace the
@@ -1662,16 +1739,16 @@ export default function (pi: ExtensionAPI) {
       }
       return current.id;
     };
-    const interrupted = live.filter(r => !kept.has(rootOf(r)));
+    const interrupted = [...cutShort, ...live.filter(r => !kept.has(rootOf(r)))];
     // Also worth keeping: another session's agents that finished while this
     // one was open, so their session shows them in full when it is reopened.
     const carried = switching && manager.listAllAgents().some(r =>
       isTopLevelAgent(r) && !ownedHere(r) && !r.resultConsumed && !manager.isRunActive(r.id) && isSessionOnDisk(r.ownerSession));
     const parking = kept.size > 0 || carried;
     if (kept.size > 0) {
-      for (const record of interrupted) manager.abort(record.id);
+      for (const record of interrupted) manager.abort(record.id, "session-end");
     } else {
-      manager.abortAll();
+      manager.abortAll("session-end");
     }
     // A stopped worktree agent still commits its changes to a branch while it
     // settles; dispose() does not wait for that, and the process may exit next.
@@ -2098,9 +2175,37 @@ export default function (pi: ExtensionAPI) {
   // so an unbounded `grep -r … /` or a server started in the foreground would
   // otherwise hold the turn until someone notices. (Subagents are also capped —
   // see installToolTimeouts in agent-runner.ts.)
-  pi.on("tool_call", (event) => {
+  const codemodeAudit = createCodemodeAudit();
+  pi.on("tool_call", (event, ctx) => {
     if (event.toolName === "bash") boundBashTimeout(event.input, getToolTimeoutSeconds(), false);
+    // Pi's codemode scripts have no deadline unless they set one; give those that don't
+    // `codemodeTimeoutSeconds` (default 30 minutes). A deadline the script sets is kept.
+    if (event.toolName === CODEMODE_TOOL_NAME) boundCodemodeTimeout(event.input, getCodemodeTimeoutSeconds());
+    codemodeAudit.recordCall(event, ctx);
     return undefined;
+  });
+  // Keeps the raw output of every call a codemode script makes; see codemode-guard.ts.
+  pi.on("tool_result", (event) => codemodeAudit.onToolResult(event));
+
+  // The first run after a restart learns, once, which agents the session's end
+  // interrupted, so it resumes them instead of launching fresh ones.
+  pi.on("before_agent_start", () => {
+    const agents = interruptedNotice;
+    interruptedNotice = [];
+    if (disposed || agents.length === 0) return;
+    try {
+      pi.appendEntry(INTERRUPTED_NOTICE_ENTRY_TYPE, { ids: agents.map((a) => a.id) });
+    } catch {
+      return;
+    }
+    return {
+      message: {
+        customType: "subagents-interrupted",
+        content: formatInterruptedNotice(agents),
+        display: true,
+        details: { ids: agents.map((a) => a.id) },
+      },
+    };
   });
 
   // The parent's turn is over: spend that arrived after its last subagent tool
@@ -2172,6 +2277,7 @@ export default function (pi: ExtensionAPI) {
     setDefaultMaxTurns,
     setGraceTurns,
     setToolTimeoutSeconds,
+    setCodemodeTimeoutSeconds,
     setDefaultJoinMode,
     setBackgroundByDefault,
     setSchedulingEnabled,
@@ -2193,6 +2299,7 @@ export default function (pi: ExtensionAPI) {
     setShowCost,
     setShowModel,
     setBackgroundKey,
+    setWatchdogExemptTools,
   };
   applyAndEmitLoaded(settingsAppliers, (event, payload) => pi.events.emit(event, payload), process.cwd(), projectTrusted);
 
@@ -2333,7 +2440,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
+- Use resume with an agent ID to continue a previous agent's work. An agent that stopped or failed (a provider error, a restart of your own session) keeps its whole context: resume it rather than starting a fresh one, which would redo its work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
@@ -2445,7 +2552,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from (the `Agent ID:` of an earlier result). Continues from previous context, with the agent's own model, working directory and worktree. Finished agents stay resumable as long as their saved session exists, also after a restart. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from (the `Agent ID:` of an earlier result). Continues from previous context, with the agent's own model, working directory and worktree. Finished, stopped and failed agents stay resumable, with their context, as long as their saved session exists, also after a restart of your session. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2921,7 +3028,7 @@ Terse command-style prompts produce shallow, generic work.
         return textResult(
           // A resumed run can hit its turn limit, so say so the way a first
           // run's headline does rather than presenting partial output as done.
-          (getForegroundOutcomeNote(record.status) ? `Agent resumed${getForegroundOutcomeNote(record.status)}.\n\n` : "") +
+          (getForegroundOutcomeNote(record.status, record.stopCause) ? `Agent resumed${getForegroundOutcomeNote(record.status, record.stopCause)}.\n\n` : "") +
           (record.result?.trim() || "No output.") +
           (isFailedStatus(record.status) ? sessionFileLine(record) : "") +
           agentIdLine(record.id),
@@ -3217,12 +3324,12 @@ Terse command-style prompts produce shallow, generic work.
       // The headline names how the run ended: a stopped or aborted run did not
       // complete, and "completed" in front of it reads as a finished task.
       const headline = record.status === "stopped"
-        ? "Agent was stopped by the user after"
+        ? record.stopCause === "session-end" ? "Agent was interrupted by the session's end after" : "Agent was stopped by the user after"
         : record.status === "aborted"
           ? "Agent was aborted after"
           : "Agent completed in";
       return textResult(
-        `${spawnNotes}${headline} ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${spawnNotes}${headline} ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status, record.stopCause)}.\n\n` +
         (record.result?.trim() || "No output.") +
         (isFailedStatus(record.status) ? sessionFileLine(record) : "") +
         agentIdLine(record.id),
@@ -3737,7 +3844,7 @@ Terse command-style prompts produce shallow, generic work.
     const thinking = entry.thinking ?? saved.thinking;
     let output =
       `Agent: ${entry.id}\n` +
-      `Type: ${getDisplayName(entry.type)} | Status: ${status}${getStatusNote(status)}\n` +
+      `Type: ${getDisplayName(entry.type)} | Status: ${status}${getStatusNote(status, entry.stopCause)}\n` +
       (model ? `Model: ${thinking ? `${model}, thinking: ${thinking}` : model}\n` : "") +
       `Description: ${entry.description}\n` +
       `(Read from the agent's saved session file, ${entry.sessionFile}: its in-memory record was released after it finished.)\n\n`;
@@ -3831,7 +3938,7 @@ Terse command-style prompts produce shallow, generic work.
       const modelText = runModelText(record);
       let output =
         `Agent: ${record.id}\n` +
-        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
+        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status, record.stopCause)} | ${statsParts.join(" | ")}\n` +
         (modelText ? `Model: ${modelText}\n` : "") +
         (record.modelNote ? `${record.modelNote}\n` : "") +
         `Description: ${record.description}\n\n`;
@@ -4500,6 +4607,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       toolTimeoutSeconds: getToolTimeoutSeconds(),
+      codemodeTimeoutSeconds: getCodemodeTimeoutSeconds(),
       defaultJoinMode: getDefaultJoinMode(),
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
@@ -4533,6 +4641,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       showModel: isShowModelEnabled(),
       // As written: undefined (the default) stays out of the file.
       backgroundKey: backgroundKeySetting,
+      ...orchestrationSettingsAsWritten(),
     } satisfies SubagentsSettings;
   }
 

@@ -107,8 +107,10 @@ describe("widget and fleet list on a shared clock", () => {
     expect(vi.getTimerCount()).toBe(1);
 
     await vi.advanceTimersByTimeAsync(2000);
-    // 25 widget ticks in 2 s; the fleet's two ticks share two of those frames.
-    expect(tui.frames).toBe(25);
+    // One timer. The widget asks for a frame on the first tick (this TUI never
+    // drew it) and then every third tick, for its spinner; the fleet's
+    // whole-second ticks (every 12th) fall on two of those.
+    expect(tui.frames).toBe(9);
     widget.dispose();
     fleet.dispose();
     expect(vi.getTimerCount()).toBe(0);

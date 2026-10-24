@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.8] - 2026-10-23
+
+### Changed
+
+- **The agents widget redraws only when its text changes.** While agents ran or waited, its 80 ms tick asked Pi for a
+  frame every time, also with the main agent idle, and each frame walks the whole main transcript. Now:
+  - When Pi draws nothing else (main agent idle), the spinner and the elapsed counters step every 240 ms instead of
+    every 80 ms, so the tenths jump by .2 or .3. Other changes (activity, tool uses, tokens, rows, queued count) still
+    show on the next 80 ms tick.
+  - When Pi draws frames of its own (the main agent streaming, its working indicator, typing), the widget moves every
+    80 ms as before, carried by those frames.
+  - A widget with only queued agents no longer redraws. Completions and status changes are drawn at once, as before.
+
+## [0.20.7] - 2026-10-21
+
+Stopped and failed subagents are resumed, not replaced. When a provider error (403, 429, a usage limit) or the end
+of the parent's own session interrupted background agents, a restarted parent launched fresh agents that redid the
+work, although resume by id worked: nothing it read said a stopped or failed agent keeps its context, and nothing
+told it after a restart which agents had been interrupted.
+
+### Added
+
+- **Restart notice.** Agents still running when the parent session ended (quit, `pi -p` exiting after a provider
+  error, SIGTERM) are recorded as interrupted. The next start of that session (`pi -p --session-id <same>`, `/resume`)
+  adds one notice to its first run, ahead of the prompt: which agents were interrupted, by id, and that they are
+  resumed with `Agent({ resume })`. It is sent once (a `subagents:interrupted-notice` entry records it); an agent
+  resumed and finished since, stopped by the user, or without a saved session is not listed.
+
+- **`watchdogExemptTools` setting.** Tools the subagent tool watchdog never stops, because they have their own
+  deadline. Default `["second_opinion_agent"]`: a synchronous second opinion has a 60-minute deadline, and the 1200 s
+  watchdog stopped 9 of 91 reviews in one VVAH run. Setting it replaces the default list.
+
+### Changed
+
+- **A subagent's `bash` timeout is kept as the call sets it.** A `timeout` longer than `toolTimeoutSeconds` was cut
+  to it (1200 s by default), so a build or fuzz run that asked for 1800 s was killed at 1200 s. Only a call with no
+  timeout (or one that is not a positive number) gets `toolTimeoutSeconds` now. In one VVAH run, 1,078 of 235,442
+  subagent `bash` calls asked for more than 1200 s, and 4 were cut short.
+- **The tool watchdog follows each call's own limit.** It stopped every tool call at `toolTimeoutSeconds` plus 60 s,
+  including a `bash` call with a longer timeout and a codemode script inside its own deadline (1800 s by default).
+  Now a `bash` call gets its own timeout, a codemode script its `timeout_ms` (else `codemodeTimeoutSeconds`), and
+  every other tool `toolTimeoutSeconds`.
+- **A subagent's inherited prompt drops the lines of tools it does not have.** In append mode a subagent starts with
+  the parent's system prompt, which lists the parent's tools and their guidelines: `Agent`, `get_subagent_result`
+  and the other orchestration tools, which subagents never get, plus tools of extensions the subagent does not
+  load, built-ins it was not given and tools its agent file denies. Each such tool's `- name: …` line and its own
+  guideline lines are removed, matched exactly, so other text that mentions a tool name is kept.
+- **The Agent tool says stopped and failed agents keep their context.** The description: an agent that stopped or
+  failed (a provider error, a restart of your own session) keeps its whole context and is resumed rather than
+  replaced. The `resume` parameter: finished, stopped and failed agents stay resumable, also after a restart of the
+  session.
+- **Background notifications of unfinished runs carry the resume hint.** Failed (error), stopped and aborted
+  notifications end with `<resume>`, naming the id to pass as `resume`, as foreground results do with their
+  `Agent ID:` line. Only for agents with a saved session.
+
+### Fixed
+
+- **An agent interrupted by its session's end is no longer reported as stopped by the user.** The stop cause is
+  recorded (`stopCause: "session-end"` on the record, its `subagents:record` entry and its resume state), and the
+  status note says the agent was interrupted when the parent session ended, not stopped by anyone, and can be
+  resumed. Foreground agents and workflow children, whose runs Pi's shutdown aborts just before the extension's
+  `session_shutdown`, get the same cause. A user's stop still reads "STOPPED BY THE USER". A resume clears the cause.
+
+## [0.20.6] - 2026-10-17
+
+Restores four fixes the Bun build had in 0.19.5-bun.6 to bun.8 (and 0.19.4-bun.0) that were lost when 0.20.x was
+cut from the Node sources. Both builds have them again.
+
+### Added
+
+- **Codemode scripts get a deadline.** Pi runs a `codemode` script with no time limit unless its first line sets
+  `timeout_ms`, so one stuck call held the agent forever. Scripts that set none now get `codemodeTimeoutSeconds`
+  (setting; default 1800, 0 = off), in the main session and in subagents; a deadline the script sets is kept.
+- **Codemode audit trail.** Every call a codemode script makes is written to
+  `$PI_CODEMODE_AUDIT_DIR/<session>/<call id>.log` (default `<agent dir>/opensec/codemode/`): the structured output
+  the script received (bash: up to 1 MiB), the exit code and the full-output path, capped per script by
+  `PI_CODEMODE_AUDIT_MAX_BYTES` (default 16 MiB). The script's result names the file and says that its filtered
+  output is not proof that something is absent; the script's structured result is kept.
+
+### Fixed
+
+- **A subagent's `bash` calls made by another tool are bounded too.** The subagent tool timeout only reached calls
+  the model made directly; calls a codemode script, `ctx.executeTool()` or a deferred tool made ran without a limit.
+  Since 0.20.3 loads codemode in every subagent, that was most of them. The subagent's tool-scope guard now sets the
+  timeout on every call path.
+- **Workflow scripts report the right line numbers on Bun.** Bun ignores a negative `lineOffset`, so every stack
+  frame pointed one line below the line the author wrote. The wrapper now needs no offset on either runtime.
+
 ## [0.20.5] - 2026-10-16
 
 Orchestration results the main agent can act on: failed runs are error results with what they produced, unfinished

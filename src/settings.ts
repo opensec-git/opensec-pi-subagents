@@ -47,6 +47,11 @@ export interface SubagentsSettings {
    * default 1200). See `toolTimeoutSeconds` in agent-runner.ts.
    */
   toolTimeoutSeconds?: number;
+  /**
+   * Deadline in seconds for pi's `codemode` scripts that set no `timeout_ms`
+   * (0 = leave them unbounded, default 1800). See codemode-guard.ts.
+   */
+  codemodeTimeoutSeconds?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -333,6 +338,12 @@ export interface SubagentsSettings {
    * extension's key lives here.
    */
   backgroundKey?: string;
+  /**
+   * Tools the subagent tool watchdog never stops, because they keep their own
+   * deadline. Defaults to `["second_opinion_agent"]` (see orchestration.ts); a
+   * list here replaces the default.
+   */
+  watchdogExemptTools?: string[];
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
@@ -344,6 +355,7 @@ export interface SettingsAppliers {
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setToolTimeoutSeconds: (n: number) => void;
+  setCodemodeTimeoutSeconds: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -365,6 +377,7 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setBackgroundKey: (key: string) => void;
+  setWatchdogExemptTools?: (names: string[]) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -382,6 +395,7 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const TOOL_TIMEOUT_CEILING = 86_400;
+const CODEMODE_TIMEOUT_CEILING = 86_400;
 const SUBAGENT_DEPTH_CEILING = 16;
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
@@ -425,6 +439,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.toolTimeoutSeconds as number) <= TOOL_TIMEOUT_CEILING
   ) {
     out.toolTimeoutSeconds = r.toolTimeoutSeconds as number;
+  }
+  if (
+    Number.isInteger(r.codemodeTimeoutSeconds) &&
+    (r.codemodeTimeoutSeconds as number) >= 0 &&
+    (r.codemodeTimeoutSeconds as number) <= CODEMODE_TIMEOUT_CEILING
+  ) {
+    out.codemodeTimeoutSeconds = r.codemodeTimeoutSeconds as number;
   }
   if (
     Number.isInteger(r.maxSubagentDepth) &&
@@ -497,6 +518,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
+  }
+  if (Array.isArray(r.watchdogExemptTools)) {
+    out.watchdogExemptTools = (r.watchdogExemptTools as unknown[]).filter((x): x is string => typeof x === "string" && !!x.trim());
   }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
@@ -579,6 +603,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.toolTimeoutSeconds === "number") appliers.setToolTimeoutSeconds(s.toolTimeoutSeconds);
+  if (typeof s.codemodeTimeoutSeconds === "number") appliers.setCodemodeTimeoutSeconds(s.codemodeTimeoutSeconds);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
@@ -600,6 +625,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.backgroundKey) appliers.setBackgroundKey(s.backgroundKey);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (s.watchdogExemptTools) appliers.setWatchdogExemptTools?.(s.watchdogExemptTools);
 }
 
 /**

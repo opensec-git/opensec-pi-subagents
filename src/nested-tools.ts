@@ -160,8 +160,8 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   // leads — appended, it would look like part of the child's own output.
   const text = record.result?.trim() || record.error?.trim() || "No output.";
   const note = position === "inline"
-    ? getForegroundOutcomeNote(record.status)
-    : getStatusNote(record.status);
+    ? getForegroundOutcomeNote(record.status, record.stopCause)
+    : getStatusNote(record.status, record.stopCause);
   const sessionLine = isFailedStatus(record.status) ? sessionFileLine(record) : "";
   return (note ? `Nested agent${note}.\n\n${text}` : text) + sessionLine + idLine;
 }

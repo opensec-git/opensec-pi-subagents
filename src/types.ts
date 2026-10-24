@@ -148,6 +148,8 @@ export interface AgentResumeState {
    * Absent in entries written before it was kept.
    */
   status?: AgentRecord["status"];
+  /** Why a `stopped` run stopped (see `AgentRecord.stopCause`). */
+  stopCause?: StopCause;
   /** Top-level agents only. */
   handle?: string;
   alias?: string;
@@ -190,6 +192,9 @@ export type MentionResolution =
   | { kind: "live"; record: AgentRecord }
   | { kind: "tombstone"; entry: AgentTombstone };
 
+/** Why an agent was stopped; see `AgentRecord.stopCause`. */
+export type StopCause = "user" | "session-end";
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -209,6 +214,13 @@ export interface AgentRecord {
   alias?: string;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  /**
+   * Why a `stopped` agent stopped: `session-end` when the parent session ended
+   * under it (quit, `pi -p` exiting, SIGTERM, a session switch), so it was
+   * interrupted rather than stopped by anyone. Undefined for a user's stop.
+   * Cleared when the agent is resumed.
+   */
+  stopCause?: StopCause;
   result?: string;
   error?: string;
   toolUses: number;
