@@ -21,9 +21,9 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** These tests pin `projectTrust: "pi"` in the run's global subagents.json; the default, "full", trusts every project. */
-function followPiTrust(): void {
-  writeFileSync(join(getAgentDir(), "subagents.json"), JSON.stringify({ projectTrust: "pi" }));
+/** The opt-in to trust every project, in the run's global subagents.json; the default, "pi", follows Pi. */
+function trustEveryProject(): void {
+  writeFileSync(join(getAgentDir(), "subagents.json"), JSON.stringify({ projectTrust: "full" }));
 }
 
 function project(): string {
@@ -53,7 +53,7 @@ const isParent = (tools: Array<{ name: string }> | undefined) => (tools ?? []).s
 const hasToolResult = (messages: Array<{ role: string }>) => messages.some((m) => m.role === "toolResult");
 
 describe("subagents and project trust", () => {
-  it("by default (projectTrust: full) a child loads the project's .pi/extensions even when the parent does not trust it", async () => {
+  it("with projectTrust: full a child loads the project's .pi/extensions even when the parent does not trust it", async () => {
     const cwd = project();
     addProjectExtension(cwd);
     let childTools: string[] | undefined;
@@ -67,7 +67,7 @@ describe("subagents and project trust", () => {
       return "child done";
     };
 
-    const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: false });
+    const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: false, beforeRun: trustEveryProject });
     await run.dispose();
 
     expect(childTools).toContain("probe_tool");
@@ -88,7 +88,7 @@ describe("subagents and project trust", () => {
         return "child done";
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
       await run.dispose();
 
       expect(childTools).toBeDefined();
@@ -115,7 +115,7 @@ describe("subagents and project trust", () => {
         return hasToolResult(context.messages) ? "child done" : fauxToolCall("bash", { command: "echo child" });
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted });
       await run.dispose();
 
       const ran = existsSync(marker) ? readFileSync(marker, "utf-8").trim().split("\n").length : 0;
@@ -125,8 +125,16 @@ describe("subagents and project trust", () => {
 });
 
 describe("the extension's own project files and project trust", () => {
-  for (const trusted of [false, true]) {
-    it(`a project agent file is used only when the parent trusts the project (trusted: ${trusted})`, async () => {
+  // Pi's decision, and whether the user trusted the folder (Pi's prompt or
+  // /trust): Pi trusts a folder holding only agent files without asking, which
+  // is not the user agreeing to its agents.
+  const agentFileCases = [
+    { name: "untrusted by Pi", trusted: false, recorded: true, loads: false },
+    { name: "trusted by Pi without asking", trusted: true, recorded: false, loads: false },
+    { name: "trusted by the user", trusted: true, recorded: true, loads: true },
+  ];
+  for (const { name, trusted, recorded, loads } of agentFileCases) {
+    it(`a project agent file is used only in a project the user trusted (${name})`, async () => {
       const cwd = project();
       mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
       writeFileSync(join(cwd, ".pi", "agents", "helper.md"), "---\ndescription: helper\n---\nHELPER-PROMPT-MARKER");
@@ -141,24 +149,49 @@ describe("the extension's own project files and project trust", () => {
         return "child done";
       };
 
-      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, beforeRun: followPiTrust });
+      const run = await runPrintMode({ cwd, prompt: "go", respond, projectTrusted: trusted, trustRecorded: recorded });
       const results = agentToolResults(run.parentSession).join("\n");
       await run.dispose();
 
       expect(childPrompt).toBeDefined();
-      if (trusted) {
+      if (loads) {
         expect(childPrompt).toContain("HELPER-PROMPT-MARKER");
       } else {
         expect(childPrompt).not.toContain("HELPER-PROMPT-MARKER");
         expect(results).toMatch(/Unknown agent type "helper"/);
+        expect(results).toMatch(/not trusted in Pi/);
+        expect(results).toMatch(/\/trust/);
       }
     }, 60_000);
   }
 
+  it("with projectTrust: full a project agent file is used in a project nobody trusted", async () => {
+    const cwd = project();
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(cwd, ".pi", "agents", "helper.md"), "---\ndescription: helper\n---\nHELPER-PROMPT-MARKER");
+    let childPrompt: string | undefined;
+    const respond: FauxResponder = (context) => {
+      if (isParent(context.tools)) {
+        return hasToolResult(context.messages)
+          ? "parent done"
+          : agentCall({ prompt: "help", description: "agent file probe", subagent_type: "helper", run_in_background: false });
+      }
+      childPrompt ??= context.systemPrompt ?? "";
+      return "child done";
+    };
+
+    const run = await runPrintMode({
+      cwd, prompt: "go", respond, projectTrusted: false, trustRecorded: false, beforeRun: trustEveryProject,
+    });
+    await run.dispose();
+
+    expect(childPrompt).toContain("HELPER-PROMPT-MARKER");
+  }, 60_000);
+
   for (const recorded of [false, true]) {
     it(`a project agent's extension path loads only once the project is recorded as trusted (recorded: ${recorded})`, async () => {
       // Nothing here is gated by Pi, so Pi trusts the folder without asking —
-      // which is not consent to run the code an agent file points at.
+      // which is not consent to use its agent files or run the code they point at.
       const cwd = project();
       const marker = join(cwd, "EXT_LOADED.log");
       mkdirSync(join(cwd, "tools"), { recursive: true });
@@ -193,8 +226,8 @@ export default function (pi: any) {
         prompt: "go",
         respond,
         projectTrusted: true,
+        trustRecorded: false,
         beforeRun: () => {
-          followPiTrust();
           if (recorded) new ProjectTrustStore(getAgentDir()).set(cwd, true);
         },
       });

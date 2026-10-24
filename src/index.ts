@@ -25,7 +25,7 @@ import { inChildSessionContext } from "./child-context.js";
 import { boundCodemodeTimeout, CODEMODE_TOOL_NAME, createCodemodeAudit, getCodemodeTimeoutSeconds, setCodemodeTimeoutSeconds } from "./codemode-guard.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
-import { loadCustomAgents } from "./custom-agents.js";
+import { loadCustomAgents, projectAgentNames } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { useTreeKillingExec } from "./exec-tree.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -37,7 +37,7 @@ import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { orchestrationSettingsAsWritten, setWatchdogExemptTools } from "./orchestration.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust } from "./project-trust.js";
+import { isProjectCodeTrusted, isProjectTrustedBy, predictProjectTrust, TRUST_PROJECT_HINT } from "./project-trust.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { readSavedResult } from "./session-file.js";
@@ -682,11 +682,12 @@ export default function (pi: ExtensionAPI) {
       "Use the `=` form — the space form consumes the next argument, which would swallow a following prompt.",
   });
 
-  // Whether this extension may read the project's own files (agents, skills,
-  // workflows, subagents.json). The extension activates before Pi has asked the
-  // user about trust, so startup goes by Pi's predicted decision and
-  // session_start replaces it with the real one (`syncProjectTrust`).
-  let projectTrusted = predictProjectTrust(process.cwd());
+  // Whether this extension may read the project's own files (agents,
+  // subagents.json, agent-tool-description.md): Pi trusts the project and the
+  // user agreed to it (see isProjectCodeTrusted). The extension activates before
+  // Pi has asked the user about trust, so startup goes by Pi's predicted decision
+  // and session_start replaces it with the real one (`syncProjectTrust`).
+  let projectTrusted = isProjectCodeTrusted(predictProjectTrust(process.cwd()), process.cwd());
 
   // Read directly rather than waiting for applyAndEmitLoaded below: this decides
   // the initial load, which happens hundreds of lines before settings are applied.
@@ -1229,6 +1230,7 @@ export default function (pi: ExtensionAPI) {
     adoptParkedAgents();
     manager.setVisibleOwner(currentSession);
     syncProjectTrust(ctx);
+    noticeSkippedProjectAgents(ctx);
     void tidyAgentWorktrees(ctx);
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -2329,7 +2331,7 @@ export default function (pi: ExtensionAPI) {
    * settings already applied from it stay until the next session.
    */
   function syncProjectTrust(ctx: ExtensionContext): void {
-    const trusted = isProjectTrustedBy(ctx);
+    const trusted = isProjectCodeTrusted(isProjectTrustedBy(ctx), process.cwd());
     if (trusted === projectTrusted) return;
     projectTrusted = trusted;
     if (trusted) applySettings(loadSettings(process.cwd()), settingsAppliers);
@@ -2340,6 +2342,33 @@ export default function (pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify(message, "warning");
       else console.warn(`[pi-subagents] ${message}`);
     }
+  }
+
+  /** The project's agent types left out because the project is not trusted; empty when trusted. */
+  const skippedProjectAgents = (): string[] => (projectTrusted ? [] : projectAgentNames(process.cwd()));
+
+  /**
+   * Say once per folder that its agents were left out and how to get them:
+   * otherwise a project agent just goes missing, and a call for it runs the
+   * fallback agent instead.
+   */
+  let skippedAgentsNoticeFor: string | undefined;
+  function noticeSkippedProjectAgents(ctx: ExtensionContext): void {
+    const skipped = skippedProjectAgents();
+    if (skipped.length === 0 || skippedAgentsNoticeFor === process.cwd()) return;
+    skippedAgentsNoticeFor = process.cwd();
+    const message = `pi-subagents did not load this project's agents (${skipped.join(", ")}): ` +
+      `the project is not trusted in Pi. ${TRUST_PROJECT_HINT}`;
+    if (ctx.hasUI) ctx.ui.notify(message, "warning");
+    else console.warn(`[pi-subagents] ${message}`);
+  }
+
+  /** Why a requested type is missing, when it is one of the project's skipped agents. */
+  function skippedProjectAgentNote(requested: unknown): string {
+    const raw = typeof requested === "string" ? requested.trim() : "";
+    if (!raw || !skippedProjectAgents().some((name) => name.toLowerCase() === raw.toLowerCase())) return "";
+    return `"${raw}" is defined in this project's agent files, which are not loaded because the project ` +
+      `is not trusted in Pi. Tell the user: ${TRUST_PROJECT_HINT}`;
   }
 
   // ---- Agent tool ----
@@ -2716,7 +2745,10 @@ Terse command-style prompts produce shallow, generic work.
       // but the parameter is required by the schema — so gating it here would
       // make a live agent unresumable the moment its type is deleted, disabled,
       // or gains a case-clashing sibling. Only a real spawn is gated.
-      if (!dispatch.ok && !params.resume) return errorResult(dispatch.message);
+      if (!dispatch.ok && !params.resume) {
+        const note = skippedProjectAgentNote(rawType);
+        return errorResult(note ? `${dispatch.message} ${note}` : dispatch.message);
+      }
       const subagentType = dispatch.ok ? dispatch.type : rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
@@ -2728,8 +2760,9 @@ Terse command-style prompts produce shallow, generic work.
       // session and ignores `subagent_type` entirely, so a note about type
       // substitution would be describing something that didn't happen.
       // A blank type is what a call without one is repaired to (tool-args.ts).
+      const skippedNote = dispatch.ok && dispatch.fellBackFrom ? skippedProjectAgentNote(dispatch.fellBackFrom) : "";
       const fallbackNote = dispatch.ok && dispatch.fellBackFrom !== undefined
-        ? `Note: ${dispatch.fellBackFrom ? `Unknown agent type "${dispatch.fellBackFrom}"` : "No agent type given"} — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.\n\n`
+        ? `Note: ${dispatch.fellBackFrom ? `Unknown agent type "${dispatch.fellBackFrom}"` : "No agent type given"} — using ${resolveType(subagentType) ? subagentType : "the fallback agent config"}.${skippedNote ? ` ${skippedNote}` : ""}\n\n`
         : "";
 
       const displayName = getDisplayName(subagentType);

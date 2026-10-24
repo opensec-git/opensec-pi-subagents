@@ -4,9 +4,9 @@
  * Pi 1.x does not load a folder's `.pi` settings, extensions, skills or prompts
  * until the user trusts the folder. Subagents run in sessions this extension
  * builds itself, and this extension reads project files of its own (agents,
- * workflows, skills, `subagents.json`). By default (`projectTrust: "full"`) both
- * trust every project, as before 0.20.1; with `projectTrust: "pi"` in the global
- * subagents.json they follow the decision the parent session made.
+ * workflows, skills, `subagents.json`). By default (`projectTrust: "pi"`) both
+ * follow the decision the parent session made; `projectTrust: "full"` in the
+ * global subagents.json trusts every project, as before 0.20.1.
  */
 
 import {
@@ -17,14 +17,19 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { globalProjectTrustMode } from "./settings.js";
 
-/** Whether Pi's trust decision applies (`projectTrust: "pi"`); otherwise every project is trusted. */
+/** Whether Pi's trust decision applies (`projectTrust: "pi"`, the default); otherwise every project is trusted. */
 function followsPiTrust(): boolean {
   try {
-    return globalProjectTrustMode() === "pi";
+    return globalProjectTrustMode() !== "full";
   } catch {
-    return false;
+    return true;
   }
 }
+
+/** How to get a skipped project file used: said wherever one is skipped. */
+export const TRUST_PROJECT_HINT =
+  "Run /trust in Pi to trust this project, then restart Pi. " +
+  'To use project files in every project, set "projectTrust": "full" in ~/.pi/agent/subagents.json.';
 
 /**
  * Whether the session behind `ctx` trusts its project.
@@ -73,12 +78,15 @@ export function predictProjectTrust(cwd: string): boolean {
 }
 
 /**
- * Whether code from the project's own files may run here: a path entry in a
- * project agent's `extensions:`, or a saved project workflow.
+ * Whether this extension may use the project's own files: its agent files and
+ * the `extensions:` they name, saved workflows, `subagents.json` and
+ * `agent-tool-description.md`.
  *
  * Pi trusts a folder without asking when nothing in it is gated, and
  * `.pi/agents` and `.pi/workflows` are not gated. So "trusted" alone does not
- * mean anyone agreed to run the folder's code. This also requires that Pi made
+ * mean anyone agreed to use the folder's agents or run its code: a cloned repo
+ * shipping only `.pi/agents/general-purpose.md` would replace the built-in
+ * agent without a prompt. This also requires that Pi made
  * a decision: the folder has gated resources (so the user, a saved decision,
  * `defaultProjectTrust` or a CLI flag answered), or the trust store records the
  * folder as trusted (`/trust`).

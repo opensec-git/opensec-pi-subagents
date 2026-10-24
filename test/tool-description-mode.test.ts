@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import subagentsExtension from "../src/index.js";
 import { setModelOverrideAllowed } from "../src/invocation-config.js";
@@ -59,6 +60,8 @@ describe("toolDescriptionMode", () => {
     prevAgentDir = process.env.PI_CODING_AGENT_DIR;
     prevHome = process.env.HOME;
     process.env.PI_CODING_AGENT_DIR = hermeticAgentDir;
+    // A project the user trusted, so the extension uses its agents and subagents.json.
+    new ProjectTrustStore(hermeticAgentDir).set(tmpDir, true);
     process.env.HOME = hermeticAgentDir;
     prevCwd = process.cwd();
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });

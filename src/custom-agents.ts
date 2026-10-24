@@ -85,6 +85,31 @@ export function loadCustomAgents(
   return agents;
 }
 
+/**
+ * The agent types the project's agent folders define, read without loading
+ * them, so an untrusted project can say which of its agents it left out.
+ */
+export function projectAgentNames(cwd: string): string[] {
+  const names = new Set<string>();
+  for (const dir of [join(cwd, ".agents", "agents"), join(cwd, ".pi", "agents")]) {
+    if (!existsSync(dir)) continue;
+    let files: string[];
+    try {
+      files = readAgentDirectory(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      let declared: string | undefined;
+      try {
+        declared = str(readParsedAgent(join(dir, file)).frontmatter.name)?.trim();
+      } catch { /* the filename stands in, as when loading */ }
+      names.add(declared || basename(file, ".md"));
+    }
+  }
+  return [...names];
+}
+
 /** Load agent configs from a directory into the map. */
 function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "project" | "global", strict: boolean): void {
   if (!existsSync(dir)) return;

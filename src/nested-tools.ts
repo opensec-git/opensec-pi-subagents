@@ -119,9 +119,9 @@ export interface NestedToolContext {
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
   /**
-   * Whether the session this branch descends from trusts its project. False
-   * keeps the project's agent files out of the registry, as at the top level.
-   * Omitted counts as trusted.
+   * Whether the project's agent files may be used (see `isProjectCodeTrusted`).
+   * False keeps them out of the registry, as at the top level. Omitted counts
+   * as trusted.
    */
   projectTrusted?: boolean;
 }

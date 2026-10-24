@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
@@ -75,6 +76,8 @@ describe("output_transcript agent wiring", () => {
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     previousHome = process.env.HOME;
     process.env.PI_CODING_AGENT_DIR = agentDir;
+    // A project the user trusted, so the extension uses its agents and subagents.json.
+    new ProjectTrustStore(agentDir).set(cwd, true);
     process.env.HOME = agentDir;
     mkdirSync(join(cwd, ".pi"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));

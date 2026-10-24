@@ -66,6 +66,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
+  ProjectTrustStore,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -162,6 +163,13 @@ export interface RunPrintModeOptions {
    * the loader builds its own (trusted) manager.
    */
   projectTrusted?: boolean;
+  /**
+   * Record the project as trusted in the hermetic trust store, as `/trust`
+   * would. Default true when globals are isolated (never written to a real agent
+   * dir): the extension uses a project's own agents, `subagents.json` and
+   * workflows only once the user trusted it.
+   */
+  trustRecorded?: boolean;
   /** Faux mode: whether the faux model supports reasoning, so thinking levels are not clamped to "off". */
   reasoning?: boolean;
   /** The parent session's thinking level. Default: Pi's (from settings). */
@@ -315,6 +323,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     hermeticDir = mkdtempSync(join(tmpdir(), "subagents-print-home-"));
     process.env.PI_CODING_AGENT_DIR = hermeticDir;
     process.env.HOME = hermeticDir;
+    if (options.trustRecorded !== false) new ProjectTrustStore(hermeticDir).set(cwd, true);
   }
 
   // --- model backend ---

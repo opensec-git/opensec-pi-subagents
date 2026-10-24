@@ -11,6 +11,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
@@ -64,6 +65,8 @@ describe("strictAgentFiles gates extension activation", () => {
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     originalHome = process.env.HOME;
     process.env.PI_CODING_AGENT_DIR = join(cwd, "agent-dir");
+    // A project the user trusted, so the extension uses its agents and subagents.json.
+    new ProjectTrustStore(join(cwd, "agent-dir")).set(cwd, true);
     process.env.HOME = cwd;
     warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   });

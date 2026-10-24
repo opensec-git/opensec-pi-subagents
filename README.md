@@ -292,26 +292,28 @@ own calls; out-of-scope tools are blocked but can still appear in codemode's `se
 
 ### Project trust
 
-By default (`projectTrust: "full"`) subagents and this extension trust every project: a child session loads the
-project's `.pi/extensions` and `.pi/settings.json`, and the extension uses the project's agents, skills, workflows and
-`subagents.json`, whatever Pi decided for the parent session.
-
-To have them follow Pi's project trust decision instead, set `"projectTrust": "pi"` in the global
-`~/.pi/agent/subagents.json` (a project's own file cannot change it). Then:
+By default (`projectTrust: "pi"`) subagents and this extension follow Pi's project trust decision:
 
 - In a folder Pi does not trust, subagents load none of the project's `.pi/extensions`, `.pi/settings.json` (for
-  example `shellCommandPrefix`), skills or prompts, exactly like the parent. This extension also ignores the project's
-  `.pi/agents`, `.agents/agents`, `.pi/skills`, `.agents/skills`, `.pi/subagents.json`,
-  `.pi/agent-tool-description.md` and saved workflows there. A trusted project behaves as before.
-- Code the project ships for this extension needs a recorded decision: saved workflows in `.pi/workflows` or
-  `.agents/workflows`, and path entries in a project agent's `extensions:`. Pi trusts a folder without asking when
-  it holds nothing Pi gates (agent and workflow folders are not gated), so these run only when the folder was trusted
-  at Pi's prompt, by `defaultProjectTrust` or a CLI flag, or recorded with `/trust`. Otherwise the workflow is refused
-  and the extension path is skipped with a warning; the rest of the agent file still applies.
+  example `shellCommandPrefix`), skills or prompts, exactly like the parent.
+- This extension uses the project's own files only in a project you trusted: agent files in `.pi/agents` and
+  `.agents/agents` (and the paths their `extensions:` name), `.pi/subagents.json`, `.pi/agent-tool-description.md`, and
+  saved workflows in `.pi/workflows` and `.agents/workflows`. "You trusted" means you trusted the folder at Pi's prompt,
+  `defaultProjectTrust` is `"always"`, or `/trust` recorded it. Pi trusts a folder without asking when it holds nothing
+  Pi gates, and these folders are not gated, so a cloned repo that ships only `.pi/agents` does not get its agents used
+  until you run `/trust`. Otherwise a project agent named `general-purpose` would replace the built-in agent without
+  any prompt.
+- When it leaves a project's agents out, the extension says so once at session start, naming them, and an `Agent` call
+  for one of them says why it fell back (or was refused). To use them, run `/trust` in Pi, then restart Pi.
 - A project agent file named `general-purpose`, `Explore` or `Plan` replaces the built-in agent. A warning names the
   file, and the `Agent` tool's type list marks the type as defined by the project.
 - The extension starts before Pi asks about trust. A folder you trust at the prompt gets its project agents and settings
   for that session, but the `Agent` tool's description, built at startup, lists them from the next session on.
+
+To trust every project instead, as before 0.20.1 and in 0.20.2 to 0.20.8, set `"projectTrust": "full"` in the global
+`~/.pi/agent/subagents.json`: a child session then loads the project's `.pi/extensions` and `.pi/settings.json`, and the
+extension uses the project's agents, skills, workflows and `subagents.json`, whatever Pi decided. A project's own
+`subagents.json` cannot set `projectTrust`.
 
 ## Configuration
 
