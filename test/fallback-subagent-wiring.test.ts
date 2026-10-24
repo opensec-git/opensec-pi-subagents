@@ -12,6 +12,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
@@ -82,6 +83,8 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     originalHome = process.env.HOME;
     process.env.PI_CODING_AGENT_DIR = join(cwd, "agent-dir");
+    // A project the user trusted, so the extension uses its agents and subagents.json.
+    new ProjectTrustStore(join(cwd, "agent-dir")).set(cwd, true);
     process.env.HOME = cwd;
     vi.mocked(runAgent).mockReset();
   });

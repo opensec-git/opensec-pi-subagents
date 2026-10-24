@@ -1299,7 +1299,8 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
-        projectTrusted,
+        // The project's agent files need the user's agreement, as at the top level.
+        projectTrusted: isProjectCodeTrusted(projectTrusted, parent.cwd),
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));

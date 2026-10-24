@@ -22,7 +22,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setModelOverrideAllowed } from "../src/invocation-config.js";
 
-// These tests pin `projectTrust: "pi"` (follow Pi's trust decision); the default, "full", trusts every project.
+// These tests pin `projectTrust: "pi"` (the default: follow Pi's trust decision), whatever the global file says.
 vi.mock("../src/settings.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/settings.js")>()),
   globalProjectTrustMode: () => "pi",
@@ -767,7 +767,7 @@ describe("SubagentWorkflow tool — saved project workflows need a trusted proje
   });
 
   function boot(opts: { trusted?: boolean; untrustedSession?: boolean }) {
-    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: opts.trusted });
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true }, trusted: opts.trusted === true });
     mkdirSync(join(hermetic.dir, ".pi", "workflows"), { recursive: true });
     writeFileSync(join(hermetic.dir, ".pi", "workflows", "nightly.js"), fileScript);
     const booted = makePi();

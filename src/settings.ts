@@ -128,11 +128,12 @@ export interface SubagentsSettings {
   strictAgentFiles?: boolean;
   /**
    * Which project files subagents and this extension may use.
-   * - "full" (default): every project's agents, skills, workflows, `subagents.json`,
-   *   agent-file `extensions:` and, in child sessions, its `.pi` extensions and settings,
-   *   as before 0.20.1.
-   * - "pi": follow Pi's trust decision for the folder: an untrusted project's files are
-   *   not used, and project code needs a saved decision (`/trust`).
+   * - "pi" (default): follow Pi's trust decision for the folder. Child sessions load
+   *   the project's `.pi` extensions and settings only when Pi trusts it; this
+   *   extension uses the project's agents (and their `extensions:`), workflows,
+   *   `subagents.json` and `agent-tool-description.md` only when the user trusted it
+   *   (Pi's prompt, `defaultProjectTrust`, or `/trust`).
+   * - "full": every project's files, whatever Pi decided, as before 0.20.1.
    * Read from the global `~/.pi/agent/subagents.json` only: a project's own file cannot
    * decide whether that project is trusted.
    */
@@ -564,16 +565,16 @@ function readSettingsFile(path: string): SubagentsSettings {
   }
 }
 
+/** `projectTrust` from the global settings file (see `SubagentsSettings.projectTrust`). */
+export function globalProjectTrustMode(): ProjectTrustMode {
+  return readSettingsFile(globalPath()).projectTrust ?? "pi";
+}
+
 /**
  * Load merged settings: global provides defaults, project overrides.
  * `project: false` reads the global file only — the project is not trusted,
  * and Pi ignores its `.pi/settings.json` too.
  */
-/** `projectTrust` from the global settings file (see `SubagentsSettings.projectTrust`). */
-export function globalProjectTrustMode(): ProjectTrustMode {
-  return readSettingsFile(globalPath()).projectTrust ?? "full";
-}
-
 export function loadSettings(cwd: string = process.cwd(), project = true): SubagentsSettings {
   return { ...readSettingsFile(globalPath()), ...(project ? readSettingsFile(projectPath(cwd)) : {}) };
 }

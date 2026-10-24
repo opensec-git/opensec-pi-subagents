@@ -1,6 +1,6 @@
 {
   "name": "@kushalkhemka/opensec-pi-subagents",
-  "version": "0.20.8",
+  "version": "0.20.9",
   "description": "OpenSec Subagents for Pi: a fork of @tintinweb/pi-subagents with parent model and thinking-level inheritance and cached agent discovery.",
   "author": "OpenSec",
   "contributors": [

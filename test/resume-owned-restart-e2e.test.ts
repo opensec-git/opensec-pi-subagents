@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxToolCall } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeCwd } from "../src/output-file.js";
 import { readJournal } from "../src/workflow/journal.js";
@@ -81,6 +81,8 @@ beforeEach(() => {
   prev = { agentDir: process.env.PI_CODING_AGENT_DIR, home: process.env.HOME, cwd: process.cwd() };
   // Shared by both runs: the child sessions are saved under the agent dir.
   process.env.PI_CODING_AGENT_DIR = home;
+  // A project the user trusted, so the extension uses its agents and subagents.json.
+  new ProjectTrustStore(home).set(cwd, true);
   process.env.HOME = home;
   mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
   writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ workflowsEnabled: true, outputTranscript: false }));

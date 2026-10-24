@@ -120,8 +120,9 @@ export function hermeticDir(opts: {
   agentFiles?: Record<string, string>;
   /**
    * Record the project as trusted in the hermetic agent dir's trust store, as
-   * `/trust` would. Needed for code the project ships itself (saved workflows,
-   * agent extension paths), which a folder Pi trusted without asking may not run.
+   * `/trust` would. Default true. The extension uses a project's own files
+   * (agents, `subagents.json`, saved workflows, agent extension paths) only once
+   * the user trusted it, and a folder Pi trusted without asking does not count.
    */
   trusted?: boolean;
 } = {}): Hermetic {
@@ -142,7 +143,7 @@ export function hermeticDir(opts: {
     }
   }
 
-  if (opts.trusted) new ProjectTrustStore(agentDir).set(dir, true);
+  if (opts.trusted !== false) new ProjectTrustStore(agentDir).set(dir, true);
 
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.HOME = agentDir;
