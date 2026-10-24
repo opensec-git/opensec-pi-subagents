@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow Pi's project trust decision again, as in 0.20.1. A child session loads the project's `.pi/extensions` and
   `.pi/settings.json` only when Pi trusts the project, and this extension uses the project's agent files (and the
   paths their `extensions:` name), `subagents.json`, `agent-tool-description.md` and saved workflows only in a project
-  you trusted: at Pi's prompt, by `defaultProjectTrust: "always"`, or with `/trust`. A folder Pi trusted without
+  you trusted: at Pi's prompt, with `/trust`, by `defaultProjectTrust: "always"`, or for one run with `--approve`. A folder Pi trusted without
   asking, because it holds nothing Pi gates (say, only `.pi/agents`), does not count, so a cloned repo can no longer
   replace the built-in `general-purpose` agent without a prompt. In 0.20.1 that case loaded the project's agents.
   `"projectTrust": "full"` in the global `~/.pi/agent/subagents.json` trusts every project, as in 0.20.2 to 0.20.8.
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Skipped project agents are named.** 0.20.1 dropped an untrusted project's agents silently: a call for one ran the
   fallback agent with only "Unknown agent type". Now session start warns once, naming the agents left out, and an
   `Agent` call for one of them says it is defined by the untrusted project. Both say how to fix it: run `/trust` in
-  Pi and restart, or set `"projectTrust": "full"`.
+  Pi and restart (or start Pi with `--approve`), or set `"projectTrust": "full"`.
 
 ## [0.20.8] - 2026-10-23
 

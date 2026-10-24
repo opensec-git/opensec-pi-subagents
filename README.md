@@ -299,12 +299,13 @@ By default (`projectTrust: "pi"`) subagents and this extension follow Pi's proje
 - This extension uses the project's own files only in a project you trusted: agent files in `.pi/agents` and
   `.agents/agents` (and the paths their `extensions:` name), `.pi/subagents.json`, `.pi/agent-tool-description.md`, and
   saved workflows in `.pi/workflows` and `.agents/workflows`. "You trusted" means you trusted the folder at Pi's prompt,
-  `defaultProjectTrust` is `"always"`, or `/trust` recorded it. Pi trusts a folder without asking when it holds nothing
-  Pi gates, and these folders are not gated, so a cloned repo that ships only `.pi/agents` does not get its agents used
-  until you run `/trust`. Otherwise a project agent named `general-purpose` would replace the built-in agent without
-  any prompt.
+  `/trust` recorded it, `defaultProjectTrust` is `"always"`, or Pi runs with `--approve`. Pi trusts a folder without
+  asking when it holds nothing Pi gates, and these folders are not gated, so a cloned repo that ships only `.pi/agents`
+  does not get its agents used until you run `/trust`. Otherwise a project agent named `general-purpose` would replace
+  the built-in agent without any prompt.
 - When it leaves a project's agents out, the extension says so once at session start, naming them, and an `Agent` call
-  for one of them says why it fell back (or was refused). To use them, run `/trust` in Pi, then restart Pi.
+  for one of them says why it fell back (or was refused). To use them, run `/trust` in Pi, then restart Pi (or start it
+  with `--approve` for one run).
 - A project agent file named `general-purpose`, `Explore` or `Plan` replaces the built-in agent. A warning names the
   file, and the `Agent` tool's type list marks the type as defined by the project.
 - The extension starts before Pi asks about trust. A folder you trust at the prompt gets its project agents and settings

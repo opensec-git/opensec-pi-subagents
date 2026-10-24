@@ -28,7 +28,7 @@ function followsPiTrust(): boolean {
 
 /** How to get a skipped project file used: said wherever one is skipped. */
 export const TRUST_PROJECT_HINT =
-  "Run /trust in Pi to trust this project, then restart Pi. " +
+  "Run /trust in Pi and restart it (or start Pi with --approve) to trust this project. " +
   'To use project files in every project, set "projectTrust": "full" in ~/.pi/agent/subagents.json.';
 
 /**
@@ -86,17 +86,29 @@ export function predictProjectTrust(cwd: string): boolean {
  * `.pi/agents` and `.pi/workflows` are not gated. So "trusted" alone does not
  * mean anyone agreed to use the folder's agents or run its code: a cloned repo
  * shipping only `.pi/agents/general-purpose.md` would replace the built-in
- * agent without a prompt. This also requires that Pi made
- * a decision: the folder has gated resources (so the user, a saved decision,
- * `defaultProjectTrust` or a CLI flag answered), or the trust store records the
- * folder as trusted (`/trust`).
+ * agent without a prompt. This also requires that the user decided: the
+ * folder has gated resources (so the user, a saved decision,
+ * `defaultProjectTrust` or `--approve` answered), the trust store records the
+ * folder as trusted (`/trust`), `defaultProjectTrust` is `"always"`, or Pi was
+ * started with `--approve`.
  */
 export function isProjectCodeTrusted(trusted: boolean, cwd: string): boolean {
   if (!followsPiTrust()) return true;
   if (!trusted) return false;
   try {
-    return hasTrustRequiringProjectResources(cwd) || savedDecision(cwd) === true || defaultTrustIsAlways(cwd);
+    return hasTrustRequiringProjectResources(cwd) || savedDecision(cwd) === true || defaultTrustIsAlways(cwd)
+      || approvedOnCommandLine();
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether Pi was started with `--approve` (`-a`), "trust project-local files
+ * for this run". Pi hands the override to its own trust decision only, and for
+ * a folder with nothing gated that decision is "trusted" either way, so the
+ * command line is the only place it shows.
+ */
+function approvedOnCommandLine(): boolean {
+  return process.argv.includes("--approve") || process.argv.includes("-a");
 }

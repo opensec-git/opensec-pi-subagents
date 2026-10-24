@@ -66,6 +66,24 @@ describe("projectTrust", () => {
     }
   });
 
+  it("counts --approve on Pi's command line as the user trusting the folder", () => {
+    const agentsOnly = mkdtempSync(join(tmpdir(), "subagents-trust-approve-"));
+    const argv = process.argv;
+    try {
+      mkdirSync(join(agentsOnly, ".pi", "agents"), { recursive: true });
+      expect(isProjectCodeTrusted(true, agentsOnly)).toBe(false);
+      for (const flag of ["--approve", "-a"]) {
+        process.argv = [...argv, flag];
+        expect(isProjectCodeTrusted(true, agentsOnly)).toBe(true);
+        // A session that does not trust the project (say, --no-approve came last) still wins.
+        expect(isProjectCodeTrusted(false, agentsOnly)).toBe(false);
+      }
+    } finally {
+      process.argv = argv;
+      rmSync(agentsOnly, { recursive: true, force: true });
+    }
+  });
+
   it("ignores a project's own projectTrust", () => {
     writeFileSync(join(project, ".pi", "subagents.json"), JSON.stringify({ projectTrust: "full" }));
     expect(globalProjectTrustMode()).toBe("pi");
